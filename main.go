@@ -219,7 +219,10 @@ func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
 	if totalIPs == 0 { return nil }
 
 	sampleSize := uint64(maxIPs)
-	if sampleSize > totalIPs { sampleSize = totalIPs }
+	// Если лимит 0 или меньше, либо больше общего кол-ва IP, берем все IP
+	if maxIPs <= 0 || sampleSize > totalIPs { 
+		sampleSize = totalIPs 
+	}
 
 	rng := rand.New(rand.NewSource(seed))
 	startIdx := rng.Uint64() % totalIPs
@@ -421,7 +424,7 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 	if uConn.ConnectionState().NegotiatedProtocol == "h2" {
 		cand.ALPN = "h2"
 	} else {
-		cand.ALPN = "h2 (no ALPN)" // Смягченный ALPN фильтр
+		cand.ALPN = "h2 (no ALPN)" 
 	}
 
 	state := uConn.ConnectionState()
@@ -535,7 +538,6 @@ ReadLoop:
 		if err != nil { break }
 	}
 
-	// Оставляем ВСЕ статусы (2xx, 3xx, 4xx, 5xx), если сервер ответил хоть что-то по HTTP/2
 	if cand.HTTPStatus == 0 { return nil, fmt.Errorf("no http status code") }
 	return cand, nil
 }
@@ -568,13 +570,14 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	if !cand.CertValidDates { cand.Score -= 30.0 }
 	cand.Score -= float64(cand.CDNConfidence)
 
-	if cand.Score <= 0 { return false } // Отсеиваем только гарантированный мусор и CDNs
+	if cand.Score <= 0 { return false }
 	return true
 }
 
 func RunDirectPipeline(ctx context.Context, cfg Config, sampledIPs []string, dedup *Deduplicator, asnDB, countryDB *geoip2.Reader, sources []OSINTSource) []Candidate {
 	var mu sync.Mutex
-	ipSniMap := make(map[string]map[string]bool)
+	// Карта: IP -> Домен -> Источник -> Булево значение (существует)
+	ipSniMap := make(map[string]map[string]map[string]bool)
 	
 	// ЭТАП 1: Разведка (PTR/OSINT)
 	g1, gCtx1 := errgroup.WithContext(ctx)
@@ -591,8 +594,13 @@ func RunDirectPipeline(ctx context.Context, cfg Config, sampledIPs []string, ded
 
 			mu.Lock()
 			for _, ev := range evidences {
-				if ipSniMap[ip] == nil { ipSniMap[ip] = make(map[string]bool) }
-				ipSniMap[ip][ev.Domain] = true
+				if ipSniMap[ip] == nil {
+					ipSniMap[ip] = make(map[string]map[string]bool)
+				}
+				if ipSniMap[ip][ev.Domain] == nil {
+					ipSniMap[ip][ev.Domain] = make(map[string]bool)
+				}
+				ipSniMap[ip][ev.Domain][ev.Source] = true
 			}
 			mu.Unlock()
 			return nil
@@ -636,7 +644,6 @@ func RunDirectPipeline(ctx context.Context, cfg Config, sampledIPs []string, ded
 	}
 	_ = g2.Wait()
 
-	// Сортировка по минимальному RTT для выдачи лучшего результата наверх
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Timings.Total() < candidates[j].Timings.Total() })
 	return candidates
 }
@@ -649,7 +656,7 @@ func main() {
 	
 	flag.StringVar(&modeStr, "mode", "passive", "passive | direct | hybrid")
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
-	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling")
+	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = unlimited)")
 	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 2000, "TCP timeout ms")
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 2000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
