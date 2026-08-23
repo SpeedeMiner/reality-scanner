@@ -27,6 +27,7 @@ import (
 	"github.com/oschwald/geoip2-golang"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
+	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
@@ -261,6 +262,14 @@ func CleanDomain(d string) string {
 		return ""
 	}
 	return d
+}
+
+func GetRootDomain(domain string) string {
+	root, err := publicsuffix.EffectiveTLDPlusOne(domain)
+	if err != nil {
+		return domain
+	}
+	return root
 }
 
 func uniqueDomains(domains []string) []string {
@@ -1126,15 +1135,24 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 
 			localDomains = uniqueDomains(localDomains)
 
-			// Crt.sh
+			// Crt.sh - Оптимизация с Root Domain
 			var allDomains []string
 			allDomains = append(allDomains, localDomains...)
 
+			// Собираем уникальные базовые домены для запросов к crt.sh
+			rootDomains := make(map[string]bool)
 			for _, dom := range localDomains {
-				subs, ok := crtCache.Get(dom)
+				root := GetRootDomain(dom)
+				if root != "" {
+					rootDomains[root] = true
+				}
+			}
+
+			for root := range rootDomains {
+				subs, ok := crtCache.Get(root)
 				if !ok {
-					v, err, _ := crtGroup.Do(dom, func() (interface{}, error) {
-						if cached, ok := crtCache.Get(dom); ok {
+					v, err, _ := crtGroup.Do(root, func() (interface{}, error) {
+						if cached, ok := crtCache.Get(root); ok {
 							return cached, nil
 						}
 
@@ -1144,7 +1162,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 
 						crtCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 						defer cancel()
-						result, err := gatherCrtSh(crtCtx, dom, httpClient)
+						result, err := gatherCrtSh(crtCtx, root, httpClient)
 
 						stats.mu.Lock()
 						if err != nil {
@@ -1155,7 +1173,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 						stats.CRTSuccess++
 						stats.mu.Unlock()
 
-						crtCache.Put(dom, result)
+						crtCache.Put(root, result)
 
 						uniqueCount := 0
 						for _, d := range result {
