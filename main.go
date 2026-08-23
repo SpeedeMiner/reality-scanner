@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -52,9 +53,10 @@ var bannedTLDs = map[string]bool{
 }
 
 var cdnHeaders = []string{"cf-ray", "x-amz-cf-id", "x-cache", "x-served-by", "cdn-loop"}
-var cdnServers = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri", "amazon"}
+var cdnServers = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri"}
 var cdnPTRs = []string{".cloudfront.net", ".fastly.net", ".akamaiedge.net", ".cloudflare.net"}
-var tldRegex = regexp.MustCompile(`^[a-z]{2,24}$`)
+
+var tldRe = regexp.MustCompile(`^[a-z]{2,24}$`)
 
 // ================= СТРУКТУРЫ =================
 type Target struct {
@@ -93,7 +95,7 @@ func ensureDBExists(filepath, downloadURL string) error {
 	}
 
 	log.Printf("[*] База %s не найдена. Начинаем скачивание...", filepath)
-	
+
 	tmpFile, err := os.CreateTemp("", "mmdb-*")
 	if err != nil {
 		return fmt.Errorf("создание temp файла: %v", err)
@@ -120,20 +122,29 @@ func ensureDBExists(filepath, downloadURL string) error {
 	}
 	tmpFile.Close()
 
+	// Валидация скачанного файла на уровне библиотеки
+	testDB, err := geoip2.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("скачанный файл повреждён или не является MMDB: %v", err)
+	}
+	testDB.Close()
+
 	if err := os.Rename(tmpPath, filepath); err != nil {
 		return fmt.Errorf("ошибка rename: %v", err)
 	}
 
-	log.Printf("[+] База %s успешно загружена.", filepath)
+	log.Printf("[+] База %s успешно загружена и проверена.", filepath)
 	return nil
 }
 
 // ================= ИНФРАСТРУКТУРА IP / ASN =================
-func getPublicIP() (string, error) {
+func getPublicIP(ctx context.Context) (string, error) {
 	urls := []string{"https://api.ipify.org", "https://ifconfig.me/ip"}
 	client := &http.Client{Timeout: 5 * time.Second}
+
 	for _, u := range urls {
-		resp, err := client.Get(u)
+		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+		resp, err := client.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
 			ipBytes, _ := io.ReadAll(resp.Body)
@@ -169,13 +180,15 @@ func getASNAndCountryLocal(ip string, asnDB, countryDB *geoip2.Reader) (uint, st
 	return asn, asnName, country
 }
 
-func getPrefixes(asn uint) []string {
+func getPrefixes(ctx context.Context, asn uint) []string {
 	if asn == 0 {
 		return nil
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	url := fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS%d", asn)
-	resp, err := client.Get(url)
+	
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil
 	}
@@ -204,7 +217,7 @@ func getPrefixes(asn uint) []string {
 // ================= ГЕНЕРАТОР IP И СЭМПЛИРОВАНИЕ =================
 func generateAndShuffleIPs(prefixes []string, maxIPs int, rng *rand.Rand) []string {
 	var allIPs []string
-	
+
 	for _, pStr := range prefixes {
 		_, ipnet, err := net.ParseCIDR(pStr)
 		if err != nil {
@@ -270,7 +283,7 @@ func cleanDomain(d string) string {
 		return ""
 	}
 	tld := parts[len(parts)-1]
-	if !tldRegex.MatchString(tld) || bannedTLDs[tld] {
+	if !tldRe.MatchString(tld) || bannedTLDs[tld] {
 		return ""
 	}
 	if strings.ContainsAny(d, " \t\r\n/\\:*?\"'<>|#%&={}~`!@$^()+[]") {
@@ -352,13 +365,13 @@ func validateFCrDNS(ctx context.Context, ip string, domains []string) []string {
 
 func probeIPStealth(ctx context.Context, ip string, rng *rand.Rand) (string, []string) {
 	candidateDomains := getPTR(ctx, ip)
-	
+
 	if len(candidateDomains) == 0 {
 		candidateDomains = append(candidateDomains, getPassiveDNS(ip, rng)...)
 	}
 
 	if len(candidateDomains) == 0 {
-		return ip, nil 
+		return ip, nil
 	}
 
 	validatedDomains := validateFCrDNS(ctx, ip, candidateDomains)
@@ -408,7 +421,7 @@ func verifyH2(ctx context.Context, ip, sni string, dialTimeout time.Duration) *V
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
 	}, utls.HelloChrome_Auto)
-	
+
 	uConn.SetDeadline(time.Now().Add(dialTimeout))
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		return nil
@@ -416,12 +429,12 @@ func verifyH2(ctx context.Context, ip, sni string, dialTimeout time.Duration) *V
 
 	rtt := time.Since(t0).Milliseconds()
 	if uConn.ConnectionState().NegotiatedProtocol != "h2" {
-		return nil 
+		return nil
 	}
 
 	uConn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
 	uConn.Write(buildH2Frame(FrameSettings, 0, 0, []byte{}))
-	
+
 	headerPayload := buildH2HeadersEncoder(sni)
 	uConn.Write(buildH2Frame(FrameHeaders, FlagEndHeaders|FlagEndStream, 1, headerPayload))
 
@@ -429,13 +442,13 @@ func verifyH2(ctx context.Context, ip, sni string, dialTimeout time.Duration) *V
 	recvBuf := bytes.Buffer{}
 	headerBlocks := bytes.Buffer{}
 	decoder := hpack.NewDecoder(4096, nil)
-	
+
 	status, server := "", "-"
 	dataBytes := 0
 	isCDN := false
 
 	uConn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
-	
+
 ReadLoop:
 	for {
 		if ctx.Err() != nil {
@@ -448,12 +461,17 @@ ReadLoop:
 		if err != nil || recvBuf.Len() > 32768 {
 			break
 		}
+		
+		// Fallback для раннего сброса не HTTP/2
+		if bytes.HasPrefix(recvBuf.Bytes(), []byte("HTTP/1.")) {
+			return nil
+		}
 
 		for recvBuf.Len() >= 9 {
 			data := recvBuf.Bytes()
 			length := int(data[0])<<16 | int(data[1])<<8 | int(data[2])
 			if recvBuf.Len() < 9+length {
-				break ReadLoop 
+				break // Дожидаемся остатка фрейма
 			}
 
 			frameType := data[3]
@@ -462,13 +480,13 @@ ReadLoop:
 			recvBuf.Next(9 + length)
 
 			if frameType == FrameGoAway || frameType == FrameRSTStream {
-				return nil 
+				return nil
 			}
 
 			if frameType == FrameSettings && (flags&0x01) == 0 {
 				uConn.Write(buildH2Frame(FrameSettings, 0x01, 0, []byte{}))
-			} 
-			
+			}
+
 			if frameType == FrameHeaders || frameType == FrameContinuation {
 				headerBlocks.Write(payload)
 				if (flags & FlagEndHeaders) != 0 {
@@ -554,14 +572,21 @@ func main() {
 		log.Fatalf("[-] Ошибка GeoIP ASN: %v", err)
 	}
 
-	countryDB, _ := geoip2.Open(*dbCountry)
-	asnDB, _ := geoip2.Open(*dbASN)
+	countryDB, err := geoip2.Open(*dbCountry)
+	if err != nil {
+		log.Fatalf("[-] Не удалось открыть GeoIP Country БД: %v", err)
+	}
 	defer countryDB.Close()
+
+	asnDB, err := geoip2.Open(*dbASN)
+	if err != nil {
+		log.Fatalf("[-] Не удалось открыть GeoIP ASN БД: %v", err)
+	}
 	defer asnDB.Close()
 
 	myIP := *vpsIP
 	if myIP == "" {
-		ip, err := getPublicIP()
+		ip, err := getPublicIP(ctx)
 		if err != nil {
 			log.Fatalf("[-] %v. Укажите IP вручную через флаг -vps-ip", err)
 		}
@@ -577,12 +602,20 @@ func main() {
 	log.Printf("[*] ASN:               %s (Local MMDB)", asnStr)
 	log.Printf("[*] Страна поиска:     %s", country)
 
-	allPrefixes := getPrefixes(asnNum)
+	allPrefixes := getPrefixes(ctx, asnNum)
+	
 	var targetPrefixes []string
-	for _, p := range allPrefixes {
-		ip, _, _ := net.ParseCIDR(p)
-		if record, err := countryDB.Country(ip); err == nil && strings.ToUpper(record.Country.IsoCode) == country {
-			targetPrefixes = append(targetPrefixes, p)
+	if country == "" {
+		targetPrefixes = allPrefixes
+	} else {
+		for _, p := range allPrefixes {
+			ip, _, err := net.ParseCIDR(p)
+			if err != nil {
+				continue
+			}
+			if record, err := countryDB.Country(ip); err == nil && strings.ToUpper(record.Country.IsoCode) == country {
+				targetPrefixes = append(targetPrefixes, p)
+			}
 		}
 	}
 
@@ -602,11 +635,13 @@ func main() {
 
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
-			localRng := rand.New(rand.NewSource(time.Now().UnixNano()))
+			localRng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 			for ip := range jobs {
-				if ctx.Err() != nil { return }
+				if ctx.Err() != nil {
+					return
+				}
 				ctxReq, cancelReq := context.WithTimeout(ctx, 4*time.Second)
 				_, doms := probeIPStealth(ctxReq, ip, localRng)
 				cancelReq()
@@ -614,12 +649,14 @@ func main() {
 					results1 <- Target{IP: ip, Domains: doms}
 				}
 			}
-		}()
+		}(i)
 	}
 
 	go func() {
 		for _, ip := range ips {
-			if ctx.Err() != nil { break }
+			if ctx.Err() != nil {
+				break
+			}
 			jobs <- ip
 		}
 		close(jobs)
@@ -632,7 +669,7 @@ func main() {
 	for t := range results1 {
 		targets = append(targets, t)
 	}
-	
+
 	if ctx.Err() != nil {
 		log.Println("[!] Сканирование прервано пользователем. Вывожу промежуточные результаты...")
 	} else {
@@ -653,7 +690,9 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for j := range jobs2 {
-				if ctx.Err() != nil { return }
+				if ctx.Err() != nil {
+					return
+				}
 				if res := verifyH2(ctx, j.IP, j.SNI, dialTimeout); res != nil {
 					results2 <- res
 				}
@@ -664,7 +703,9 @@ func main() {
 	go func() {
 		for _, t := range targets {
 			for _, d := range t.Domains {
-				if ctx.Err() != nil { break }
+				if ctx.Err() != nil {
+					break
+				}
 				jobs2 <- ValidateJob{IP: t.IP, SNI: d}
 			}
 		}
@@ -684,12 +725,17 @@ func main() {
 		return
 	}
 
+	sort.Slice(finalResults, func(i, j int) bool {
+		return finalResults[i].RTT < finalResults[j].RTT
+	})
+
 	fmt.Printf("\n%-36s | %-15s | %-5s | %-9s | %-20s | %-7s\n", "Цель (SNI)", "IP адрес", "HTTP", "DATA", "Сервер", "RTT")
 	fmt.Println(strings.Repeat("-", 110))
 	for _, r := range finalResults {
 		dataStr := fmt.Sprintf("%d B", r.DataBytes)
-		fmt.Printf("%-36s | %-15s | %-5s | %-9s | %-20s | %d ms\n",
-			limitStr(r.SNI, 36), r.IP, r.Status, dataStr, limitStr(r.Server, 20), r.RTT)
+		rttStr := fmt.Sprintf("%d ms", r.RTT)
+		fmt.Printf("%-36s | %-15s | %-5s | %-9s | %-20s | %-7s\n",
+			limitStr(r.SNI, 36), r.IP, r.Status, dataStr, limitStr(r.Server, 20), rttStr)
 	}
 
 	best := finalResults[0]
