@@ -49,6 +49,8 @@ const (
 
 	FlagEndStream  = 0x01
 	FlagEndHeaders = 0x04
+	FlagPadded     = 0x08
+	FlagPriority   = 0x20
 	FlagAck        = 0x01
 )
 
@@ -95,6 +97,22 @@ func (t Timings) TotalLatency() time.Duration {
 	return t.TCP + t.TLS + t.HTTPHeaders
 }
 
+type H2SettingsProfile struct {
+	HeaderTableSize      uint32
+	EnablePush           uint32
+	MaxConcurrentStreams uint32
+	InitialWindowSize    uint32
+	MaxFrameSize         uint32
+	MaxHeaderListSize    uint32
+
+	HasHeaderTableSize      bool
+	HasEnablePush           bool
+	HasMaxConcurrentStreams bool
+	HasInitialWindowSize    bool
+	HasMaxFrameSize         bool
+	HasMaxHeaderListSize    bool
+}
+
 type Candidate struct {
 	IP                string
 	SNI               string
@@ -102,7 +120,7 @@ type Candidate struct {
 	H2HeadersReceived bool
 	HTTPStatus        int
 	Location          string
-	DataBytes         int
+	BodyBytes         int
 	Server            string
 	ContentType       string
 	ScoreDebug        []string
@@ -116,6 +134,16 @@ type Candidate struct {
 	EndStreamSeen     bool
 	StreamReset       bool
 	GoAwaySeen        bool
+
+	// REALITY Suitability attributes
+	CertIssuer            string
+	CertSubject           string
+	CertSANCount          int
+	H2SettingsReceived    bool
+	H2SettingsAckSent     bool
+	H2SettingsAckReceived bool
+	H2SettingsProfile     H2SettingsProfile
+	H2DataFrames          int
 }
 
 type TargetPair struct {
@@ -129,13 +157,18 @@ type PipelineStats struct {
 	mu               sync.Mutex
 	IPSampled        int
 	IPWithPTR        int
-	CRTRequests      int
+	CRTAttempts      int
+	CRTSuccess       int
+	CRTFailed        int
 	CRTUniqueSANs    int
 	DNSValidPairs    int
 	TCPConnected     int
 	TLSHandshakeOK   int
+	TLSValidationErr int
 	H2HeadersOK      int
 	EndStreamOK      int
+	ASNFiltered      int
+	CountryFiltered  int
 	CDNDropped       int
 }
 
@@ -509,7 +542,7 @@ func buildH2HeadersEncoder(sni string) []byte {
 	encoder.WriteField(hpack.HeaderField{Name: ":authority", Value: sni})
 	encoder.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	encoder.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
-	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"})
+	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 	encoder.WriteField(hpack.HeaderField{Name: "accept", Value: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
 	encoder.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "gzip, deflate, br"})
 
@@ -573,6 +606,13 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	cert := state.PeerCertificates[0]
 	now := time.Now()
 
+	cand.CertIssuer = cert.Issuer.CommonName
+	if cand.CertIssuer == "" && len(cert.Issuer.Organization) > 0 {
+		cand.CertIssuer = cert.Issuer.Organization[0]
+	}
+	cand.CertSubject = cert.Subject.CommonName
+	cand.CertSANCount = len(cert.DNSNames) + len(cert.IPAddresses)
+
 	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
 		return cand, &ProbeError{Stage: ProbeStageTLSValidation, Err: fmt.Errorf("certificate is expired or not yet valid")}
 	}
@@ -592,7 +632,6 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	t2 := time.Now()
 	wTo := time.Duration(cfg.H2WriteTimeoutMs) * time.Millisecond
 
-	// Write preface
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil {
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
@@ -605,8 +644,8 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
 
-	const maxInboundFrameSize = 16384
-	buf := make([]byte, maxInboundFrameSize)
+	maxInboundFrameSize := uint32(16384)
+	buf := make([]byte, 32768)
 	recvBuf := bytes.Buffer{}
 	headerBlocks := bytes.Buffer{}
 	decoder := hpack.NewDecoder(4096, nil)
@@ -634,7 +673,7 @@ ReadLoop:
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
 
 			if length > maxInboundFrameSize {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame exceeds limit")}
+				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame exceeds dynamic limit")}
 			}
 			if uint32(recvBuf.Len()) < 9+length {
 				break
@@ -655,17 +694,65 @@ ReadLoop:
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("SETTINGS on non-zero stream")}
 				}
 				if flags&FlagAck != 0 {
+					cand.H2SettingsAckReceived = true
 					if length != 0 {
 						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("SETTINGS ACK with non-zero payload")}
 					}
 					break
 				}
+
+				cand.H2SettingsReceived = true
 				if length%6 != 0 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length: %d", length)}
 				}
+
+				seenSettings := make(map[uint16]bool)
+				for i := 0; i < int(length); i += 6 {
+					id := binary.BigEndian.Uint16(payload[i : i+2])
+					val := binary.BigEndian.Uint32(payload[i+2 : i+6])
+
+					if seenSettings[id] {
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("duplicate SETTINGS identifier: %d", id)}
+					}
+					seenSettings[id] = true
+
+					switch id {
+					case 1:
+						cand.H2SettingsProfile.HeaderTableSize = val
+						cand.H2SettingsProfile.HasHeaderTableSize = true
+					case 2:
+						if val > 1 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS_ENABLE_PUSH: %d", val)}
+						}
+						cand.H2SettingsProfile.EnablePush = val
+						cand.H2SettingsProfile.HasEnablePush = true
+					case 3:
+						cand.H2SettingsProfile.MaxConcurrentStreams = val
+						cand.H2SettingsProfile.HasMaxConcurrentStreams = true
+					case 4:
+						if val > 0x7fffffff {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS_INITIAL_WINDOW_SIZE: %d", val)}
+						}
+						cand.H2SettingsProfile.InitialWindowSize = val
+						cand.H2SettingsProfile.HasInitialWindowSize = true
+					case 5:
+						if val < 16384 || val > 16777215 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS_MAX_FRAME_SIZE: %d", val)}
+						}
+						cand.H2SettingsProfile.MaxFrameSize = val
+						cand.H2SettingsProfile.HasMaxFrameSize = true
+						maxInboundFrameSize = val // Update local receive boundary safely
+					case 6:
+						cand.H2SettingsProfile.MaxHeaderListSize = val
+						cand.H2SettingsProfile.HasMaxHeaderListSize = true
+					}
+				}
+
 				if err := writeH2(uConn, buildH2Frame(FrameSettings, FlagAck, 0, nil), wTo); err != nil {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 				}
+				cand.H2SettingsAckSent = true
+
 			case FrameWindowUpdate:
 				if length != 4 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid WINDOW_UPDATE length: %d", length)}
@@ -674,12 +761,37 @@ ReadLoop:
 				if inc == 0 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("WINDOW_UPDATE increment is 0")}
 				}
+
 			case FrameHeaders:
 				if streamID == 1 {
 					if (flags & FlagEndStream) != 0 {
 						cand.EndStreamSeen = true
 					}
-					headerBlocks.Write(payload)
+
+					actualPayload := payload
+					var padLen int
+					if flags&FlagPadded != 0 {
+						if len(actualPayload) < 1 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED flag set but payload too short")}
+						}
+						padLen = int(actualPayload[0])
+						actualPayload = actualPayload[1:]
+					}
+					if flags&FlagPriority != 0 {
+						if len(actualPayload) < 5 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PRIORITY flag set but payload too short")}
+						}
+						actualPayload = actualPayload[5:] // Skip Stream Dependency and Weight
+					}
+					if padLen > 0 {
+						if len(actualPayload) < padLen {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("padding exceeds actual payload")}
+						}
+						actualPayload = actualPayload[:len(actualPayload)-padLen]
+					}
+
+					headerBlocks.Write(actualPayload)
+
 					if (flags & FlagEndHeaders) == 0 {
 						expectingContinuation = true
 						activeStreamID = streamID
@@ -706,6 +818,7 @@ ReadLoop:
 				}
 
 				headerBlocks.Write(payload)
+
 				if (flags & FlagEndHeaders) != 0 {
 					expectingContinuation = false
 					headers, err := decoder.DecodeFull(headerBlocks.Bytes())
@@ -721,20 +834,36 @@ ReadLoop:
 				}
 			case FrameData:
 				if streamID == 1 {
+					cand.H2DataFrames++
 					if (flags & FlagEndStream) != 0 {
 						cand.EndStreamSeen = true
 					}
-					cand.DataBytes += len(payload)
 
-					// Send WINDOW_UPDATE back to the server to prevent flow-control deadlocks for payloads > 64KB
-					if len(payload) > 0 {
-						inc := uint32(len(payload))
+					actualPayload := payload
+					var padLen int
+					if flags&FlagPadded != 0 {
+						if len(actualPayload) < 1 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED flag set but payload too short")}
+						}
+						padLen = int(actualPayload[0])
+						actualPayload = actualPayload[1:]
+					}
+					if padLen > 0 {
+						if len(actualPayload) < padLen {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("padding exceeds actual payload")}
+						}
+						actualPayload = actualPayload[:len(actualPayload)-padLen]
+					}
 
-						// Stream-level flow control
+					cand.BodyBytes += len(actualPayload)
+
+					// Flow control MUST use original frame payload length including padding (RFC 9113 Sec 6.1)
+					if length > 0 {
+						inc := uint32(length)
+
 						if err := writeH2(uConn, buildWindowUpdateFrame(1, inc), wTo); err != nil {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
-						// Connection-level flow control
 						if err := writeH2(uConn, buildWindowUpdateFrame(0, inc), wTo); err != nil {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
@@ -747,7 +876,7 @@ ReadLoop:
 				}
 			case FrameGoAway:
 				cand.GoAwaySeen = true
-				break ReadLoop
+				// Allowed to continue to process already-active stream 1 until EndStream or connection closed
 			}
 
 			if streamID == 1 && cand.EndStreamSeen && !expectingContinuation {
@@ -817,9 +946,15 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	}
 
 	if cfg.TargetASN != 0 && cand.ASN != cfg.TargetASN {
+		stats.mu.Lock()
+		stats.ASNFiltered++
+		stats.mu.Unlock()
 		return false
 	}
 	if cfg.TargetCountry != "" && !strings.EqualFold(cand.Country, cfg.TargetCountry) {
+		stats.mu.Lock()
+		stats.CountryFiltered++
+		stats.mu.Unlock()
 		return false
 	}
 	if cand.CDNStrong {
@@ -938,17 +1073,25 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 						if cached, ok := crtCache.Get(dom); ok {
 							return cached, nil
 						}
+
+						stats.mu.Lock()
+						stats.CRTAttempts++
+						stats.mu.Unlock()
+
 						crtCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 						defer cancel()
 						result, err := gatherCrtSh(crtCtx, dom, httpClient)
-						if err != nil {
-							return nil, err
-						}
-						crtCache.Put(dom, result)
 
 						stats.mu.Lock()
-						stats.CRTRequests++
+						if err != nil {
+							stats.CRTFailed++
+							stats.mu.Unlock()
+							return nil, err
+						}
+						stats.CRTSuccess++
 						stats.mu.Unlock()
+
+						crtCache.Put(dom, result)
 
 						uniqueCount := 0
 						for _, d := range result {
@@ -1019,6 +1162,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 			}
 			if pErr == nil || pErr.Stage > ProbeStageTLS {
 				stats.TLSHandshakeOK++
+			}
+			if pErr != nil && pErr.Stage == ProbeStageTLSValidation {
+				stats.TLSValidationErr++
 			}
 			if cand.H2HeadersReceived {
 				stats.H2HeadersOK++
@@ -1199,13 +1345,16 @@ func main() {
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("[*] IP отобрано для пула:      %d\n", stats.IPSampled)
 	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", stats.IPWithPTR)
-	fmt.Printf("[*] Уникальных crt.sh запросов:%d\n", stats.CRTRequests)
+	fmt.Printf("[*] Запросов к crt.sh (Всего): %d (Успешно: %d, Ошибок: %d)\n", stats.CRTAttempts, stats.CRTSuccess, stats.CRTFailed)
 	fmt.Printf("[*] Уникальных SAN найдено:    %d\n", stats.CRTUniqueSANs)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", stats.DNSValidPairs)
 	fmt.Printf("[*] Успешных TCP соединений:   %d\n", stats.TCPConnected)
 	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", stats.TLSHandshakeOK)
+	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", stats.TLSValidationErr)
 	fmt.Printf("[*] С откликом H2 Headers:     %d\n", stats.H2HeadersOK)
 	fmt.Printf("[*] Полных H2 ответов (END):   %d\n", stats.EndStreamOK)
+	fmt.Printf("[*] Отсеяно по ASN:            %d\n", stats.ASNFiltered)
+	fmt.Printf("[*] Отсеяно по Стране:         %d\n", stats.CountryFiltered)
 	fmt.Printf("[*] Отсеяно CDN (Strong):      %d\n", stats.CDNDropped)
 	fmt.Printf("[*] Финальных кандидатов:      %d\n", len(results))
 
@@ -1215,7 +1364,7 @@ func main() {
 	}
 
 	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
-	fmt.Printf("%-37.37s | %-15.15s | %-6s | %-4s | %-8s | %-17.17s | %-15.15s | %-8s | %s\n", "Цель (Реальный SNI)", "IP адрес", "SCORE", "HTTP", "H2 Resp", "Content-Type", "Сервер", "ALPN", "TTFB")
+	fmt.Printf("%-37.37s | %-15.15s | %-6s | %-4s | %-8s | %-17.17s | %-15.15s | %-8s | %s\n", "Цель (Реальный SNI)", "IP адрес", "SCORE", "HTTP", "H2 HEAD", "Content-Type", "Сервер", "ALPN", "TTFB")
 	fmt.Println(strings.Repeat("-", 135))
 
 	for _, r := range results {
