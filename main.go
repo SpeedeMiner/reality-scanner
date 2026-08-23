@@ -36,6 +36,7 @@ const (
 	ModePassive Mode = "passive"
 	ModeHybrid  Mode = "hybrid"
 	ModeDirect  Mode = "direct"
+	ModeAuto    Mode = "autonomous" // Новый полностью автоматический режим
 
 	FrameData         = 0x00
 	FrameHeaders      = 0x01
@@ -124,7 +125,7 @@ func CleanDomain(d string) string {
 	return d
 }
 
-// ================= AUTO DETECTION =================
+// ================= AUTO DETECTION & RIPE STAT API =================
 
 type ipAPIResp struct {
 	Status      string `json:"status"`
@@ -155,6 +156,38 @@ func autoDetectVPS() (uint, string, error) {
 	}
 
 	return asn, geo.CountryCode, nil
+}
+
+type RipeStatResponse struct {
+	Data struct {
+		Prefixes []struct {
+			Prefix string `json:"prefix"`
+		} `json:"prefixes"`
+	} `json:"data"`
+}
+
+func fetchASNCIDRs(asn uint) ([]string, error) {
+	urlStr := fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS%d", asn)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(urlStr)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var stat RipeStatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&stat); err != nil {
+		return nil, err
+	}
+
+	var cidrs []string
+	for _, p := range stat.Data.Prefixes {
+		// Фильтруем только IPv4 подсети
+		if !strings.Contains(p.Prefix, ":") {
+			cidrs = append(cidrs, p.Prefix)
+		}
+	}
+	return cidrs, nil
 }
 
 // ================= CIDR MERGE & SAMPLER =================
@@ -709,7 +742,7 @@ func main() {
 	
 	flag.StringVar(&modeStr, "mode", "passive", "passive | direct | hybrid")
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
-	flag.IntVar(&cfg.MaxIPs, "max-ips", 100000, "Limit for IP sampling")
+	flag.IntVar(&cfg.MaxIPs, "max-ips", 10000, "Limit for IP sampling")
 	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 2000, "TCP timeout ms")
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 2000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
@@ -728,7 +761,13 @@ func main() {
 	cfg.CIDRs = flag.Args()
 	if domainsStr != "" { cfg.Domains = strings.Split(domainsStr, ",") }
 
-	// Auto-detect Geo and ASN if not explicitly set
+	// Если не переданы ни домены, ни CIDR, принудительно переводим в автономный режим
+	if len(cfg.Domains) == 0 && len(cfg.CIDRs) == 0 {
+		log.Println("[*] No domains or CIDRs provided. Switching to FULL AUTONOMOUS MODE.")
+		cfg.Mode = ModeAuto
+	}
+
+	// Автоопределение локации и ASN
 	if cfg.TargetASN == 0 && cfg.TargetCountry == "" {
 		log.Println("[*] Auto-detecting VPS ASN and Country...")
 		asn, country, err := autoDetectVPS()
@@ -739,6 +778,25 @@ func main() {
 			cfg.TargetCountry = country
 			log.Printf("[+] Auto-detected: ASN=%d, Country=%s", cfg.TargetASN, cfg.TargetCountry)
 		}
+	}
+
+	// Обработка автономного режима (выкачивание подсетей)
+	if cfg.Mode == ModeAuto {
+		if cfg.TargetASN == 0 {
+			log.Fatal("[-] Autonomous mode failed: Could not determine ASN automatically.")
+		}
+		log.Printf("[*] Autonomous Mode: Fetching all announced IPv4 prefixes for AS%d via RIPE STAT API...", cfg.TargetASN)
+		cidrs, err := fetchASNCIDRs(cfg.TargetASN)
+		if err != nil {
+			log.Fatalf("[-] Failed to fetch CIDRs for AS%d: %v", cfg.TargetASN, err)
+		}
+		if len(cidrs) == 0 {
+			log.Fatalf("[-] No IPv4 prefixes found for AS%d", cfg.TargetASN)
+		}
+		log.Printf("[+] Successfully fetched %d IPv4 prefixes for AS%d", len(cidrs), cfg.TargetASN)
+		
+		cfg.CIDRs = cidrs
+		cfg.Mode = ModeDirect // Подсети найдены, запускаем обычный Direct-пайплайн
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -775,10 +833,10 @@ func main() {
 	if len(results) == 0 { log.Println("[-] No viable candidates found."); return }
 	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
 
-	fmt.Printf("\n%-25s | %-15s | %-5s | %-5s | %-18s | %-6s\n", "SNI", "IP Address", "Score", "ASN", "TCP/TLS/TTFB", "Status")
-	fmt.Println(strings.Repeat("-", 90))
+	fmt.Printf("\n%-30s | %-15s | %-5s | %-5s | %-18s | %-6s\n", "SNI", "IP Address", "Score", "ASN", "TCP/TLS/TTFB", "Status")
+	fmt.Println(strings.Repeat("-", 95))
 	for _, r := range results {
-		fmt.Printf("%-25s | %-15s | %-5.0f | %-5d | %-4d/%-4d/%-4d ms | %-6d\n",
+		fmt.Printf("%-30s | %-15s | %-5.0f | %-5d | %-4d/%-4d/%-4d ms | %-6d\n",
 			r.SNI, r.IP, r.Score, r.ASN,
 			r.Timings.TCP.Milliseconds(), r.Timings.TLS.Milliseconds(), r.Timings.TTFB.Milliseconds(), r.HTTPStatus)
 	}
