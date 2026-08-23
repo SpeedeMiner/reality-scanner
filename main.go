@@ -3,11 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -286,76 +284,42 @@ func uniqueDomains(domains []string) []string {
 	return result
 }
 
-// ================= DOWNLOAD & VERIFY DATABASES =================
+// ================= DOWNLOAD DATABASES =================
 
-func checkFileHash(path, expected string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return false
-	}
-	return hex.EncodeToString(h.Sum(nil)) == expected
-}
-
-func ensureDB(path, dbURL, shaURL string) error {
-	client := &http.Client{Timeout: 10 * time.Second}
-	
-	// Получаем ожидаемый sha256
-	resp, err := client.Get(shaURL)
-	if err != nil {
-		return fmt.Errorf("failed to fetch hash: %v", err)
-	}
-	defer resp.Body.Close()
-	hashBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read hash response: %v", err)
-	}
-	// Парсим первый токен (сам хэш)
-	expectedHash := strings.Split(strings.TrimSpace(string(hashBytes)), " ")[0]
-
-	// Проверяем существующий файл
+func ensureDB(path, dbURL string) error {
 	if _, err := os.Stat(path); err == nil {
-		if checkFileHash(path, expectedHash) {
-			return nil // Файл актуален и цел
-		}
-		fmt.Printf("[*] Файл %s устарел или поврежден. Обновляем...\n", path)
-	} else {
-		fmt.Printf("[*] Файл %s не найден. Начинаем загрузку...\n", path)
+		return nil // Файл уже существует
 	}
 
-	// Загружаем во временный файл
+	fmt.Printf("[*] Файл %s не найден. Загружаем с GitHub...\n", path)
+
 	tempFile := path + ".tmp"
 	out, err := os.Create(tempFile)
 	if err != nil {
 		return err
 	}
 
-	downloadClient := &http.Client{Timeout: 5 * time.Minute}
-	dlResp, err := downloadClient.Get(dbURL)
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Get(dbURL)
 	if err != nil {
 		out.Close()
 		os.Remove(tempFile)
 		return err
 	}
-	defer dlResp.Body.Close()
+	defer resp.Body.Close()
 
-	if _, err = io.Copy(out, dlResp.Body); err != nil {
+	if resp.StatusCode != http.StatusOK {
+		out.Close()
+		os.Remove(tempFile)
+		return fmt.Errorf("bad HTTP status: %d", resp.StatusCode)
+	}
+
+	if _, err = io.Copy(out, resp.Body); err != nil {
 		out.Close()
 		os.Remove(tempFile)
 		return err
 	}
 	out.Close()
-
-	// Проверяем скачанный файл
-	if !checkFileHash(tempFile, expectedHash) {
-		os.Remove(tempFile)
-		return fmt.Errorf("SHA256 mismatch after downloading %s", path)
-	}
 
 	return os.Rename(tempFile, path)
 }
@@ -1392,18 +1356,16 @@ func main() {
 	defer cancel()
 
 	// -------------------------------------------------------------
-	// ЗАГРУЗКА БАЗ MAXMIND С ПРОВЕРКОЙ ХЭША
+	// АВТОМАТИЧЕСКАЯ ЗАГРУЗКА БАЗ MAXMIND
 	// -------------------------------------------------------------
 	asnDBUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"
-	asnShaUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb.sha256sum"
-	if err := ensureDB(cfg.ASNPath, asnDBUrl, asnShaUrl); err != nil {
-		log.Fatalf("[-] Ошибка загрузки/проверки базы ASN (%s): %v", cfg.ASNPath, err)
+	if err := ensureDB(cfg.ASNPath, asnDBUrl); err != nil {
+		log.Fatalf("[-] Ошибка загрузки базы ASN (%s): %v", cfg.ASNPath, err)
 	}
 
 	countryDBUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
-	countryShaUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb.sha256sum"
-	if err := ensureDB(cfg.GeoIPPath, countryDBUrl, countryShaUrl); err != nil {
-		log.Fatalf("[-] Ошибка загрузки/проверки базы Country (%s): %v", cfg.GeoIPPath, err)
+	if err := ensureDB(cfg.GeoIPPath, countryDBUrl); err != nil {
+		log.Fatalf("[-] Ошибка загрузки базы Country (%s): %v", cfg.GeoIPPath, err)
 	}
 	// -------------------------------------------------------------
 
