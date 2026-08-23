@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -219,7 +220,7 @@ func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
 	if totalIPs == 0 { return nil }
 
 	sampleSize := uint64(maxIPs)
-	// Если лимит 0 или меньше, либо больше общего кол-ва IP, берем все IP
+	// Если лимит 0 или меньше, берем все IP из подсетей без ограничений
 	if maxIPs <= 0 || sampleSize > totalIPs { 
 		sampleSize = totalIPs 
 	}
@@ -354,6 +355,58 @@ func GatherOSINT(ctx context.Context, q TargetQuery, sources []OSINTSource) []Do
 	return result
 }
 
+// ================= SMART SNI EXTRACTOR =================
+
+// Функция вытягивает "боевой" домен из сертификата, игнорируя технические PTR и IP-адреса
+func extractRealSNI(cert *x509.Certificate, originalSNI, ip string) string {
+	if cert == nil {
+		return originalSNI
+	}
+	
+	ipHyphen := strings.ReplaceAll(ip, ".", "-")
+	var bestSAN string
+	
+	for _, san := range cert.DNSNames {
+		cleanSan := strings.ToLower(san)
+		
+		// Обработка wildcard доменов: *.example.com -> www.example.com
+		if strings.HasPrefix(cleanSan, "*.") {
+			cleanSan = "www." + cleanSan[2:]
+		}
+		
+		// Отбрасываем сырые IP адреса
+		if net.ParseIP(cleanSan) != nil {
+			continue
+		}
+		
+		// Отбрасываем домены, содержащие IP (вида 1-2-3-4.host.net)
+		if strings.Contains(cleanSan, ip) || strings.Contains(cleanSan, ipHyphen) {
+			continue
+		}
+		
+		// Отбрасываем мусорные и технические префиксы хостеров
+		isJunk := false
+		junkWords := []string{"static", "hosted-by", "vps", "server", "cp", "panel", "mail", "webmail", "autoconfig", "autodiscover", "localhost"}
+		for _, w := range junkWords {
+			if strings.HasPrefix(cleanSan, w+".") {
+				isJunk = true
+				break
+			}
+		}
+		if isJunk {
+			continue
+		}
+		
+		bestSAN = cleanSan
+		break // Берем первый чистый домен
+	}
+	
+	if bestSAN != "" {
+		return bestSAN
+	}
+	return originalSNI
+}
+
 // ================= HTTP/2 VALIDATOR =================
 
 func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
@@ -433,6 +486,13 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 		now := time.Now()
 		cand.CertValidDates = now.After(cert.NotBefore) && now.Before(cert.NotAfter)
 		cand.CertSANs = cert.DNSNames
+		
+		// Smart SNI Swap: Извлекаем реальный домен из сертификата
+		realSNI := extractRealSNI(cert, sni, ip)
+		if realSNI != sni {
+			cand.SNI = realSNI
+			cand.Sources["CertSAN"] = true // Помечаем, что домен был заменен на живой
+		}
 	}
 
 	t2 := time.Now()
@@ -440,7 +500,8 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 	
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil { return nil, err }
 	if err := writeH2(uConn, buildH2Frame(FrameSettings, 0, 0, []byte{}), wTo); err != nil { return nil, err }
-	if err := writeH2(uConn, buildH2Frame(FrameHeaders, FlagEndHeaders|FlagEndStream, 1, buildH2HeadersEncoder(sni)), wTo); err != nil { return nil, err }
+	// Отправляем HTTP/2 запрос уже с обновленным/настоящим SNI
+	if err := writeH2(uConn, buildH2Frame(FrameHeaders, FlagEndHeaders|FlagEndStream, 1, buildH2HeadersEncoder(cand.SNI)), wTo); err != nil { return nil, err }
 
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
 	
@@ -576,10 +637,8 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 
 func RunDirectPipeline(ctx context.Context, cfg Config, sampledIPs []string, dedup *Deduplicator, asnDB, countryDB *geoip2.Reader, sources []OSINTSource) []Candidate {
 	var mu sync.Mutex
-	// Карта: IP -> Домен -> Источник -> Булево значение (существует)
 	ipSniMap := make(map[string]map[string]map[string]bool)
 	
-	// ЭТАП 1: Разведка (PTR/OSINT)
 	g1, gCtx1 := errgroup.WithContext(ctx)
 	g1.SetLimit(cfg.Workers)
 	
@@ -622,7 +681,6 @@ func RunDirectPipeline(ctx context.Context, cfg Config, sampledIPs []string, ded
 		}
 	}
 
-	// ЭТАП 2: Пробинг HTTP/2
 	var candidates []Candidate
 	g2, gCtx2 := errgroup.WithContext(ctx)
 	g2.SetLimit(cfg.Workers)
@@ -633,7 +691,13 @@ func RunDirectPipeline(ctx context.Context, cfg Config, sampledIPs []string, ded
 			cand, err := ProbeH2(gCtx2, p.IP, p.SNI, cfg)
 			if err != nil { return nil }
 
-			cand.Sources = p.Src
+			// Если ProbeH2 подменил SNI на реальный (CertSAN), нам нужно обновить sources
+			if cand.Sources["CertSAN"] {
+				cand.Sources = map[string]bool{"CertSAN": true}
+			} else {
+				cand.Sources = p.Src
+			}
+
 			if validateAndEnrich(cand, asnDB, countryDB, cfg) {
 				mu.Lock()
 				candidates = append(candidates, *cand)
@@ -746,7 +810,7 @@ func main() {
 
 	fmt.Printf("[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
 
-	fmt.Printf("%-37.37s | %-15.15s | %-13.13s | %-5s | %-9s | %-20.20s | %s\n", "Цель (SNI)", "IP адрес", "ALPN", "HTTP", "DATA", "Сервер", "RTT")
+	fmt.Printf("%-37.37s | %-15.15s | %-13.13s | %-5s | %-9s | %-20.20s | %s\n", "Цель (Реальный SNI)", "IP адрес", "ALPN", "HTTP", "DATA", "Сервер", "RTT")
 	fmt.Println(strings.Repeat("-", 115))
 
 	for _, r := range results {
