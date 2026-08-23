@@ -41,7 +41,6 @@ const (
 	FlagEndHeaders = 0x04
 )
 
-// ================= НАСТРОЙКИ И ЭВРИСТИКИ =================
 const (
 	geoCountryURL = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
 	geoAsnURL     = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"
@@ -58,23 +57,6 @@ var cdnServers = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrato
 var cdnPTRs = []string{".cloudfront.net", ".fastly.net", ".akamaiedge.net", ".cloudflare.net"}
 
 var tldRe = regexp.MustCompile(`^[a-z]{2,24}$`)
-
-// ================= СТРУКТУРЫ =================
-type Target struct {
-	IP      string
-	Domains []string
-}
-
-type ValidResult struct {
-	Dest      string
-	SNI       string
-	IP        string
-	RTT       int64
-	ALPN      string
-	Status    string
-	Server    string
-	DataBytes int
-}
 
 // ================= УТИЛИТЫ =================
 func addAPIJitter(rng *rand.Rand) {
@@ -96,15 +78,13 @@ func ensureDBExists(targetPath, downloadURL string) error {
 	}
 
 	log.Printf("[*] База %s не найдена. Начинаем скачивание...", targetPath)
-
-	// Создаем временный файл в той же директории, что и целевой файл (защита от EXDEV / cross-device link)
 	dir := filepath.Dir(targetPath)
 	tmpFile, err := os.CreateTemp(dir, ".mmdb-*.tmp")
 	if err != nil {
 		return fmt.Errorf("создание temp файла: %v", err)
 	}
 	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath) // Удалит мусор при сбое до rename
+	defer os.Remove(tmpPath)
 
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Get(downloadURL)
@@ -125,19 +105,16 @@ func ensureDBExists(targetPath, downloadURL string) error {
 	}
 	tmpFile.Close()
 
-	// Валидация целостности базы перед заменой
 	testDB, err := geoip2.Open(tmpPath)
 	if err != nil {
-		return fmt.Errorf("скачанный файл повреждён или не является MMDB: %v", err)
+		return fmt.Errorf("скачанный файл повреждён: %v", err)
 	}
 	testDB.Close()
 
-	// Атомарная замена внутри одного раздела диска
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		return fmt.Errorf("ошибка rename: %v", err)
 	}
-
-	log.Printf("[+] База %s успешно загружена и проверена.", targetPath)
+	log.Printf("[+] База %s успешно загружена.", targetPath)
 	return nil
 }
 
@@ -145,7 +122,6 @@ func ensureDBExists(targetPath, downloadURL string) error {
 func getPublicIP(ctx context.Context) (string, error) {
 	urls := []string{"https://api.ipify.org", "https://ifconfig.me/ip"}
 	client := &http.Client{Timeout: 5 * time.Second}
-
 	for _, u := range urls {
 		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
 		resp, err := client.Do(req)
@@ -185,60 +161,42 @@ func getASNAndCountryLocal(ip string, asnDB, countryDB *geoip2.Reader) (uint, st
 }
 
 func getPrefixes(ctx context.Context, asn uint) []string {
-	if asn == 0 {
-		return nil
-	}
+	if asn == 0 { return nil }
 	client := &http.Client{Timeout: 10 * time.Second}
 	url := fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS%d", asn)
-	
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	resp, err := client.Do(req)
-	if err != nil {
-		return nil
-	}
+	if err != nil { return nil }
 	defer resp.Body.Close()
 
 	var result struct {
 		Data struct {
-			Prefixes []struct {
-				Prefix string `json:"prefix"`
-			} `json:"prefixes"`
+			Prefixes []struct{ Prefix string `json:"prefix"` } `json:"prefixes"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil
-	}
-
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil { return nil }
 	var prefixes []string
 	for _, p := range result.Data.Prefixes {
-		if !strings.Contains(p.Prefix, ":") {
-			prefixes = append(prefixes, p.Prefix)
-		}
+		if !strings.Contains(p.Prefix, ":") { prefixes = append(prefixes, p.Prefix) }
 	}
 	return prefixes
 }
 
-// ================= ГЕНЕРАТОР IP И СЭМПЛИРОВАНИЕ =================
+// ================= ГЕНЕРАТОР IP =================
 func generateAndShuffleIPs(prefixes []string, maxIPs int, rng *rand.Rand) []string {
 	var allIPs []string
-
 	for _, pStr := range prefixes {
 		_, ipnet, err := net.ParseCIDR(pStr)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 
 		ones, _ := ipnet.Mask.Size()
 		var subnets []string
-
 		if ones < 24 {
 			for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); incIPBy(ip, 256) {
 				subnets = append(subnets, fmt.Sprintf("%d.%d.%d.0/24", ip[0], ip[1], ip[2]))
 			}
 			rng.Shuffle(len(subnets), func(i, j int) { subnets[i], subnets[j] = subnets[j], subnets[i] })
-			if len(subnets) > MaxSampled24 {
-				subnets = subnets[:MaxSampled24]
-			}
+			if len(subnets) > MaxSampled24 { subnets = subnets[:MaxSampled24] }
 		} else {
 			subnets = []string{pStr}
 		}
@@ -248,29 +206,21 @@ func generateAndShuffleIPs(prefixes []string, maxIPs int, rng *rand.Rand) []stri
 			for ip := subIP.Mask(subNet.Mask); subNet.Contains(ip); inc(ip) {
 				ip4 := ip.To4()
 				if ip4 != nil {
-					if ip4[3] == 0 || ip4[3] == 255 {
-						continue
-					}
+					if ip4[3] == 0 || ip4[3] == 255 { continue }
 					allIPs = append(allIPs, ip.String())
 				}
 			}
 		}
 	}
-
 	rng.Shuffle(len(allIPs), func(i, j int) { allIPs[i], allIPs[j] = allIPs[j], allIPs[i] })
-
-	if maxIPs > 0 && len(allIPs) > maxIPs {
-		allIPs = allIPs[:maxIPs]
-	}
+	if maxIPs > 0 && len(allIPs) > maxIPs { allIPs = allIPs[:maxIPs] }
 	return allIPs
 }
 
 func inc(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
+		if ip[j] > 0 { break }
 	}
 }
 
@@ -279,28 +229,28 @@ func incIPBy(ip net.IP, val uint32) {
 	binary.BigEndian.PutUint32(ip.To4(), ipInt+val)
 }
 
-// ================= OSINT И ПАССИВНЫЙ DNS (ФАЗА 1) =================
+// ================= OSINT =================
+type Target struct { IP, Domain string }
+
+type ValidResult struct {
+	Dest, SNI, IP, ALPN, Status, Server string
+	RTT                                 int64
+	DataBytes                           int
+}
+
 func cleanDomain(d string) string {
 	d = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(d, "*.")))
 	parts := strings.Split(d, ".")
-	if len(parts) < 2 {
-		return ""
-	}
+	if len(parts) < 2 { return "" }
 	tld := parts[len(parts)-1]
-	if !tldRe.MatchString(tld) || bannedTLDs[tld] {
-		return ""
-	}
-	if strings.ContainsAny(d, " \t\r\n/\\:*?\"'<>|#%&={}~`!@$^()+[]") {
-		return ""
-	}
+	if !tldRe.MatchString(tld) || bannedTLDs[tld] { return "" }
+	if strings.ContainsAny(d, " \t\r\n/\\:*?\"'<>|#%&={}~`!@$^()+[]") { return "" }
 	return d
 }
 
 func isCDNDomain(d string) bool {
 	for _, ptr := range cdnPTRs {
-		if strings.HasSuffix(d, ptr) {
-			return true
-		}
+		if strings.HasSuffix(d, ptr) { return true }
 	}
 	return false
 }
@@ -310,33 +260,26 @@ func getPassiveDNS(ip string, rng *rand.Rand) []string {
 	var domains []string
 	client := &http.Client{Timeout: 5 * time.Second}
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/IPv4/%s/passive_dns", ip), nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 	if resp, err := client.Do(req); err == nil {
 		defer resp.Body.Close()
 		var res struct {
-			PassiveDNS []struct {
-				Hostname string `json:"hostname"`
-			} `json:"passive_dns"`
+			PassiveDNS []struct{ Hostname string `json:"hostname"` } `json:"passive_dns"`
 		}
 		json.NewDecoder(resp.Body).Decode(&res)
 		for _, r := range res.PassiveDNS {
-			if d := cleanDomain(r.Hostname); d != "" && !isCDNDomain(d) {
-				domains = append(domains, d)
-			}
+			if d := cleanDomain(r.Hostname); d != "" && !isCDNDomain(d) { domains = append(domains, d) }
 		}
 	}
 	return domains
 }
 
 func getPTR(ctx context.Context, ip string) []string {
-	resolver := net.Resolver{}
-	names, err := resolver.LookupAddr(ctx, ip)
+	names, err := net.DefaultResolver.LookupAddr(ctx, ip)
 	var res []string
 	if err == nil {
 		for _, n := range names {
-			if d := cleanDomain(strings.TrimSuffix(n, ".")); d != "" && !isCDNDomain(d) {
-				res = append(res, d)
-			}
+			if d := cleanDomain(strings.TrimSuffix(n, ".")); d != "" && !isCDNDomain(d) { res = append(res, d) }
 		}
 	}
 	return res
@@ -345,18 +288,11 @@ func getPTR(ctx context.Context, ip string) []string {
 func validateFCrDNS(ctx context.Context, ip string, domains []string) []string {
 	var valid []string
 	seen := make(map[string]bool)
-	resolver := net.Resolver{}
-
 	for _, d := range domains {
-		if seen[d] {
-			continue
-		}
+		if seen[d] { continue }
 		seen[d] = true
-
-		addrs, err := resolver.LookupHost(ctx, d)
-		if err != nil {
-			continue
-		}
+		addrs, err := net.DefaultResolver.LookupHost(ctx, d)
+		if err != nil { continue }
 		for _, a := range addrs {
 			if a == ip {
 				valid = append(valid, d)
@@ -369,23 +305,15 @@ func validateFCrDNS(ctx context.Context, ip string, domains []string) []string {
 
 func probeIPStealth(ctx context.Context, ip string, rng *rand.Rand) (string, []string) {
 	candidateDomains := getPTR(ctx, ip)
+	if len(candidateDomains) == 0 { candidateDomains = append(candidateDomains, getPassiveDNS(ip, rng)...) }
+	if len(candidateDomains) == 0 { return ip, nil }
 
-	if len(candidateDomains) == 0 {
-		candidateDomains = append(candidateDomains, getPassiveDNS(ip, rng)...)
-	}
-
-	if len(candidateDomains) == 0 {
-		return ip, nil
-	}
-
-	validatedDomains := validateFCrDNS(ctx, ip, candidateDomains)
-	if len(validatedDomains) > 5 {
-		validatedDomains = validatedDomains[:5]
-	}
-	return ip, validatedDomains
+	validated := validateFCrDNS(ctx, ip, candidateDomains)
+	if len(validated) > 5 { validated = validated[:5] }
+	return ip, validated
 }
 
-// ================= HTTP/2 ВАЛИДАЦИЯ (ФАЗА 2) =================
+// ================= HTTP/2 =================
 func buildH2HeadersEncoder(sni string) []byte {
 	var buf bytes.Buffer
 	encoder := hpack.NewEncoder(&buf)
@@ -393,7 +321,7 @@ func buildH2HeadersEncoder(sni string) []byte {
 	encoder.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	encoder.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
 	encoder.WriteField(hpack.HeaderField{Name: ":authority", Value: sni})
-	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0"})
+	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"})
 	return buf.Bytes()
 }
 
@@ -409,11 +337,12 @@ func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte
 	return append(header, payload...)
 }
 
-func verifyH2(ctx context.Context, ip, sni string, dialTimeout time.Duration) *ValidResult {
+func verifyH2(ctx context.Context, ip, sni string, dialTimeout time.Duration, debug bool) *ValidResult {
 	t0 := time.Now()
 	dialer := &net.Dialer{Timeout: dialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
 	if err != nil {
+		if debug { log.Printf("[DEBUG] %s (%s) - TCP Dial Fail: %v", sni, ip, err) }
 		return nil
 	}
 	defer conn.Close()
@@ -428,19 +357,20 @@ func verifyH2(ctx context.Context, ip, sni string, dialTimeout time.Duration) *V
 
 	uConn.SetDeadline(time.Now().Add(dialTimeout))
 	if err := uConn.HandshakeContext(ctx); err != nil {
+		if debug { log.Printf("[DEBUG] %s (%s) - TLS Handshake Fail: %v", sni, ip, err) }
 		return nil
 	}
 
 	rtt := time.Since(t0).Milliseconds()
-	if uConn.ConnectionState().NegotiatedProtocol != "h2" {
+	alpn := uConn.ConnectionState().NegotiatedProtocol
+	if alpn != "h2" {
+		if debug { log.Printf("[DEBUG] %s (%s) - Отклонён (ALPN: '%s')", sni, ip, alpn) }
 		return nil
 	}
 
 	uConn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
 	uConn.Write(buildH2Frame(FrameSettings, 0, 0, []byte{}))
-
-	headerPayload := buildH2HeadersEncoder(sni)
-	uConn.Write(buildH2Frame(FrameHeaders, FlagEndHeaders|FlagEndStream, 1, headerPayload))
+	uConn.Write(buildH2Frame(FrameHeaders, FlagEndHeaders|FlagEndStream, 1, buildH2HeadersEncoder(sni)))
 
 	buf := make([]byte, 8192)
 	recvBuf := bytes.Buffer{}
@@ -455,28 +385,19 @@ func verifyH2(ctx context.Context, ip, sni string, dialTimeout time.Duration) *V
 
 ReadLoop:
 	for {
-		if ctx.Err() != nil {
-			return nil
-		}
+		if ctx.Err() != nil { return nil }
 		n, err := uConn.Read(buf)
-		if n > 0 {
-			recvBuf.Write(buf[:n])
-		}
-		if err != nil || recvBuf.Len() > 32768 {
-			break
-		}
-		
-		// Fallback для раннего сброса не HTTP/2
+		if n > 0 { recvBuf.Write(buf[:n]) }
+
 		if bytes.HasPrefix(recvBuf.Bytes(), []byte("HTTP/1.")) {
+			if debug { log.Printf("[DEBUG] %s (%s) - Вернул HTTP/1.1 вместо H2 фрейма", sni, ip) }
 			return nil
 		}
 
 		for recvBuf.Len() >= 9 {
 			data := recvBuf.Bytes()
 			length := int(data[0])<<16 | int(data[1])<<8 | int(data[2])
-			if recvBuf.Len() < 9+length {
-				break // Дожидаемся остатка фрейма
-			}
+			if recvBuf.Len() < 9+length { break }
 
 			frameType := data[3]
 			flags := data[4]
@@ -484,13 +405,12 @@ ReadLoop:
 			recvBuf.Next(9 + length)
 
 			if frameType == FrameGoAway || frameType == FrameRSTStream {
+				if debug { log.Printf("[DEBUG] %s (%s) - Сервер прислал GOAWAY/RST", sni, ip) }
 				return nil
 			}
-
 			if frameType == FrameSettings && (flags&0x01) == 0 {
 				uConn.Write(buildH2Frame(FrameSettings, 0x01, 0, []byte{}))
 			}
-
 			if frameType == FrameHeaders || frameType == FrameContinuation {
 				headerBlocks.Write(payload)
 				if (flags & FlagEndHeaders) != 0 {
@@ -498,52 +418,44 @@ ReadLoop:
 					headerBlocks.Reset()
 					for _, h := range headers {
 						hName := strings.ToLower(h.Name)
-						if hName == ":status" {
-							status = h.Value
-						}
-						if hName == "server" {
-							server = h.Value
-						}
+						if hName == ":status" { status = h.Value }
+						if hName == "server" { server = h.Value }
 						for _, ch := range cdnHeaders {
-							if hName == ch {
-								isCDN = true
-							}
+							if hName == ch { isCDN = true }
 						}
 					}
 				}
 			}
-
-			if frameType == FrameData {
-				dataBytes += len(payload)
-			}
-
-			if (flags & FlagEndStream) != 0 {
+			if frameType == FrameData { dataBytes += len(payload) }
+			
+			// БАГФИКС ЗДЕСЬ: Проверяем END_STREAM ТОЛЬКО для фреймов DATA или HEADERS. 
+			// Иначе мы рвали соединение на служебном SETTINGS ACK.
+			if (frameType == FrameData || frameType == FrameHeaders) && (flags&FlagEndStream) != 0 {
 				break ReadLoop
 			}
+		}
+
+		if err != nil || recvBuf.Len() > 32768 {
+			if debug && err != io.EOF { log.Printf("[DEBUG] %s (%s) - Ошибка чтения/EOF: %v", sni, ip, err) }
+			break
 		}
 	}
 
 	if status == "" || isCDN {
+		if debug { log.Printf("[DEBUG] %s (%s) - Отклонён (Status: %s, isCDN: %v)", sni, ip, status, isCDN) }
 		return nil
 	}
 
 	serverLower := strings.ToLower(server)
 	for _, cdn := range cdnServers {
 		if strings.Contains(serverLower, cdn) {
+			if debug { log.Printf("[DEBUG] %s (%s) - Обнаружен CDN Server: %s", sni, ip, server) }
 			return nil
 		}
 	}
 
-	return &ValidResult{
-		Dest:      sni + ":443",
-		SNI:       sni,
-		IP:        ip,
-		RTT:       rtt,
-		ALPN:      "h2",
-		Status:    status,
-		Server:    server,
-		DataBytes: dataBytes,
-	}
+	if debug { log.Printf("[DEBUG] %s (%s) - УСПЕХ! H2 200 OK", sni, ip) }
+	return &ValidResult{Dest: sni + ":443", SNI: sni, IP: ip, RTT: rtt, ALPN: "h2", Status: status, Server: server, DataBytes: dataBytes}
 }
 
 // ================= MAIN =================
@@ -555,11 +467,8 @@ func main() {
 	countryFlag := flag.String("c", "", "Код страны (RU, US и т.д.)")
 	dbCountry := flag.String("geoip", "GeoLite2-Country.mmdb", "Путь к GeoLite2-Country.mmdb")
 	dbASN := flag.String("asn", "GeoLite2-ASN.mmdb", "Путь к GeoLite2-ASN.mmdb")
+	debugMode := flag.Bool("debug", false, "Выводить причины отбрасывания целей (Фаза 2)")
 	flag.Parse()
-
-	if *workers > 150 {
-		log.Println("[!] Предупреждение: большое кол-во воркеров может вызвать ban или drop пакетов.")
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -569,54 +478,36 @@ func main() {
 	fmt.Println("      STEALTH REALITY SCANNER (OSINT-First + FCrDNS + H2 + AutoDB)")
 	fmt.Println(strings.Repeat("=", 115))
 
-	if err := ensureDBExists(*dbCountry, geoCountryURL); err != nil {
-		log.Fatalf("[-] Ошибка GeoIP Country: %v", err)
-	}
-	if err := ensureDBExists(*dbASN, geoAsnURL); err != nil {
-		log.Fatalf("[-] Ошибка GeoIP ASN: %v", err)
-	}
+	if err := ensureDBExists(*dbCountry, geoCountryURL); err != nil { log.Fatalf("[-] %v", err) }
+	if err := ensureDBExists(*dbASN, geoAsnURL); err != nil { log.Fatalf("[-] %v", err) }
 
-	countryDB, err := geoip2.Open(*dbCountry)
-	if err != nil {
-		log.Fatalf("[-] Не удалось открыть GeoIP Country БД: %v", err)
-	}
+	countryDB, _ := geoip2.Open(*dbCountry)
+	asnDB, _ := geoip2.Open(*dbASN)
 	defer countryDB.Close()
-
-	asnDB, err := geoip2.Open(*dbASN)
-	if err != nil {
-		log.Fatalf("[-] Не удалось открыть GeoIP ASN БД: %v", err)
-	}
 	defer asnDB.Close()
 
 	myIP := *vpsIP
 	if myIP == "" {
 		ip, err := getPublicIP(ctx)
-		if err != nil {
-			log.Fatalf("[-] %v. Укажите IP вручную через флаг -vps-ip", err)
-		}
+		if err != nil { log.Fatalf("[-] %v", err) }
 		myIP = ip
 	}
 
 	asnNum, asnStr, country := getASNAndCountryLocal(myIP, asnDB, countryDB)
-	if *countryFlag != "" {
-		country = strings.ToUpper(*countryFlag)
-	}
+	if *countryFlag != "" { country = strings.ToUpper(*countryFlag) }
 
 	log.Printf("[*] IP сервера:        %s", myIP)
 	log.Printf("[*] ASN:               %s (Local MMDB)", asnStr)
 	log.Printf("[*] Страна поиска:     %s", country)
 
 	allPrefixes := getPrefixes(ctx, asnNum)
-	
 	var targetPrefixes []string
 	if country == "" {
 		targetPrefixes = allPrefixes
 	} else {
 		for _, p := range allPrefixes {
 			ip, _, err := net.ParseCIDR(p)
-			if err != nil {
-				continue
-			}
+			if err != nil { continue }
 			if record, err := countryDB.Country(ip); err == nil && strings.ToUpper(record.Country.IsoCode) == country {
 				targetPrefixes = append(targetPrefixes, p)
 			}
@@ -628,10 +519,7 @@ func main() {
 	totalIPs := len(ips)
 	log.Printf("[*] Подготовлено IP:   %d (Shuffled & Sampled)", totalIPs)
 
-	if totalIPs == 0 {
-		log.Println("[-] Нет адресов для сканирования.")
-		return
-	}
+	if totalIPs == 0 { return }
 
 	jobs := make(chan string, totalIPs)
 	results1 := make(chan Target, totalIPs)
@@ -643,24 +531,18 @@ func main() {
 			defer wg.Done()
 			localRng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 			for ip := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
+				if ctx.Err() != nil { return }
 				ctxReq, cancelReq := context.WithTimeout(ctx, 4*time.Second)
 				_, doms := probeIPStealth(ctxReq, ip, localRng)
 				cancelReq()
-				if len(doms) > 0 {
-					results1 <- Target{IP: ip, Domains: doms}
-				}
+				if len(doms) > 0 { results1 <- Target{IP: ip, Domains: doms} }
 			}
 		}(i)
 	}
 
 	go func() {
 		for _, ip := range ips {
-			if ctx.Err() != nil {
-				break
-			}
+			if ctx.Err() != nil { break }
 			jobs <- ip
 		}
 		close(jobs)
@@ -670,19 +552,14 @@ func main() {
 	close(results1)
 
 	var targets []Target
-	for t := range results1 {
-		targets = append(targets, t)
-	}
+	for t := range results1 { targets = append(targets, t) }
 
 	if ctx.Err() != nil {
-		log.Println("[!] Сканирование прервано пользователем. Вывожу промежуточные результаты...")
+		log.Println("[!] Прервано. Промежуточные результаты...")
 	} else {
 		log.Printf("\n[+] OSINT фаза завершена. Найдено IP с FCrDNS доменами: %d", len(targets))
 	}
-
-	if len(targets) == 0 {
-		return
-	}
+	if len(targets) == 0 { return }
 
 	type ValidateJob struct{ IP, SNI string }
 	jobs2 := make(chan ValidateJob, len(targets)*5)
@@ -694,10 +571,8 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for j := range jobs2 {
-				if ctx.Err() != nil {
-					return
-				}
-				if res := verifyH2(ctx, j.IP, j.SNI, dialTimeout); res != nil {
+				if ctx.Err() != nil { return }
+				if res := verifyH2(ctx, j.IP, j.SNI, dialTimeout, *debugMode); res != nil {
 					results2 <- res
 				}
 			}
@@ -707,9 +582,7 @@ func main() {
 	go func() {
 		for _, t := range targets {
 			for _, d := range t.Domains {
-				if ctx.Err() != nil {
-					break
-				}
+				if ctx.Err() != nil { break }
 				jobs2 <- ValidateJob{IP: t.IP, SNI: d}
 			}
 		}
@@ -720,26 +593,20 @@ func main() {
 	close(results2)
 
 	var finalResults []*ValidResult
-	for r := range results2 {
-		finalResults = append(finalResults, r)
-	}
+	for r := range results2 { finalResults = append(finalResults, r) }
 
 	if len(finalResults) == 0 {
 		log.Println("[-] Подходящих HTTP/2 целей не обнаружено.")
 		return
 	}
 
-	sort.Slice(finalResults, func(i, j int) bool {
-		return finalResults[i].RTT < finalResults[j].RTT
-	})
+	sort.Slice(finalResults, func(i, j int) bool { return finalResults[i].RTT < finalResults[j].RTT })
 
 	fmt.Printf("\n%-36s | %-15s | %-5s | %-9s | %-20s | %-7s\n", "Цель (SNI)", "IP адрес", "HTTP", "DATA", "Сервер", "RTT")
 	fmt.Println(strings.Repeat("-", 110))
 	for _, r := range finalResults {
-		dataStr := fmt.Sprintf("%d B", r.DataBytes)
-		rttStr := fmt.Sprintf("%d ms", r.RTT)
-		fmt.Printf("%-36s | %-15s | %-5s | %-9s | %-20s | %-7s\n",
-			limitStr(r.SNI, 36), r.IP, r.Status, dataStr, limitStr(r.Server, 20), rttStr)
+		fmt.Printf("%-36s | %-15s | %-5s | %-9s | %-20s | %d ms\n",
+			limitStr(r.SNI, 36), r.IP, r.Status, fmt.Sprintf("%d B", r.DataBytes), limitStr(r.Server, 20), r.RTT)
 	}
 
 	best := finalResults[0]
