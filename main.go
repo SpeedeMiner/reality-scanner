@@ -54,7 +54,8 @@ const (
 )
 
 var (
-	cdnServers = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri"}
+	// Расширенный список CDN для жесткого бана (мы не хотим использовать кэширующие узлы)
+	cdnServers = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri", "gws", "ats", "varnish", "github"}
 	cdnHeaders = []string{"x-cache", "x-served-by", "cf-ray"}
 	domainRe   = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
 )
@@ -220,7 +221,6 @@ func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
 	if totalIPs == 0 { return nil }
 
 	sampleSize := uint64(maxIPs)
-	// Если лимит 0 или меньше, берем все IP из подсетей без ограничений
 	if maxIPs <= 0 || sampleSize > totalIPs { 
 		sampleSize = totalIPs 
 	}
@@ -357,54 +357,59 @@ func GatherOSINT(ctx context.Context, q TargetQuery, sources []OSINTSource) []Do
 
 // ================= SMART SNI EXTRACTOR =================
 
-// Функция вытягивает "боевой" домен из сертификата, игнорируя технические PTR и IP-адреса
-func extractRealSNI(cert *x509.Certificate, originalSNI, ip string) string {
-	if cert == nil {
-		return originalSNI
+// resolveAndCheck делает реальный DNS запрос и проверяет, ведет ли домен на сканируемый IP
+func resolveAndCheck(ctx context.Context, domain, ip string) bool {
+	dnsCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupHost(dnsCtx, domain)
+	if err != nil { return false }
+	for _, a := range addrs {
+		if a == ip { return true }
 	}
-	
+	return false
+}
+
+// extractRealSNI отсеивает мусорные домены и одобряет только те, что резолвятся в нужный IP
+func extractRealSNI(ctx context.Context, cert *x509.Certificate, originalSNI, ip string) string {
+	megaCorps := []string{"google", "yahoo", "apple", "microsoft", "github", "azure", "amazon", "aws", "cloudflare", "fastly", "akamai", "yandex"}
+	junkPrefixes := []string{"static.", "hosted-by.", "vps.", "server.", "cp.", "panel.", "mail.", "webmail.", "autoconfig.", "autodiscover.", "localhost.", "ns1.", "ns2.", "pop.", "smtp.", "imap."}
+	hexRe := regexp.MustCompile(`^[a-f0-9]{15,}\.`)
 	ipHyphen := strings.ReplaceAll(ip, ".", "-")
-	var bestSAN string
-	
-	for _, san := range cert.DNSNames {
-		cleanSan := strings.ToLower(san)
-		
-		// Обработка wildcard доменов: *.example.com -> www.example.com
-		if strings.HasPrefix(cleanSan, "*.") {
-			cleanSan = "www." + cleanSan[2:]
-		}
-		
-		// Отбрасываем сырые IP адреса
-		if net.ParseIP(cleanSan) != nil {
-			continue
-		}
-		
-		// Отбрасываем домены, содержащие IP (вида 1-2-3-4.host.net)
-		if strings.Contains(cleanSan, ip) || strings.Contains(cleanSan, ipHyphen) {
-			continue
-		}
-		
-		// Отбрасываем мусорные и технические префиксы хостеров
-		isJunk := false
-		junkWords := []string{"static", "hosted-by", "vps", "server", "cp", "panel", "mail", "webmail", "autoconfig", "autodiscover", "localhost"}
-		for _, w := range junkWords {
-			if strings.HasPrefix(cleanSan, w+".") {
-				isJunk = true
-				break
+
+	if cert != nil {
+		for _, san := range cert.DNSNames {
+			cleanSan := strings.ToLower(san)
+			if strings.HasPrefix(cleanSan, "*.") { cleanSan = "www." + cleanSan[2:] }
+			
+			if net.ParseIP(cleanSan) != nil || strings.Contains(cleanSan, ip) || strings.Contains(cleanSan, ipHyphen) { continue }
+			
+			isJunk := false
+			for _, p := range junkPrefixes {
+				if strings.HasPrefix(cleanSan, p) { isJunk = true; break }
+			}
+			if hexRe.MatchString(cleanSan) { isJunk = true }
+			for _, corp := range megaCorps {
+				if strings.Contains(cleanSan, corp) { isJunk = true; break }
+			}
+			if isJunk { continue }
+
+			// Если SAN выглядит чистым, проверяем, резолвится ли он в наш IP
+			if resolveAndCheck(ctx, cleanSan, ip) {
+				return cleanSan
 			}
 		}
-		if isJunk {
-			continue
-		}
-		
-		bestSAN = cleanSan
-		break // Берем первый чистый домен
 	}
-	
-	if bestSAN != "" {
-		return bestSAN
+
+	// Если из сертификата ничего не подошло (или его нет), жестко проверяем изначальный SNI (из PTR)
+	isOrigJunk := false
+	for _, corp := range megaCorps {
+		if strings.Contains(strings.ToLower(originalSNI), corp) { isOrigJunk = true; break }
 	}
-	return originalSNI
+	if !isOrigJunk && resolveAndCheck(ctx, originalSNI, ip) {
+		return originalSNI
+	}
+
+	return "" // Мусорный/нерезолвящийся домен — отбрасываем
 }
 
 // ================= HTTP/2 VALIDATOR =================
@@ -487,11 +492,20 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 		cand.CertValidDates = now.After(cert.NotBefore) && now.Before(cert.NotAfter)
 		cand.CertSANs = cert.DNSNames
 		
-		// Smart SNI Swap: Извлекаем реальный домен из сертификата
-		realSNI := extractRealSNI(cert, sni, ip)
+		// Извлекаем чистый домен и проверяем его DNS
+		realSNI := extractRealSNI(ctx, cert, sni, ip)
+		if realSNI == "" {
+			return nil, fmt.Errorf("strict validation failed: no resolving SAN found")
+		}
+		
 		if realSNI != sni {
 			cand.SNI = realSNI
-			cand.Sources["CertSAN"] = true // Помечаем, что домен был заменен на живой
+			cand.Sources["CertSAN_Verified"] = true
+		}
+	} else {
+		// Сертификата нет, проверяем изначальный SNI
+		if !resolveAndCheck(ctx, sni, ip) {
+			return nil, fmt.Errorf("strict validation failed: original SNI does not resolve")
 		}
 	}
 
@@ -500,7 +514,7 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 	
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil { return nil, err }
 	if err := writeH2(uConn, buildH2Frame(FrameSettings, 0, 0, []byte{}), wTo); err != nil { return nil, err }
-	// Отправляем HTTP/2 запрос уже с обновленным/настоящим SNI
+	// Шлем H2-заголовки с проверенным, настоящим SNI
 	if err := writeH2(uConn, buildH2Frame(FrameHeaders, FlagEndHeaders|FlagEndStream, 1, buildH2HeadersEncoder(cand.SNI)), wTo); err != nil { return nil, err }
 
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
@@ -609,9 +623,15 @@ func parseHeaders(cand *Candidate, headers []hpack.HeaderField) {
 		if hName == ":status" { fmt.Sscanf(hVal, "%d", &cand.HTTPStatus) }
 		if hName == "server" {
 			cand.Server = h.Value
-			for _, cdn := range cdnServers { if strings.Contains(hVal, cdn) { cand.CDNConfidence += 30 } }
+			// Жесткий бан глобальных CDN по заголовку Server
+			for _, cdn := range cdnServers { 
+				if strings.Contains(hVal, cdn) { cand.CDNConfidence += 100 } 
+			}
 		}
-		for _, cdnH := range cdnHeaders { if hName == cdnH { cand.CDNConfidence += 20 } }
+		// Пенальти за CDN-специфичные заголовки
+		for _, cdnH := range cdnHeaders { 
+			if hName == cdnH { cand.CDNConfidence += 20 } 
+		}
 	}
 }
 
@@ -626,6 +646,9 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 
 	if cfg.TargetASN != 0 && cand.ASN != cfg.TargetASN { return false }
 	if cfg.TargetCountry != "" && !strings.EqualFold(cand.Country, cfg.TargetCountry) { return false }
+
+	// Отбрасываем жесткие CDN и кэши (Google, Yahoo, Cloudflare)
+	if cand.CDNConfidence >= 100 { return false } 
 
 	cand.Score = 50.0
 	if !cand.CertValidDates { cand.Score -= 30.0 }
@@ -691,9 +714,8 @@ func RunDirectPipeline(ctx context.Context, cfg Config, sampledIPs []string, ded
 			cand, err := ProbeH2(gCtx2, p.IP, p.SNI, cfg)
 			if err != nil { return nil }
 
-			// Если ProbeH2 подменил SNI на реальный (CertSAN), нам нужно обновить sources
-			if cand.Sources["CertSAN"] {
-				cand.Sources = map[string]bool{"CertSAN": true}
+			if cand.Sources["CertSAN_Verified"] {
+				cand.Sources = map[string]bool{"CertSAN_Verified": true}
 			} else {
 				cand.Sources = p.Src
 			}
@@ -804,7 +826,7 @@ func main() {
 	}
 
 	if len(results) == 0 {
-		fmt.Println("[-] Подходящих кандидатов не найдено.")
+		fmt.Println("[-] Подходящих кандидатов не найдено. (Все отброшены из-за строгих проверок DNS/CDN)")
 		return
 	}
 
