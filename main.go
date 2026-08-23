@@ -139,6 +139,7 @@ type Candidate struct {
 	Country           string
 	CDNStrong         bool
 	CDNWeak           bool
+	Score             float64
 	RealityScore      RealityScore
 	CertChainValid    bool
 	EndStreamSeen     bool
@@ -602,6 +603,7 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	}
 	cand.Timings.TLS = time.Since(t1)
 
+	// INTENTIONAL BEHAVIOR: Do not hard-fail if negotiated protocol isn't H2.
 	if uConn.ConnectionState().NegotiatedProtocol == "h2" {
 		cand.ALPN = "h2"
 	} else {
