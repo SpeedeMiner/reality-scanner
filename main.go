@@ -56,8 +56,7 @@ const (
 	FlagPriority   = 0x20
 	FlagAck        = 0x01
 
-	maxProviderNamesPerRoot = 100
-	maxDiscoveryRoots       = 30
+	maxDiscoveryRoots = 30
 )
 
 var (
@@ -175,8 +174,9 @@ type Candidate struct {
 	EndStreamSeen     bool
 	StreamReset       bool
 	GoAwaySeen        bool
-	Sources           DomainSource
-	DomainQuality     string
+
+	Sources       DomainSource
+	DomainQuality string
 
 	CertIssuer            string
 	CertSubject           string
@@ -210,15 +210,21 @@ type ProviderStats struct {
 }
 
 type PipelineStats struct {
-	mu            sync.Mutex
-	IPSampled     int
-	IPWithPTR     int
-	DNSValidPairs int
-	TCPConnected  int
-	TLSHandshake  int
-	TLSValidation int
-	H2HeadersOK   int
-	EndStreamOK   int
+	mu                  sync.Mutex
+	IPSampled           int
+	IPWithPTR           int
+	DNSQueries          int
+	DNSSuccess          int
+	DNSFailed           int
+	DNSResolvedIPs      int
+	DNSIPsInTargetRange int
+	DNSTargetDomains    int
+	DNSValidPairs       int
+	TCPConnected        int
+	TLSHandshake        int
+	TLSValidation       int
+	H2HeadersOK         int
+	EndStreamOK         int
 
 	ASNFiltered     int
 	CountryFiltered int
@@ -306,9 +312,13 @@ func CleanDomain(d string) string {
 }
 
 func GetRootDomain(domain string) string {
+	domain = CleanDomain(domain)
+	if domain == "" {
+		return ""
+	}
 	root, err := publicsuffix.EffectiveTLDPlusOne(domain)
 	if err != nil {
-		return domain
+		return ""
 	}
 	return root
 }
@@ -557,7 +567,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 
 			if isTimeout || is5xx || isLimit {
 				r.cbFailures++
-				if r.cbFailures >= 5 {
+				if r.cbFailures >= 5 && r.cbUntil.IsZero() {
 					r.cbUntil = time.Now().Add(5 * time.Minute)
 					fmt.Printf("[!] %s временно отключен на 5м после 5 сбоев.\n", r.Name())
 				}
@@ -573,11 +583,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			return nil, err
 		}
 
-		cleanRes := uniqueDomains(res)
-		if r.Config.MaxNames > 0 && len(cleanRes) > r.Config.MaxNames {
-			cleanRes = cleanRes[:r.Config.MaxNames]
-		}
-
+		cleanRes := rankAndLimitDomains(res, r.Config.MaxNames)
 		recordProviderStat(r.Name(), r.Category(), true, false, len(cleanRes))
 		provCache.Put(cacheKey, cleanRes)
 		return cleanRes, nil
@@ -730,7 +736,7 @@ func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.
 	var result []string
 	for i, row := range cdx {
 		if i == 0 || len(row) < 1 {
-			continue // Skip header
+			continue
 		}
 		if parsed, err := url.Parse(row[0]); err == nil && parsed.Hostname() != "" {
 			if d := CleanDomain(parsed.Hostname()); d != "" {
@@ -747,7 +753,7 @@ func (p *hackerTargetProvider) Name() string                 { return "HackerTar
 func (p *hackerTargetProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *hackerTargetProvider) QueryType() ProviderQueryType { return QueryIP }
 func (p *hackerTargetProvider) SourceBit() DomainSource      { return SourceHackerTarget }
-func (p *hackerTargetProvider) MaxRoots() int                { return 0 } // IP Provider
+func (p *hackerTargetProvider) MaxRoots() int                { return 0 }
 func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
 	u := fmt.Sprintf("https://api.hackertarget.com/reverseiplookup/?q=%s", url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -1006,12 +1012,34 @@ func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
 	return result
 }
 
+func ipInRanges(ipStr string, ranges []ipRange) bool {
+	parsed := net.ParseIP(ipStr)
+	if parsed == nil {
+		return false
+	}
+	ip4 := parsed.To4()
+	if ip4 == nil {
+		return false
+	}
+	val := uint64(binary.BigEndian.Uint32(ip4))
+	for _, r := range ranges {
+		if val >= r.start && val <= r.end {
+			return true
+		}
+	}
+	return false
+}
+
 func resolveIPv4Cached(ctx context.Context, domain string) ([]string, error) {
+	domain = CleanDomain(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("invalid domain")
+	}
 	v, err, _ := dnsGroup.Do(domain, func() (interface{}, error) {
 		if cached, ok := dnsCache.Get(domain); ok {
 			return cached, nil
 		}
-		dnsCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		dnsCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 		defer cancel()
 
 		ips, err := net.DefaultResolver.LookupIP(dnsCtx, "ip4", domain)
@@ -1019,9 +1047,18 @@ func resolveIPv4Cached(ctx context.Context, domain string) ([]string, error) {
 			return nil, err
 		}
 
+		seen := make(map[string]struct{})
 		var res []string
 		for _, ip := range ips {
-			res = append(res, ip.String())
+			ip4 := ip.To4()
+			if ip4 == nil {
+				continue
+			}
+			s := ip4.String()
+			if _, ok := seen[s]; !ok {
+				seen[s] = struct{}{}
+				res = append(res, s)
+			}
 		}
 		dnsCache.Put(domain, res)
 		return res, nil
@@ -1679,7 +1716,7 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	return cand.Score >= 0
 }
 
-func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, countryDB *geoip2.Reader) []Candidate {
+func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange, asnDB, countryDB *geoip2.Reader) []Candidate {
 	var mu sync.Mutex
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
@@ -1786,25 +1823,25 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 		score := func(s DomainSource) int {
 			sc := 0
 			if s.Has(SourcePTR) {
-				sc += 3
+				sc += 10
 			}
 			if s.Has(SourceHackerTarget) {
-				sc += 3
+				sc += 8
 			}
 			if s.Has(SourceCRTSh) {
-				sc += 3
+				sc += 4
 			}
 			if s.Has(SourceCertSpotter) {
-				sc += 3
+				sc += 4
 			}
 			if s.Has(SourceAlienVault) {
-				sc += 2
+				sc += 3
 			}
 			if s.Has(SourceWayback) {
-				sc += 1
+				sc += 2
 			}
 			if s.Has(SourceSeed) {
-				sc += 2
+				sc += 5
 			}
 			return sc
 		}
@@ -1855,11 +1892,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 		allDomains = append(allDomains, d)
 	}
 
-	sampledIPsSet := make(map[string]struct{}, len(sampledIPs))
-	for _, ip := range sampledIPs {
-		sampledIPsSet[ip] = struct{}{}
-	}
-
 	var validPairs []TargetPair
 	var pairSeen sync.Map
 
@@ -1889,29 +1921,54 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 		}
 		dom := dom
 		g1c.Go(func() error {
-			ips, err := resolveIPv4Cached(gCtx1c, dom)
-			if err == nil {
-				for _, resolvedIP := range ips {
-					if _, ok := sampledIPsSet[resolvedIP]; ok {
-						pairKey := resolvedIP + "\x00" + dom
-						if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
-							mu.Lock()
-							genericMask := domainSources[dom] &^ (SourcePTR | SourceHackerTarget)
-							specificMask := pairSources[pairKey]
-							finalMask := genericMask | specificMask
+			stats.mu.Lock()
+			stats.DNSQueries++
+			stats.mu.Unlock()
 
-							validPairs = append(validPairs, TargetPair{
-								IP:      resolvedIP,
-								SNI:     dom,
-								Sources: finalMask,
-							})
-							if len(validPairs) <= 50 {
-								fmt.Printf("  [+] DNS Match: %s -> %s\n", dom, resolvedIP)
-							}
-							mu.Unlock()
+			ips, err := resolveIPv4Cached(gCtx1c, dom)
+			if err != nil || len(ips) == 0 {
+				stats.mu.Lock()
+				stats.DNSFailed++
+				stats.mu.Unlock()
+				return nil
+			}
+
+			stats.mu.Lock()
+			stats.DNSSuccess++
+			stats.DNSResolvedIPs += len(ips)
+			stats.mu.Unlock()
+
+			matched := false
+			for _, resolvedIP := range ips {
+				if ipInRanges(resolvedIP, scanRanges) {
+					matched = true
+					stats.mu.Lock()
+					stats.DNSIPsInTargetRange++
+					stats.mu.Unlock()
+
+					pairKey := resolvedIP + "\x00" + dom
+					if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
+						mu.Lock()
+						genericMask := domainSources[dom] &^ (SourcePTR | SourceHackerTarget)
+						specificMask := pairSources[pairKey]
+						finalMask := genericMask | specificMask
+
+						validPairs = append(validPairs, TargetPair{
+							IP:      resolvedIP,
+							SNI:     dom,
+							Sources: finalMask,
+						})
+						if len(validPairs) <= 50 {
+							fmt.Printf("  [+] DNS Match: %s -> %s\n", dom, resolvedIP)
 						}
+						mu.Unlock()
 					}
 				}
+			}
+			if matched {
+				stats.mu.Lock()
+				stats.DNSTargetDomains++
+				stats.mu.Unlock()
 			}
 			return nil
 		})
@@ -2021,12 +2078,7 @@ func main() {
 			}
 		}
 	}
-	if cfg.DirectSNI != "" {
-		if cleaned := CleanDomain(cfg.DirectSNI); cleaned != "" {
-			cfg.Domains = append(cfg.Domains, cleaned)
-		}
-	}
-
+	
 	if cfg.Mode != ModeAuto && cfg.Mode != ModeDirect {
 		log.Fatalf("[-] Unknown mode: %s", cfg.Mode)
 	}
@@ -2122,13 +2174,13 @@ func main() {
 		fmt.Printf("[*] Подсетей для скана:      %d\n", len(merged))
 		fmt.Printf("[*] Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
 
-		results = RunPipeline(ctx, cfg, sampledIPs, asnDB, countryDB)
+		results = RunPipeline(ctx, cfg, sampledIPs, merged, asnDB, countryDB)
 
 	} else if cfg.Mode == ModeDirect {
 		merged := MergeCIDRs(cfg.CIDRs)
 		sampledIPs := SampleIPs(merged, cfg.MaxIPs, cfg.Seed)
 		fmt.Printf("[*] Direct Mode: Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
-		results = RunPipeline(ctx, cfg, sampledIPs, asnDB, countryDB)
+		results = RunPipeline(ctx, cfg, sampledIPs, merged, asnDB, countryDB)
 	}
 
 	fmt.Println("\n===================================================================================================================")
@@ -2140,10 +2192,20 @@ func main() {
 	fmt.Println("\nSNI/Hostname Discovery Providers:")
 	
 	categories := map[DiscoveryCategory][]string{}
+	catMap := make(map[string]DiscoveryCategory)
 	
+	providersInfo := []struct{n string; c DiscoveryCategory}{
+		{"crt.sh", CatCertificate}, {"CertSpotter", CatCertificate},
+		{"AlienVault", CatPassiveDNS}, {"WaybackMachine", CatArchive}, {"HackerTarget", CatReverseIP},
+	}
+	for _, p := range providersInfo {
+		catMap[p.n] = p.c
+	}
+
 	stats.mu.Lock()
-	for name, p := range stats.ProviderStats {
-		categories[p.Category] = append(categories[p.Category], name)
+	for name := range stats.ProviderStats {
+		cat := catMap[name]
+		categories[cat] = append(categories[cat], name)
 	}
 	
 	catNames := make([]string, 0, len(categories))
@@ -2162,14 +2224,18 @@ func main() {
 			fmt.Printf("    %-15s : Попыток: %d (Успех: %d, Ошибок: %d, Таймаутов: %d) -> Найдено имён: %d\n", name, p.Attempts, p.Success, p.Failed, p.Timeouts, p.Names)
 		}
 	}
-	stats.mu.Unlock()
-
-	fmt.Printf("\n[*] Подтверждено DNS-пар:      %d\n", stats.DNSValidPairs)
+	
+	fmt.Printf("\n[*] DNS Lookups:               %d (Успех: %d, Ошибок: %d)\n", stats.DNSQueries, stats.DNSSuccess, stats.DNSFailed)
+	fmt.Printf("[*] DNS Resolved IPs (Всего):  %d\n", stats.DNSResolvedIPs)
+	fmt.Printf("[*] DNS IPs в целевых CIDR:    %d\n", stats.DNSIPsInTargetRange)
+	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", stats.DNSTargetDomains)
+	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", stats.DNSValidPairs)
 	fmt.Printf("[*] Успешных TCP соединений:   %d\n", stats.TCPConnected)
 	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", stats.TLSHandshake)
 	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", stats.TLSValidation)
 	fmt.Printf("[*] С откликом H2 Headers:     %d\n", stats.H2HeadersOK)
 	fmt.Printf("[*] Финальных кандидатов:      %d\n", len(results))
+	stats.mu.Unlock()
 
 	if len(results) == 0 {
 		fmt.Println("\n[-] Подходящих кандидатов не найдено.")
