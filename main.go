@@ -1278,7 +1278,7 @@ func scorePeerSettings(prof PeerSettingsProfile) float64 {
 	if prof.HasInitialWindowSize && prof.InitialWindowSize >= 65535 {
 		score += 2.0
 	}
-	if prof.HasMaxFrameSize && prof.HasMaxFrameSize >= 16384 {
+	if prof.HasMaxFrameSize && prof.MaxFrameSize >= 16384 {
 		score += 2.0
 	}
 	if prof.HasMaxConcurrentStreams && prof.MaxConcurrentStreams > 0 {
