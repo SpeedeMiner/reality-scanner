@@ -230,7 +230,10 @@ func incIPBy(ip net.IP, val uint32) {
 }
 
 // ================= OSINT =================
-type Target struct { IP, Domain string }
+type Target struct {
+	IP      string
+	Domains []string
+}
 
 type ValidResult struct {
 	Dest, SNI, IP, ALPN, Status, Server string
