@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -282,6 +284,80 @@ func uniqueDomains(domains []string) []string {
 		}
 	}
 	return result
+}
+
+// ================= DOWNLOAD & VERIFY DATABASES =================
+
+func checkFileHash(path, expected string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false
+	}
+	return hex.EncodeToString(h.Sum(nil)) == expected
+}
+
+func ensureDB(path, dbURL, shaURL string) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	
+	// Получаем ожидаемый sha256
+	resp, err := client.Get(shaURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch hash: %v", err)
+	}
+	defer resp.Body.Close()
+	hashBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read hash response: %v", err)
+	}
+	// Парсим первый токен (сам хэш)
+	expectedHash := strings.Split(strings.TrimSpace(string(hashBytes)), " ")[0]
+
+	// Проверяем существующий файл
+	if _, err := os.Stat(path); err == nil {
+		if checkFileHash(path, expectedHash) {
+			return nil // Файл актуален и цел
+		}
+		fmt.Printf("[*] Файл %s устарел или поврежден. Обновляем...\n", path)
+	} else {
+		fmt.Printf("[*] Файл %s не найден. Начинаем загрузку...\n", path)
+	}
+
+	// Загружаем во временный файл
+	tempFile := path + ".tmp"
+	out, err := os.Create(tempFile)
+	if err != nil {
+		return err
+	}
+
+	downloadClient := &http.Client{Timeout: 5 * time.Minute}
+	dlResp, err := downloadClient.Get(dbURL)
+	if err != nil {
+		out.Close()
+		os.Remove(tempFile)
+		return err
+	}
+	defer dlResp.Body.Close()
+
+	if _, err = io.Copy(out, dlResp.Body); err != nil {
+		out.Close()
+		os.Remove(tempFile)
+		return err
+	}
+	out.Close()
+
+	// Проверяем скачанный файл
+	if !checkFileHash(tempFile, expectedHash) {
+		os.Remove(tempFile)
+		return fmt.Errorf("SHA256 mismatch after downloading %s", path)
+	}
+
+	return os.Rename(tempFile, path)
 }
 
 // ================= IP DETECTION =================
@@ -612,7 +688,6 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	}
 	cand.Timings.TLS = time.Since(t1)
 
-	// INTENTIONAL BEHAVIOR: Do not hard-fail if negotiated protocol isn't H2.
 	if uConn.ConnectionState().NegotiatedProtocol == "h2" {
 		cand.ALPN = "h2"
 	} else {
@@ -653,7 +728,6 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	t2 := time.Now()
 	wTo := time.Duration(cfg.H2WriteTimeoutMs) * time.Millisecond
 
-	// Write preface
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil {
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
@@ -813,7 +887,7 @@ ReadLoop:
 						if len(actualPayload) < 5 {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PRIORITY flag set but payload too short")}
 						}
-						actualPayload = actualPayload[5:] // Skip Stream Dependency and Weight
+						actualPayload = actualPayload[5:]
 					}
 					if padLen > 0 {
 						if len(actualPayload) < padLen {
@@ -994,19 +1068,14 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		return false
 	}
 
-	// -----------------------------------------------------------
-	// REALITY Suitability Scoring (max 100)
-	// -----------------------------------------------------------
 	rs := RealityScore{}
 
-	// 1. TLS Quality (max 20)
 	if cand.CertChainValid {
 		rs.TLSQuality += 20
 	} else {
 		rs.TLSQuality += 5
 	}
 
-	// 2. Certificate Quality (max 20)
 	isJunk := false
 	sniLower := strings.ToLower(cand.SNI)
 	for _, tld := range junkTLDs {
@@ -1035,7 +1104,6 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		rs.Certificate += 5
 	}
 
-	// 3. HTTP/2 Profile (max 20)
 	if cand.H2SettingsReceived {
 		rs.H2Profile += 10
 	}
@@ -1046,7 +1114,6 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		rs.H2Profile += 5
 	}
 
-	// 4. Server Profile (max 15)
 	if cand.Server != "" && cand.Server != "-" {
 		srvLower := strings.ToLower(cand.Server)
 		if strings.Contains(srvLower, "nginx") || strings.Contains(srvLower, "caddy") || strings.Contains(srvLower, "apache") || strings.Contains(srvLower, "litespeed") || strings.Contains(srvLower, "openresty") {
@@ -1056,7 +1123,6 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		}
 	}
 
-	// 5. HTTP Behavior (max 10)
 	switch cand.HTTPStatus {
 	case 200:
 		rs.HTTPBehavior = 10
@@ -1064,18 +1130,16 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		rs.HTTPBehavior = 5
 	default:
 		if cand.HTTPStatus >= 400 && cand.HTTPStatus < 500 {
-			rs.HTTPBehavior = 0 // Valid fallback but client err
+			rs.HTTPBehavior = 0 
 		} else if cand.HTTPStatus >= 500 {
-			rs.HTTPBehavior = -10 // Penalty
+			rs.HTTPBehavior = -10 
 		}
 	}
 
-	// 6. DNS Consistency (max 10)
 	if !cand.CDNWeak {
 		rs.DNSConsistency += 10
 	}
 
-	// 7. Latency (max 5)
 	rtt := cand.Timings.TotalLatency().Milliseconds()
 	if rtt <= 50 {
 		rs.Latency = 5
@@ -1090,7 +1154,7 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	cand.RealityScore = rs
 	cand.Score = rs.Total
 
-	return rs.Total >= 0 // Keep candidate if overall score is logically sound
+	return rs.Total >= 0 
 }
 
 func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, countryDB *geoip2.Reader) []Candidate {
@@ -1102,7 +1166,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 
 	stats.IPSampled = len(sampledIPs)
 
-	// === STAGE 1: Discovery & DNS Validation ===
 	g1, gCtx1 := errgroup.WithContext(ctx)
 	g1.SetLimit(cfg.Workers)
 
@@ -1112,7 +1175,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 		g1.Go(func() error {
 			var localDomains []string
 
-			// PTR
 			names, err := net.DefaultResolver.LookupAddr(gCtx1, ip)
 			if err == nil {
 				ptrFound := false
@@ -1135,11 +1197,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 
 			localDomains = uniqueDomains(localDomains)
 
-			// Crt.sh - Оптимизация с Root Domain
 			var allDomains []string
 			allDomains = append(allDomains, localDomains...)
 
-			// Собираем уникальные базовые домены для запросов к crt.sh
 			rootDomains := make(map[string]bool)
 			for _, dom := range localDomains {
 				root := GetRootDomain(dom)
@@ -1199,7 +1259,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 
 			allDomains = uniqueDomains(allDomains)
 
-			// DNS Resolution Cached + IPv4 only
 			for _, dom := range allDomains {
 				ips, err := resolveIPv4Cached(gCtx1, dom)
 				if err == nil {
@@ -1227,7 +1286,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 		return nil
 	}
 
-	// === STAGE 2: Active H2 Probing ===
 	fmt.Printf("[*] Этап 2: Активное сканирование HTTP/2 и анализ TLS...\n")
 	var candidates []Candidate
 	g2, gCtx2 := errgroup.WithContext(ctx)
@@ -1332,6 +1390,22 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// -------------------------------------------------------------
+	// ЗАГРУЗКА БАЗ MAXMIND С ПРОВЕРКОЙ ХЭША
+	// -------------------------------------------------------------
+	asnDBUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"
+	asnShaUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb.sha256sum"
+	if err := ensureDB(cfg.ASNPath, asnDBUrl, asnShaUrl); err != nil {
+		log.Fatalf("[-] Ошибка загрузки/проверки базы ASN (%s): %v", cfg.ASNPath, err)
+	}
+
+	countryDBUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
+	countryShaUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb.sha256sum"
+	if err := ensureDB(cfg.GeoIPPath, countryDBUrl, countryShaUrl); err != nil {
+		log.Fatalf("[-] Ошибка загрузки/проверки базы Country (%s): %v", cfg.GeoIPPath, err)
+	}
+	// -------------------------------------------------------------
 
 	var asnDB, countryDB *geoip2.Reader
 	if db, err := geoip2.Open(cfg.ASNPath); err == nil {
