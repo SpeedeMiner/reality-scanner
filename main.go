@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -89,19 +90,21 @@ func limitStr(s string, limit int) string {
 }
 
 // ================= AUTO-PROVISIONING =================
-func ensureDBExists(filepath, downloadURL string) error {
-	if _, err := os.Stat(filepath); err == nil {
+func ensureDBExists(targetPath, downloadURL string) error {
+	if _, err := os.Stat(targetPath); err == nil {
 		return nil
 	}
 
-	log.Printf("[*] База %s не найдена. Начинаем скачивание...", filepath)
+	log.Printf("[*] База %s не найдена. Начинаем скачивание...", targetPath)
 
-	tmpFile, err := os.CreateTemp("", "mmdb-*")
+	// Создаем временный файл в той же директории, что и целевой файл (защита от EXDEV / cross-device link)
+	dir := filepath.Dir(targetPath)
+	tmpFile, err := os.CreateTemp(dir, ".mmdb-*.tmp")
 	if err != nil {
 		return fmt.Errorf("создание temp файла: %v", err)
 	}
 	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
+	defer os.Remove(tmpPath) // Удалит мусор при сбое до rename
 
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Get(downloadURL)
@@ -122,18 +125,19 @@ func ensureDBExists(filepath, downloadURL string) error {
 	}
 	tmpFile.Close()
 
-	// Валидация скачанного файла на уровне библиотеки
+	// Валидация целостности базы перед заменой
 	testDB, err := geoip2.Open(tmpPath)
 	if err != nil {
 		return fmt.Errorf("скачанный файл повреждён или не является MMDB: %v", err)
 	}
 	testDB.Close()
 
-	if err := os.Rename(tmpPath, filepath); err != nil {
+	// Атомарная замена внутри одного раздела диска
+	if err := os.Rename(tmpPath, targetPath); err != nil {
 		return fmt.Errorf("ошибка rename: %v", err)
 	}
 
-	log.Printf("[+] База %s успешно загружена и проверена.", filepath)
+	log.Printf("[+] База %s успешно загружена и проверена.", targetPath)
 	return nil
 }
 
