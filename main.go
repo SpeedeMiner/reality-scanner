@@ -113,6 +113,17 @@ type H2SettingsProfile struct {
 	HasMaxHeaderListSize    bool
 }
 
+type RealityScore struct {
+	TLSQuality     float64 // 20 max
+	Certificate    float64 // 20 max
+	H2Profile      float64 // 20 max
+	ServerProfile  float64 // 15 max
+	HTTPBehavior   float64 // 10 max
+	DNSConsistency float64 // 10 max
+	Latency        float64 // 5 max
+	Total          float64 // 100 max
+}
+
 type Candidate struct {
 	IP                string
 	SNI               string
@@ -123,27 +134,27 @@ type Candidate struct {
 	BodyBytes         int
 	Server            string
 	ContentType       string
-	ScoreDebug        []string
 	Timings           Timings
 	ASN               uint
 	Country           string
 	CDNStrong         bool
 	CDNWeak           bool
-	Score             float64
+	RealityScore      RealityScore
 	CertChainValid    bool
 	EndStreamSeen     bool
 	StreamReset       bool
 	GoAwaySeen        bool
 
 	// REALITY Suitability attributes
-	CertIssuer            string
-	CertSubject           string
-	CertSANCount          int
-	H2SettingsReceived    bool
-	H2SettingsAckSent     bool
-	H2SettingsAckReceived bool
-	H2SettingsProfile     H2SettingsProfile
-	H2DataFrames          int
+	CertIssuer               string
+	CertSubject              string
+	CertSANCount             int
+	H2SettingsReceived       bool
+	H2SettingsAckSent        bool
+	H2SettingsAckReceived    bool
+	InitialH2SettingsProfile H2SettingsProfile
+	LatestH2SettingsProfile  H2SettingsProfile
+	H2DataFrames             int
 }
 
 type TargetPair struct {
@@ -542,7 +553,7 @@ func buildH2HeadersEncoder(sni string) []byte {
 	encoder.WriteField(hpack.HeaderField{Name: ":authority", Value: sni})
 	encoder.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	encoder.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
-	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"})
 	encoder.WriteField(hpack.HeaderField{Name: "accept", Value: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
 	encoder.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "gzip, deflate, br"})
 
@@ -591,7 +602,6 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	}
 	cand.Timings.TLS = time.Since(t1)
 
-	// INTENTIONAL BEHAVIOR: Do not hard-fail if negotiated protocol isn't H2.
 	if uConn.ConnectionState().NegotiatedProtocol == "h2" {
 		cand.ALPN = "h2"
 	} else {
@@ -632,6 +642,7 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	t2 := time.Now()
 	wTo := time.Duration(cfg.H2WriteTimeoutMs) * time.Millisecond
 
+	// Write preface
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil {
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
@@ -701,12 +712,16 @@ ReadLoop:
 					break
 				}
 
-				cand.H2SettingsReceived = true
 				if length%6 != 0 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length: %d", length)}
 				}
 
 				seenSettings := make(map[uint16]bool)
+				var prof H2SettingsProfile
+				if cand.H2SettingsReceived {
+					prof = cand.LatestH2SettingsProfile
+				}
+
 				for i := 0; i < int(length); i += 6 {
 					id := binary.BigEndian.Uint16(payload[i : i+2])
 					val := binary.BigEndian.Uint32(payload[i+2 : i+6])
@@ -718,34 +733,40 @@ ReadLoop:
 
 					switch id {
 					case 1:
-						cand.H2SettingsProfile.HeaderTableSize = val
-						cand.H2SettingsProfile.HasHeaderTableSize = true
+						prof.HeaderTableSize = val
+						prof.HasHeaderTableSize = true
 					case 2:
 						if val > 1 {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS_ENABLE_PUSH: %d", val)}
 						}
-						cand.H2SettingsProfile.EnablePush = val
-						cand.H2SettingsProfile.HasEnablePush = true
+						prof.EnablePush = val
+						prof.HasEnablePush = true
 					case 3:
-						cand.H2SettingsProfile.MaxConcurrentStreams = val
-						cand.H2SettingsProfile.HasMaxConcurrentStreams = true
+						prof.MaxConcurrentStreams = val
+						prof.HasMaxConcurrentStreams = true
 					case 4:
 						if val > 0x7fffffff {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS_INITIAL_WINDOW_SIZE: %d", val)}
 						}
-						cand.H2SettingsProfile.InitialWindowSize = val
-						cand.H2SettingsProfile.HasInitialWindowSize = true
+						prof.InitialWindowSize = val
+						prof.HasInitialWindowSize = true
 					case 5:
 						if val < 16384 || val > 16777215 {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS_MAX_FRAME_SIZE: %d", val)}
 						}
-						cand.H2SettingsProfile.MaxFrameSize = val
-						cand.H2SettingsProfile.HasMaxFrameSize = true
-						maxInboundFrameSize = val // Update local receive boundary safely
+						prof.MaxFrameSize = val
+						prof.HasMaxFrameSize = true
+						maxInboundFrameSize = val
 					case 6:
-						cand.H2SettingsProfile.MaxHeaderListSize = val
-						cand.H2SettingsProfile.HasMaxHeaderListSize = true
+						prof.MaxHeaderListSize = val
+						prof.HasMaxHeaderListSize = true
 					}
+				}
+
+				cand.LatestH2SettingsProfile = prof
+				if !cand.H2SettingsReceived {
+					cand.InitialH2SettingsProfile = prof
+					cand.H2SettingsReceived = true
 				}
 
 				if err := writeH2(uConn, buildH2Frame(FrameSettings, FlagAck, 0, nil), wTo); err != nil {
@@ -857,7 +878,6 @@ ReadLoop:
 
 					cand.BodyBytes += len(actualPayload)
 
-					// Flow control MUST use original frame payload length including padding (RFC 9113 Sec 6.1)
 					if length > 0 {
 						inc := uint32(length)
 
@@ -876,7 +896,6 @@ ReadLoop:
 				}
 			case FrameGoAway:
 				cand.GoAwaySeen = true
-				// Allowed to continue to process already-active stream 1 until EndStream or connection closed
 			}
 
 			if streamID == 1 && cand.EndStreamSeen && !expectingContinuation {
@@ -964,60 +983,103 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		return false
 	}
 
-	cand.Score = 50.0
-	cand.ScoreDebug = append(cand.ScoreDebug, "+50.0 (Base)")
+	// -----------------------------------------------------------
+	// REALITY Suitability Scoring (max 100)
+	// -----------------------------------------------------------
+	rs := RealityScore{}
 
+	// 1. TLS Quality (max 20)
 	if cand.CertChainValid {
-		cand.Score += 20.0
-		cand.ScoreDebug = append(cand.ScoreDebug, "+20.0 (Cert Chain Trusted)")
+		rs.TLSQuality += 20
+	} else {
+		rs.TLSQuality += 5
 	}
 
-	if cand.CDNWeak {
-		cand.Score -= 30.0
-		cand.ScoreDebug = append(cand.ScoreDebug, "-30.0 (Weak CDN Evidence)")
-	}
-
+	// 2. Certificate Quality (max 20)
+	isJunk := false
 	sniLower := strings.ToLower(cand.SNI)
 	for _, tld := range junkTLDs {
 		if strings.HasSuffix(sniLower, tld) {
-			cand.Score -= 40.0
-			cand.ScoreDebug = append(cand.ScoreDebug, "-40.0 (Junk TLD)")
+			isJunk = true
 			break
 		}
 	}
 	for _, dDNS := range dynDNS {
 		if strings.HasSuffix(sniLower, dDNS) {
-			cand.Score -= 50.0
-			cand.ScoreDebug = append(cand.ScoreDebug, "-50.0 (DynDNS)")
+			isJunk = true
 			break
 		}
 	}
 	if numRe.MatchString(sniLower) {
-		cand.Score -= 50.0
-		cand.ScoreDebug = append(cand.ScoreDebug, "-50.0 (Numeric Domain)")
+		isJunk = true
 	}
 
-	switch cand.HTTPStatus {
-	case 200:
-		cand.Score += 20.0
-		cand.ScoreDebug = append(cand.ScoreDebug, "+20.0 (HTTP 200)")
-	case 301, 302:
-		cand.Score += 5.0
-		cand.ScoreDebug = append(cand.ScoreDebug, fmt.Sprintf("+5.0 (HTTP %d Redirect)", cand.HTTPStatus))
-	case 401, 405:
-		cand.Score -= 5.0
-		cand.ScoreDebug = append(cand.ScoreDebug, fmt.Sprintf("-5.0 (HTTP %d)", cand.HTTPStatus))
-	case 400, 403, 404:
-		cand.Score -= 30.0
-		cand.ScoreDebug = append(cand.ScoreDebug, fmt.Sprintf("-30.0 (HTTP %d)", cand.HTTPStatus))
-	default:
-		if cand.HTTPStatus >= 500 {
-			cand.Score -= 20.0
-			cand.ScoreDebug = append(cand.ScoreDebug, fmt.Sprintf("-20.0 (HTTP %d Server Error)", cand.HTTPStatus))
+	if !isJunk {
+		rs.Certificate += 10
+	}
+	if cand.CertSANCount > 1 {
+		rs.Certificate += 5
+	}
+	if cand.CertIssuer != "" && !strings.Contains(strings.ToLower(cand.CertIssuer), "localhost") {
+		rs.Certificate += 5
+	}
+
+	// 3. HTTP/2 Profile (max 20)
+	if cand.H2SettingsReceived {
+		rs.H2Profile += 10
+	}
+	if cand.H2SettingsAckReceived {
+		rs.H2Profile += 5
+	}
+	if cand.H2DataFrames > 0 {
+		rs.H2Profile += 5
+	}
+
+	// 4. Server Profile (max 15)
+	if cand.Server != "" && cand.Server != "-" {
+		srvLower := strings.ToLower(cand.Server)
+		if strings.Contains(srvLower, "nginx") || strings.Contains(srvLower, "caddy") || strings.Contains(srvLower, "apache") || strings.Contains(srvLower, "litespeed") || strings.Contains(srvLower, "openresty") {
+			rs.ServerProfile = 15
+		} else {
+			rs.ServerProfile = 10
 		}
 	}
 
-	return true
+	// 5. HTTP Behavior (max 10)
+	switch cand.HTTPStatus {
+	case 200:
+		rs.HTTPBehavior = 10
+	case 301, 302, 307, 308:
+		rs.HTTPBehavior = 5
+	default:
+		if cand.HTTPStatus >= 400 && cand.HTTPStatus < 500 {
+			rs.HTTPBehavior = 0 // Valid fallback but client err
+		} else if cand.HTTPStatus >= 500 {
+			rs.HTTPBehavior = -10 // Penalty
+		}
+	}
+
+	// 6. DNS Consistency (max 10)
+	if !cand.CDNWeak {
+		rs.DNSConsistency += 10
+	}
+
+	// 7. Latency (max 5)
+	rtt := cand.Timings.TotalLatency().Milliseconds()
+	if rtt <= 50 {
+		rs.Latency = 5
+	} else if rtt <= 150 {
+		rs.Latency = 3
+	} else if rtt <= 300 {
+		rs.Latency = 1
+	}
+
+	rs.Total = rs.TLSQuality + rs.Certificate + rs.H2Profile + rs.ServerProfile + rs.HTTPBehavior + rs.DNSConsistency + rs.Latency
+
+	cand.RealityScore = rs
+	cand.Score = rs.Total
+
+	return rs.Total >= 0 // Keep candidate if overall score is logically sound
 }
 
 func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, countryDB *geoip2.Reader) []Candidate {
@@ -1189,8 +1251,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 	_ = g2.Wait()
 
 	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].Score != candidates[j].Score {
-			return candidates[i].Score > candidates[j].Score
+		if candidates[i].RealityScore.Total != candidates[j].RealityScore.Total {
+			return candidates[i].RealityScore.Total > candidates[j].RealityScore.Total
 		}
 		return candidates[i].Timings.TotalLatency() < candidates[j].Timings.TotalLatency()
 	})
@@ -1345,6 +1407,9 @@ func main() {
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("[*] IP отобрано для пула:      %d\n", stats.IPSampled)
 	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", stats.IPWithPTR)
+	if stats.CRTAttempts > 0 && stats.CRTSuccess == 0 {
+		fmt.Printf("[!] ВНИМАНИЕ: crt.sh недоступен из вашей локации. Все запросы завершились таймаутом.\n")
+	}
 	fmt.Printf("[*] Запросов к crt.sh (Всего): %d (Успешно: %d, Ошибок: %d)\n", stats.CRTAttempts, stats.CRTSuccess, stats.CRTFailed)
 	fmt.Printf("[*] Уникальных SAN найдено:    %d\n", stats.CRTUniqueSANs)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", stats.DNSValidPairs)
@@ -1398,10 +1463,13 @@ func main() {
 
 	best := results[0]
 	fmt.Println("\n===================================================================================================================")
-	fmt.Println("                                   ПРОВЕРЕННАЯ КОНФИГУРАЦИЯ DEST/SNI")
+	fmt.Println("                                   РЕКОМЕНДУЕМАЯ КОНФИГУРАЦИЯ DEST/SNI")
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
-	fmt.Printf("Параметры: ALPN: %s, Score: %.1f, HTTP: %d, TTFB: %d ms, Type: %s, Server: %s\n",
-		best.ALPN, best.Score, best.HTTPStatus, best.Timings.TotalLatency().Milliseconds(), best.ContentType, best.Server)
+	fmt.Printf("Подробности лучшего кандидата:\n")
+	fmt.Printf("TLS: %.0f/20 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/15 | HTTP: %.0f/10 | DNS: %.0f/10 | LATENCY: %.0f/5\n",
+		best.RealityScore.TLSQuality, best.RealityScore.Certificate, best.RealityScore.H2Profile, best.RealityScore.ServerProfile, best.RealityScore.HTTPBehavior, best.RealityScore.DNSConsistency, best.RealityScore.Latency)
+	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
+	fmt.Printf("TOTAL REALITY SCORE: %.0f/100 (HTTP: %d, TTFB: %d ms)\n", best.RealityScore.Total, best.HTTPStatus, best.Timings.TotalLatency().Milliseconds())
 }
