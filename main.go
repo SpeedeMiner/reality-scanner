@@ -124,6 +124,39 @@ func CleanDomain(d string) string {
 	return d
 }
 
+// ================= AUTO DETECTION =================
+
+type ipAPIResp struct {
+	Status      string `json:"status"`
+	CountryCode string `json:"countryCode"`
+	AS          string `json:"as"`
+}
+
+func autoDetectVPS() (uint, string, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://ip-api.com/json/?fields=status,countryCode,as")
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+
+	var geo ipAPIResp
+	if err := json.NewDecoder(resp.Body).Decode(&geo); err != nil {
+		return 0, "", err
+	}
+	if geo.Status != "success" {
+		return 0, "", fmt.Errorf("api returned non-success status")
+	}
+
+	var asn uint
+	parts := strings.Fields(geo.AS)
+	if len(parts) > 0 && strings.HasPrefix(strings.ToUpper(parts[0]), "AS") {
+		fmt.Sscanf(strings.ToUpper(parts[0]), "AS%d", &asn)
+	}
+
+	return asn, geo.CountryCode, nil
+}
+
 // ================= CIDR MERGE & SAMPLER =================
 
 type ipRange struct {
@@ -160,7 +193,7 @@ func MergeCIDRs(cidrs []string) []ipRange {
 			continue
 		}
 		last := &merged[len(merged)-1]
-		if r.start <= last.end+1 { // Overlap or adjacent
+		if r.start <= last.end+1 {
 			if r.end > last.end {
 				last.end = r.end
 			}
@@ -189,7 +222,6 @@ func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
 	startIdx := rng.Uint64() % totalIPs
 	var step uint64 = 1
 	if totalIPs > 1 {
-		// Ensure odd step to avoid easy small cycles, simple coprime approach for 2^n
 		step = (rng.Uint64() % (totalIPs - 1)) | 1 
 	}
 
@@ -233,7 +265,6 @@ type OSINTSource interface {
 	Search(ctx context.Context, q TargetQuery) ([]DomainEvidence, error)
 }
 
-// -- CrtSh (CT Logs) --
 type CrtShSource struct {
 	client *http.Client
 }
@@ -268,7 +299,6 @@ func (s *CrtShSource) Search(ctx context.Context, q TargetQuery) ([]DomainEviden
 	return results, nil
 }
 
-// -- PTR Source --
 type PTRSource struct{}
 func (s *PTRSource) Name() string           { return "PTR" }
 func (s *PTRSource) SupportsIP() bool       { return true }
@@ -290,7 +320,6 @@ func (s *PTRSource) Search(ctx context.Context, q TargetQuery) ([]DomainEvidence
 
 func GatherOSINT(ctx context.Context, q TargetQuery, sources []OSINTSource) []DomainEvidence {
 	var mu sync.Mutex
-	// P0-2 Fix: Store multiple sources per domain
 	evidenceMap := make(map[string]map[string]bool)
 	g, gCtx := errgroup.WithContext(ctx)
 
@@ -339,13 +368,11 @@ func buildH2HeadersEncoder(sni string) []byte {
 	var buf bytes.Buffer
 	encoder := hpack.NewEncoder(&buf)
 	
-	// В HTTP/2 псевдо-заголовки (начинаются с двоеточия) ОБЯЗАНЫ идти первыми
 	encoder.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
 	encoder.WriteField(hpack.HeaderField{Name: ":authority", Value: sni})
 	encoder.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	encoder.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
 	
-	// Стандартные заголовки Chrome 151
 	encoder.WriteField(hpack.HeaderField{
 		Name:  "user-agent", 
 		Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
@@ -363,7 +390,6 @@ func buildH2HeadersEncoder(sni string) []byte {
 		Value: "en-US,en;q=0.9,ru;q=0.8",
 	})
 	
-	// Sec-CH-UA заголовки сильно повышают траст со стороны WAF
 	encoder.WriteField(hpack.HeaderField{
 		Name:  "sec-ch-ua", 
 		Value: `"Not A(Brand";v="8", "Chromium";v="151", "Google Chrome";v="151"`,
@@ -391,7 +417,6 @@ func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte
 func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error) {
 	cand := &Candidate{IP: ip, SNI: sni, Sources: make(map[string]bool)}
 	
-	// 1. TCP
 	t0 := time.Now()
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.TCPTimeoutMs) * time.Millisecond}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
@@ -399,7 +424,6 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 	defer conn.Close()
 	cand.Timings.TCP = time.Since(t0)
 
-	// 2. TLS
 	t1 := time.Now()
 	uConn := utls.UClient(conn, &utls.Config{
 		ServerName:         sni,
@@ -415,7 +439,6 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 
 	if uConn.ConnectionState().NegotiatedProtocol != "h2" { return nil, fmt.Errorf("protocol is not h2") }
 
-	// Extract Cert Evidence
 	state := uConn.ConnectionState()
 	if len(state.PeerCertificates) > 0 {
 		cert := state.PeerCertificates[0]
@@ -424,7 +447,6 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 		cand.CertSANs = cert.DNSNames
 	}
 
-	// 3. H2
 	t2 := time.Now()
 	wTo := time.Duration(cfg.H2WriteTimeoutMs) * time.Millisecond
 	
@@ -486,7 +508,7 @@ ReadLoop:
 							val := binary.BigEndian.Uint32(payload[i+2 : i+6])
 							if val >= 16384 && val <= 16777215 { 
 								maxInboundFrameSize = val
-								if maxInboundFrameSize > 1<<20 { maxInboundFrameSize = 1<<20 } // App Cap 1MB
+								if maxInboundFrameSize > 1<<20 { maxInboundFrameSize = 1<<20 }
 							}
 						}
 					}
@@ -553,7 +575,6 @@ func parseHeaders(cand *Candidate, headers []hpack.HeaderField) {
 
 // ================= PIPELINES =================
 
-// returns false if candidate fails HARD SCOPE (ASN or Country)
 func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Config) bool {
 	parsedIP := net.ParseIP(cand.IP)
 	if parsedIP != nil {
@@ -561,13 +582,11 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		if countryDB != nil { if r, err := countryDB.Country(parsedIP); err == nil { cand.Country = r.Country.IsoCode } }
 	}
 
-	// P0-6: Hard Scope check
 	if cfg.TargetASN != 0 && cand.ASN != cfg.TargetASN { return false }
 	if cfg.TargetCountry != "" && !strings.EqualFold(cand.Country, cfg.TargetCountry) { return false }
 
-	// Scoring logic
 	var score float64 = 50.0
-	score -= float64(cand.CDNConfidence) // P41: Evidence based CDN penalty
+	score -= float64(cand.CDNConfidence)
 
 	ttfbMs := float64(cand.Timings.TTFB.Milliseconds())
 	if ttfbMs < 50 { score += 15.0 } else if ttfbMs > 300 { score -= (ttfbMs - 300) / 10.0 }
@@ -587,7 +606,6 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 }
 
 func RunPassivePipeline(ctx context.Context, cfg Config, dedup *Deduplicator, asnDB, countryDB *geoip2.Reader, sources []OSINTSource) []Candidate {
-	// Normalize seed domains
 	var qDomains []string
 	for _, d := range cfg.Domains {
 		if cl := CleanDomain(d); cl != "" { qDomains = append(qDomains, cl) }
@@ -597,7 +615,6 @@ func RunPassivePipeline(ctx context.Context, cfg Config, dedup *Deduplicator, as
 	log.Printf("[*] Passive Mode: CT Expanding %d seed domains...", len(qDomains))
 	evidences := GatherOSINT(ctx, TargetQuery{Domains: qDomains}, sources)
 	
-	// Pre-group by Domain to resolve DNS efficiently
 	domMap := make(map[string]map[string]bool)
 	for _, ev := range evidences {
 		if domMap[ev.Domain] == nil { domMap[ev.Domain] = make(map[string]bool) }
@@ -619,7 +636,6 @@ func RunPassivePipeline(ctx context.Context, cfg Config, dedup *Deduplicator, as
 				if net.ParseIP(ip).To4() == nil { continue }
 				if !dedup.IsNew(ip + ":" + dom) { continue }
 				
-				// Quick ASN/Country pre-filter before expensive H2 probe (Optional but saves traffic)
 				tempCand := &Candidate{IP: ip}
 				if !validateAndEnrich(tempCand, asnDB, countryDB, cfg) { continue }
 
@@ -711,6 +727,19 @@ func main() {
 	cfg.Mode = Mode(modeStr)
 	cfg.CIDRs = flag.Args()
 	if domainsStr != "" { cfg.Domains = strings.Split(domainsStr, ",") }
+
+	// Auto-detect Geo and ASN if not explicitly set
+	if cfg.TargetASN == 0 && cfg.TargetCountry == "" {
+		log.Println("[*] Auto-detecting VPS ASN and Country...")
+		asn, country, err := autoDetectVPS()
+		if err != nil {
+			log.Printf("[!] Failed to auto-detect VPS location: %v. Proceeding without hard scope.", err)
+		} else {
+			cfg.TargetASN = asn
+			cfg.TargetCountry = country
+			log.Printf("[+] Auto-detected: ASN=%d, Country=%s", cfg.TargetASN, cfg.TargetCountry)
+		}
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
