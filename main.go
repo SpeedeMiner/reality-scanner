@@ -36,7 +36,7 @@ const (
 	ModePassive Mode = "passive"
 	ModeHybrid  Mode = "hybrid"
 	ModeDirect  Mode = "direct"
-	ModeAuto    Mode = "autonomous" // Новый полностью автоматический режим
+	ModeAuto    Mode = "autonomous"
 
 	FrameData         = 0x00
 	FrameHeaders      = 0x01
@@ -74,7 +74,6 @@ type Config struct {
 	Domains          []string
 	GeoIPPath        string
 	ASNPath          string
-	Debug            bool
 }
 
 // ================= MODELS =================
@@ -85,17 +84,20 @@ type Timings struct {
 	TTFB time.Duration
 }
 
+func (t Timings) Total() time.Duration { return t.TCP + t.TLS + t.TTFB }
+
 type Candidate struct {
 	IP             string
 	SNI            string
+	ALPN           string
+	HTTPStatus     int
+	DataBytes      int
+	Server         string
+	Timings        Timings
 	Sources        map[string]bool
 	ASN            uint
 	Country        string
-	Timings        Timings
-	HTTPStatus     int
-	Server         string
 	CDNConfidence  int
-	DataBytes      int
 	Score          float64
 	CertValidDates bool
 	CertSANs       []string
@@ -116,12 +118,8 @@ func CleanDomain(d string) string {
 	d = strings.ToLower(strings.TrimSpace(d))
 	d = strings.TrimPrefix(d, "*.")
 	d = strings.TrimSuffix(d, ".")
-	if d == "localhost" || strings.HasPrefix(d, "localhost.") {
-		return ""
-	}
-	if !domainRe.MatchString(d) {
-		return ""
-	}
+	if d == "localhost" || strings.HasPrefix(d, "localhost.") { return "" }
+	if !domainRe.MatchString(d) { return "" }
 	return d
 }
 
@@ -131,31 +129,25 @@ type ipAPIResp struct {
 	Status      string `json:"status"`
 	CountryCode string `json:"countryCode"`
 	AS          string `json:"as"`
+	Query       string `json:"query"`
 }
 
-func autoDetectVPS() (uint, string, error) {
+func autoDetectVPS() (uint, string, string, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://ip-api.com/json/?fields=status,countryCode,as")
-	if err != nil {
-		return 0, "", err
-	}
+	resp, err := client.Get("http://ip-api.com/json/?fields=status,countryCode,as,query")
+	if err != nil { return 0, "", "", err }
 	defer resp.Body.Close()
 
 	var geo ipAPIResp
-	if err := json.NewDecoder(resp.Body).Decode(&geo); err != nil {
-		return 0, "", err
-	}
-	if geo.Status != "success" {
-		return 0, "", fmt.Errorf("api returned non-success status")
-	}
+	if err := json.NewDecoder(resp.Body).Decode(&geo); err != nil { return 0, "", "", err }
+	if geo.Status != "success" { return 0, "", "", fmt.Errorf("api returned non-success status") }
 
 	var asn uint
 	parts := strings.Fields(geo.AS)
 	if len(parts) > 0 && strings.HasPrefix(strings.ToUpper(parts[0]), "AS") {
 		fmt.Sscanf(strings.ToUpper(parts[0]), "AS%d", &asn)
 	}
-
-	return asn, geo.CountryCode, nil
+	return asn, geo.CountryCode, geo.Query, nil
 }
 
 type RipeStatResponse struct {
@@ -170,22 +162,15 @@ func fetchASNCIDRs(asn uint) ([]string, error) {
 	urlStr := fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS%d", asn)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(urlStr)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	defer resp.Body.Close()
 
 	var stat RipeStatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&stat); err != nil {
-		return nil, err
-	}
+	if err := json.NewDecoder(resp.Body).Decode(&stat); err != nil { return nil, err }
 
 	var cidrs []string
 	for _, p := range stat.Data.Prefixes {
-		// Фильтруем только IPv4 подсети
-		if !strings.Contains(p.Prefix, ":") {
-			cidrs = append(cidrs, p.Prefix)
-		}
+		if !strings.Contains(p.Prefix, ":") { cidrs = append(cidrs, p.Prefix) }
 	}
 	return cidrs, nil
 }
@@ -201,22 +186,15 @@ func MergeCIDRs(cidrs []string) []ipRange {
 	var ranges []ipRange
 	for _, c := range cidrs {
 		_, ipnet, err := net.ParseCIDR(c)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 		ones, bits := ipnet.Mask.Size()
-		if bits != 32 {
-			continue // IPv4 only
-		}
+		if bits != 32 { continue }
 		startInt := binary.BigEndian.Uint32(ipnet.IP)
 		count := uint32(1) << (32 - ones)
 		ranges = append(ranges, ipRange{start: startInt, end: startInt + count - 1})
 	}
 
-	if len(ranges) == 0 {
-		return nil
-	}
-
+	if len(ranges) == 0 { return nil }
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
 	
 	var merged []ipRange
@@ -227,9 +205,7 @@ func MergeCIDRs(cidrs []string) []ipRange {
 		}
 		last := &merged[len(merged)-1]
 		if r.start <= last.end+1 {
-			if r.end > last.end {
-				last.end = r.end
-			}
+			if r.end > last.end { last.end = r.end }
 		} else {
 			merged = append(merged, r)
 		}
@@ -239,24 +215,16 @@ func MergeCIDRs(cidrs []string) []ipRange {
 
 func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
 	var totalIPs uint64
-	for _, b := range blocks {
-		totalIPs += uint64(b.end - b.start + 1)
-	}
-	if totalIPs == 0 {
-		return nil
-	}
+	for _, b := range blocks { totalIPs += uint64(b.end - b.start + 1) }
+	if totalIPs == 0 { return nil }
 
 	sampleSize := uint64(maxIPs)
-	if sampleSize > totalIPs {
-		sampleSize = totalIPs
-	}
+	if sampleSize > totalIPs { sampleSize = totalIPs }
 
 	rng := rand.New(rand.NewSource(seed))
 	startIdx := rng.Uint64() % totalIPs
 	var step uint64 = 1
-	if totalIPs > 1 {
-		step = (rng.Uint64() % (totalIPs - 1)) | 1 
-	}
+	if totalIPs > 1 { step = (rng.Uint64() % (totalIPs - 1)) | 1 }
 
 	var result []string
 	currIdx := startIdx
@@ -301,7 +269,7 @@ type OSINTSource interface {
 type CrtShSource struct {
 	client *http.Client
 }
-func (s *CrtShSource) Name() string           { return "Crt.sh(CT)" }
+func (s *CrtShSource) Name() string           { return "Crt.sh" }
 func (s *CrtShSource) SupportsIP() bool       { return false }
 func (s *CrtShSource) SupportsDomain() bool   { return true }
 func (s *CrtShSource) Search(ctx context.Context, q TargetQuery) ([]DomainEvidence, error) {
@@ -358,17 +326,13 @@ func GatherOSINT(ctx context.Context, q TargetQuery, sources []OSINTSource) []Do
 
 	for _, src := range sources {
 		s := src
-		if (len(q.IPs) > 0 && !s.SupportsIP()) || (len(q.Domains) > 0 && !s.SupportsDomain()) {
-			continue
-		}
+		if (len(q.IPs) > 0 && !s.SupportsIP()) || (len(q.Domains) > 0 && !s.SupportsDomain()) { continue }
 		g.Go(func() error {
 			evidences, err := s.Search(gCtx, q)
 			if err == nil {
 				mu.Lock()
 				for _, ev := range evidences {
-					if evidenceMap[ev.Domain] == nil {
-						evidenceMap[ev.Domain] = make(map[string]bool)
-					}
+					if evidenceMap[ev.Domain] == nil { evidenceMap[ev.Domain] = make(map[string]bool) }
 					evidenceMap[ev.Domain][ev.Source] = true
 				}
 				mu.Unlock()
@@ -406,27 +370,11 @@ func buildH2HeadersEncoder(sni string) []byte {
 	encoder.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	encoder.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
 	
-	encoder.WriteField(hpack.HeaderField{
-		Name:  "user-agent", 
-		Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-	})
-	encoder.WriteField(hpack.HeaderField{
-		Name:  "accept", 
-		Value: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-	})
-	encoder.WriteField(hpack.HeaderField{
-		Name:  "accept-encoding", 
-		Value: "gzip, deflate, br, zstd",
-	})
-	encoder.WriteField(hpack.HeaderField{
-		Name:  "accept-language", 
-		Value: "en-US,en;q=0.9,ru;q=0.8",
-	})
-	
-	encoder.WriteField(hpack.HeaderField{
-		Name:  "sec-ch-ua", 
-		Value: `"Not A(Brand";v="8", "Chromium";v="151", "Google Chrome";v="151"`,
-	})
+	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"})
+	encoder.WriteField(hpack.HeaderField{Name: "accept", Value: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"})
+	encoder.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "gzip, deflate, br, zstd"})
+	encoder.WriteField(hpack.HeaderField{Name: "accept-language", Value: "en-US,en;q=0.9,ru;q=0.8"})
+	encoder.WriteField(hpack.HeaderField{Name: "sec-ch-ua", Value: `"Not A(Brand";v="8", "Chromium";v="151", "Google Chrome";v="151"`})
 	encoder.WriteField(hpack.HeaderField{Name: "sec-ch-ua-mobile", Value: "?0"})
 	encoder.WriteField(hpack.HeaderField{Name: "sec-ch-ua-platform", Value: `"Windows"`})
 	encoder.WriteField(hpack.HeaderField{Name: "sec-fetch-dest", Value: "document"})
@@ -453,7 +401,7 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 	t0 := time.Now()
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.TCPTimeoutMs) * time.Millisecond}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
-	if err != nil { return nil, fmt.Errorf("tcp dial: %w", err) }
+	if err != nil { return nil, err }
 	defer conn.Close()
 	cand.Timings.TCP = time.Since(t0)
 
@@ -467,10 +415,14 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, error
 	}, utls.HelloChrome_Auto)
 
 	uConn.SetDeadline(time.Now().Add(time.Duration(cfg.TLSTimeoutMs) * time.Millisecond))
-	if err := uConn.HandshakeContext(ctx); err != nil { return nil, fmt.Errorf("tls handshake: %w", err) }
+	if err := uConn.HandshakeContext(ctx); err != nil { return nil, err }
 	cand.Timings.TLS = time.Since(t1)
 
-	if uConn.ConnectionState().NegotiatedProtocol != "h2" { return nil, fmt.Errorf("protocol is not h2") }
+	if uConn.ConnectionState().NegotiatedProtocol == "h2" {
+		cand.ALPN = "h2"
+	} else {
+		cand.ALPN = "h2 (no ALPN)" // Смягченный ALPN фильтр
+	}
 
 	state := uConn.ConnectionState()
 	if len(state.PeerCertificates) > 0 {
@@ -516,7 +468,7 @@ ReadLoop:
 			data := recvBuf.Bytes()
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
 			
-			if length > maxInboundFrameSize { return nil, fmt.Errorf("frame size %d exceeds max", length) }
+			if length > maxInboundFrameSize { return nil, fmt.Errorf("frame size exceeds max") }
 			if uint32(recvBuf.Len()) < 9+length { break }
 
 			frameType, flags := data[3], data[4]
@@ -531,28 +483,21 @@ ReadLoop:
 			switch frameType {
 			case FrameSettings:
 				if streamID != 0 { return nil, fmt.Errorf("SETTINGS stream != 0") }
-				if (flags & FlagAck) != 0 {
-					if length != 0 { return nil, fmt.Errorf("SETTINGS ACK length != 0") }
-				} else {
-					if length%6 != 0 { return nil, fmt.Errorf("SETTINGS length mod 6 != 0") }
-					_ = writeH2(uConn, buildH2Frame(FrameSettings, FlagAck, 0, []byte{}), wTo)
-					for i := 0; i < int(length); i += 6 {
-						if binary.BigEndian.Uint16(payload[i:i+2]) == SettingMaxFrameSize {
-							val := binary.BigEndian.Uint32(payload[i+2 : i+6])
-							if val >= 16384 && val <= 16777215 { 
-								maxInboundFrameSize = val
-								if maxInboundFrameSize > 1<<20 { maxInboundFrameSize = 1<<20 }
+				if (flags & FlagAck) == 0 {
+					if length%6 == 0 {
+						_ = writeH2(uConn, buildH2Frame(FrameSettings, FlagAck, 0, []byte{}), wTo)
+						for i := 0; i < int(length); i += 6 {
+							if binary.BigEndian.Uint16(payload[i:i+2]) == SettingMaxFrameSize {
+								val := binary.BigEndian.Uint32(payload[i+2 : i+6])
+								if val >= 16384 && val <= 16777215 { 
+									maxInboundFrameSize = val
+									if maxInboundFrameSize > 1<<20 { maxInboundFrameSize = 1<<20 }
+								}
 							}
 						}
 					}
 				}
-			case FrameGoAway:
-				if streamID != 0 { return nil, fmt.Errorf("GOAWAY stream != 0") }
-			case FrameRSTStream:
-				if length != 4 { return nil, fmt.Errorf("RST_STREAM length != 4") }
-				if streamID == 1 { return nil, fmt.Errorf("stream 1 reset") }
 			case FrameHeaders:
-				if streamID == 0 { return nil, fmt.Errorf("HEADERS stream == 0") }
 				if streamID == 1 {
 					if (flags & FlagEndStream) != 0 { endStreamSeen = true }
 					headerBlocks.Write(payload)
@@ -560,6 +505,7 @@ ReadLoop:
 						expectingContinuation = true
 						activeStreamID = streamID
 					} else {
+						expectingContinuation = false
 						headers, err := decoder.DecodeFull(headerBlocks.Bytes())
 						if err != nil { return nil, err }
 						parseHeaders(cand, headers)
@@ -578,7 +524,6 @@ ReadLoop:
 					}
 				}
 			case FrameData:
-				if streamID == 0 { return nil, fmt.Errorf("DATA stream == 0") }
 				if streamID == 1 {
 					if (flags & FlagEndStream) != 0 { endStreamSeen = true }
 					cand.DataBytes += len(payload)
@@ -590,7 +535,8 @@ ReadLoop:
 		if err != nil { break }
 	}
 
-	if cand.HTTPStatus < 200 || cand.HTTPStatus >= 300 { return nil, fmt.Errorf("bad http status: %d", cand.HTTPStatus) }
+	// Оставляем ВСЕ статусы (2xx, 3xx, 4xx, 5xx), если сервер ответил хоть что-то по HTTP/2
+	if cand.HTTPStatus == 0 { return nil, fmt.Errorf("no http status code") }
 	return cand, nil
 }
 
@@ -618,119 +564,80 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	if cfg.TargetASN != 0 && cand.ASN != cfg.TargetASN { return false }
 	if cfg.TargetCountry != "" && !strings.EqualFold(cand.Country, cfg.TargetCountry) { return false }
 
-	var score float64 = 50.0
-	score -= float64(cand.CDNConfidence)
+	cand.Score = 50.0
+	if !cand.CertValidDates { cand.Score -= 30.0 }
+	cand.Score -= float64(cand.CDNConfidence)
 
-	ttfbMs := float64(cand.Timings.TTFB.Milliseconds())
-	if ttfbMs < 50 { score += 15.0 } else if ttfbMs > 300 { score -= (ttfbMs - 300) / 10.0 }
-	if cand.HTTPStatus == 200 { score += 10.0 }
-	
-	if !cand.CertValidDates { score -= 20.0 }
-	certMatch := false
-	for _, san := range cand.CertSANs {
-		if strings.EqualFold(san, cand.SNI) { certMatch = true; break }
-	}
-	if certMatch { score += 30.0 }
-
-	if score > 100 { score = 100 }
-	if score < 0 { score = 0 }
-	cand.Score = score
+	if cand.Score <= 0 { return false } // Отсеиваем только гарантированный мусор и CDNs
 	return true
 }
 
-func RunPassivePipeline(ctx context.Context, cfg Config, dedup *Deduplicator, asnDB, countryDB *geoip2.Reader, sources []OSINTSource) []Candidate {
-	var qDomains []string
-	for _, d := range cfg.Domains {
-		if cl := CleanDomain(d); cl != "" { qDomains = append(qDomains, cl) }
-	}
-	if len(qDomains) == 0 { return nil }
-
-	log.Printf("[*] Passive Mode: CT Expanding %d seed domains...", len(qDomains))
-	evidences := GatherOSINT(ctx, TargetQuery{Domains: qDomains}, sources)
+func RunDirectPipeline(ctx context.Context, cfg Config, sampledIPs []string, dedup *Deduplicator, asnDB, countryDB *geoip2.Reader, sources []OSINTSource) []Candidate {
+	var mu sync.Mutex
+	ipSniMap := make(map[string]map[string]bool)
 	
-	domMap := make(map[string]map[string]bool)
-	for _, ev := range evidences {
-		if domMap[ev.Domain] == nil { domMap[ev.Domain] = make(map[string]bool) }
-		domMap[ev.Domain][ev.Source] = true
-	}
-
-	var candidates []Candidate
-	var mu sync.Mutex
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(cfg.Workers)
-
-	for dom, srcMap := range domMap {
-		dom, srcMap := dom, srcMap
-		g.Go(func() error {
-			addrs, err := net.DefaultResolver.LookupHost(gCtx, dom)
-			if err != nil || len(addrs) == 0 { return nil }
-
-			for _, ip := range addrs {
-				if net.ParseIP(ip).To4() == nil { continue }
-				if !dedup.IsNew(ip + ":" + dom) { continue }
-				
-				tempCand := &Candidate{IP: ip}
-				if !validateAndEnrich(tempCand, asnDB, countryDB, cfg) { continue }
-
-				cand, err := ProbeH2(gCtx, ip, dom, cfg)
-				if err != nil { continue }
-
-				cand.Sources = srcMap
-				if validateAndEnrich(cand, asnDB, countryDB, cfg) && cand.Score > 20 {
-					mu.Lock()
-					candidates = append(candidates, *cand)
-					mu.Unlock()
-				}
-			}
-			return nil
-		})
-	}
-	_ = g.Wait()
-	return candidates
-}
-
-func RunDirectPipeline(ctx context.Context, cfg Config, dedup *Deduplicator, asnDB, countryDB *geoip2.Reader, sources []OSINTSource) []Candidate {
-	mergedBlocks := MergeCIDRs(cfg.CIDRs)
-	sampledIPs := SampleIPs(mergedBlocks, cfg.MaxIPs, cfg.Seed)
-	log.Printf("[*] Direct Mode: Sampled %d unique IPs from merged CIDRs", len(sampledIPs))
-
-	var candidates []Candidate
-	var mu sync.Mutex
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(cfg.Workers)
-
+	// ЭТАП 1: Разведка (PTR/OSINT)
+	g1, gCtx1 := errgroup.WithContext(ctx)
+	g1.SetLimit(cfg.Workers)
+	
 	for _, ip := range sampledIPs {
 		ip := ip
-		g.Go(func() error {
-			evidences := GatherOSINT(gCtx, TargetQuery{IPs: []string{ip}}, sources)
+		g1.Go(func() error {
+			evidences := GatherOSINT(gCtx1, TargetQuery{IPs: []string{ip}}, sources)
 			
-			sniMap := make(map[string]map[string]bool)
-			for _, e := range evidences {
-				if sniMap[e.Domain] == nil { sniMap[e.Domain] = make(map[string]bool) }
-				sniMap[e.Domain][e.Source] = true
-			}
-			
-			if len(sniMap) == 0 && cfg.DirectSNI != "" {
-				sniMap[cfg.DirectSNI] = map[string]bool{"FallbackSNI": true}
+			if len(evidences) == 0 && cfg.DirectSNI != "" {
+				evidences = append(evidences, DomainEvidence{Domain: cfg.DirectSNI, Source: "Fallback"})
 			}
 
-			for sni, srcMap := range sniMap {
-				if !dedup.IsNew(ip + ":" + sni) { continue }
-				
-				cand, err := ProbeH2(gCtx, ip, sni, cfg)
-				if err != nil { continue }
+			mu.Lock()
+			for _, ev := range evidences {
+				if ipSniMap[ip] == nil { ipSniMap[ip] = make(map[string]bool) }
+				ipSniMap[ip][ev.Domain] = true
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g1.Wait()
 
-				cand.Sources = srcMap
-				if validateAndEnrich(cand, asnDB, countryDB, cfg) && cand.Score > 20 {
-					mu.Lock()
-					candidates = append(candidates, *cand)
-					mu.Unlock()
-				}
+	uniqueIPs := 0
+	for _, snis := range ipSniMap {
+		if len(snis) > 0 { uniqueIPs++ }
+	}
+	fmt.Printf("\n[+] Этап 1 завершен. Найдено чистых IP с доменами: %d\n\n", uniqueIPs)
+
+	type Pair struct { IP, SNI string; Src map[string]bool }
+	var pairs []Pair
+	for ip, snis := range ipSniMap {
+		for sni, srcMap := range snis {
+			if dedup.IsNew(ip + ":" + sni) { pairs = append(pairs, Pair{IP: ip, SNI: sni, Src: srcMap}) }
+		}
+	}
+
+	// ЭТАП 2: Пробинг HTTP/2
+	var candidates []Candidate
+	g2, gCtx2 := errgroup.WithContext(ctx)
+	g2.SetLimit(cfg.Workers)
+
+	for _, p := range pairs {
+		p := p
+		g2.Go(func() error {
+			cand, err := ProbeH2(gCtx2, p.IP, p.SNI, cfg)
+			if err != nil { return nil }
+
+			cand.Sources = p.Src
+			if validateAndEnrich(cand, asnDB, countryDB, cfg) {
+				mu.Lock()
+				candidates = append(candidates, *cand)
+				mu.Unlock()
 			}
 			return nil
 		})
 	}
-	_ = g.Wait()
+	_ = g2.Wait()
+
+	// Сортировка по минимальному RTT для выдачи лучшего результата наверх
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Timings.Total() < candidates[j].Timings.Total() })
 	return candidates
 }
 
@@ -742,7 +649,7 @@ func main() {
 	
 	flag.StringVar(&modeStr, "mode", "passive", "passive | direct | hybrid")
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
-	flag.IntVar(&cfg.MaxIPs, "max-ips", 10000, "Limit for IP sampling")
+	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling")
 	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 2000, "TCP timeout ms")
 	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 2000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
@@ -761,83 +668,98 @@ func main() {
 	cfg.CIDRs = flag.Args()
 	if domainsStr != "" { cfg.Domains = strings.Split(domainsStr, ",") }
 
-	// Если не переданы ни домены, ни CIDR, принудительно переводим в автономный режим
 	if len(cfg.Domains) == 0 && len(cfg.CIDRs) == 0 {
-		log.Println("[*] No domains or CIDRs provided. Switching to FULL AUTONOMOUS MODE.")
 		cfg.Mode = ModeAuto
 	}
 
-	// Автоопределение локации и ASN
-	if cfg.TargetASN == 0 && cfg.TargetCountry == "" {
-		log.Println("[*] Auto-detecting VPS ASN and Country...")
-		asn, country, err := autoDetectVPS()
-		if err != nil {
-			log.Printf("[!] Failed to auto-detect VPS location: %v. Proceeding without hard scope.", err)
-		} else {
-			cfg.TargetASN = asn
-			cfg.TargetCountry = country
-			log.Printf("[+] Auto-detected: ASN=%d, Country=%s", cfg.TargetASN, cfg.TargetCountry)
-		}
-	}
+	var vpsASN uint
+	var vpsCountry, vpsIP, localPrefix string
+	var err error
 
-	// Обработка автономного режима (выкачивание подсетей)
-	if cfg.Mode == ModeAuto {
-		if cfg.TargetASN == 0 {
-			log.Fatal("[-] Autonomous mode failed: Could not determine ASN automatically.")
+	if cfg.Mode == ModeAuto || (cfg.TargetASN == 0 && cfg.TargetCountry == "") {
+		vpsASN, vpsCountry, vpsIP, err = autoDetectVPS()
+		if err == nil {
+			cfg.TargetASN = vpsASN
+			cfg.TargetCountry = vpsCountry
 		}
-		log.Printf("[*] Autonomous Mode: Fetching all announced IPv4 prefixes for AS%d via RIPE STAT API...", cfg.TargetASN)
-		cidrs, err := fetchASNCIDRs(cfg.TargetASN)
-		if err != nil {
-			log.Fatalf("[-] Failed to fetch CIDRs for AS%d: %v", cfg.TargetASN, err)
-		}
-		if len(cidrs) == 0 {
-			log.Fatalf("[-] No IPv4 prefixes found for AS%d", cfg.TargetASN)
-		}
-		log.Printf("[+] Successfully fetched %d IPv4 prefixes for AS%d", len(cidrs), cfg.TargetASN)
-		
-		cfg.CIDRs = cidrs
-		cfg.Mode = ModeDirect // Подсети найдены, запускаем обычный Direct-пайплайн
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	var asnDB, countryDB *geoip2.Reader
-	if db, err := geoip2.Open(cfg.ASNPath); err == nil { asnDB = db; defer db.Close() } else { log.Printf("[!] ASN DB error: %v", err) }
-	if db, err := geoip2.Open(cfg.GeoIPPath); err == nil { countryDB = db; defer db.Close() } else { log.Printf("[!] GeoIP DB error: %v", err) }
+	if db, err := geoip2.Open(cfg.ASNPath); err == nil { asnDB = db; defer db.Close() }
+	if db, err := geoip2.Open(cfg.GeoIPPath); err == nil { countryDB = db; defer db.Close() }
 
 	sources := []OSINTSource{&PTRSource{}, &CrtShSource{client: &http.Client{Timeout: 10 * time.Second}}}
 	dedup := &Deduplicator{}
 	var results []Candidate
 
-	switch cfg.Mode {
-	case ModePassive:
-		if len(cfg.Domains) == 0 { log.Fatal("[-] Passive mode requires --domains") }
-		results = RunPassivePipeline(ctx, cfg, dedup, asnDB, countryDB, sources)
-	case ModeDirect:
-		if len(cfg.CIDRs) == 0 { log.Fatal("[-] Direct mode requires CIDR args") }
-		results = RunDirectPipeline(ctx, cfg, dedup, asnDB, countryDB, sources)
-	case ModeHybrid:
-		log.Println("[*] Hybrid Mode Pipeline")
-		if len(cfg.Domains) > 0 { results = RunPassivePipeline(ctx, cfg, dedup, asnDB, countryDB, sources) }
+	if cfg.Mode == ModeAuto {
+		if cfg.TargetASN == 0 { log.Fatal("[-] Autonomous mode failed: Could not determine ASN.") }
+		cidrs, err := fetchASNCIDRs(cfg.TargetASN)
+		if err != nil || len(cidrs) == 0 { log.Fatalf("[-] Failed to fetch CIDRs for AS%d", cfg.TargetASN) }
 		
-		goodCount := 0
-		for _, r := range results { if r.Score >= 70 { goodCount++ } }
+		cfg.CIDRs = cidrs
+		merged := MergeCIDRs(cidrs)
 		
-		if goodCount < 3 && len(cfg.CIDRs) > 0 {
-			log.Printf("[!] Yield low (%d good candidates), initiating Direct phase...", goodCount)
-			results = append(results, RunDirectPipeline(ctx, cfg, dedup, asnDB, countryDB, sources)...)
+		vpsIPObj := net.ParseIP(vpsIP)
+		for _, c := range cidrs {
+			_, ipnet, _ := net.ParseCIDR(c)
+			if ipnet != nil && ipnet.Contains(vpsIPObj) {
+				localPrefix = c
+				break
+			}
 		}
+
+		sampledIPs := SampleIPs(merged, cfg.MaxIPs, cfg.Seed)
+		
+		fmt.Printf("[*] Используем указанный IP VPS: %s\n", vpsIP)
+		fmt.Printf("[*] Announcing ASN:          AS%d (Локальный префикс: %s)\n", cfg.TargetASN, localPrefix)
+		fmt.Printf("[*] Параллелизм:             %d горутин\n", cfg.Workers)
+		fmt.Printf("[*] Страна сервера:          %s (GeoIP)\n", cfg.TargetCountry)
+		fmt.Printf("[*] Подсетей для скана:      %d (из %d)\n", len(merged), len(cidrs))
+		fmt.Printf("[*] Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
+
+		results = RunDirectPipeline(ctx, cfg, sampledIPs, dedup, asnDB, countryDB, sources)
+
+	} else if cfg.Mode == ModeDirect {
+		merged := MergeCIDRs(cfg.CIDRs)
+		sampledIPs := SampleIPs(merged, cfg.MaxIPs, cfg.Seed)
+		fmt.Printf("[*] Direct Mode: Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
+		results = RunDirectPipeline(ctx, cfg, sampledIPs, dedup, asnDB, countryDB, sources)
+	} else {
+		log.Fatal("[-] Only autonomous and direct modes are fully formatted in this block.")
 	}
 
-	if len(results) == 0 { log.Println("[-] No viable candidates found."); return }
-	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+	if len(results) == 0 {
+		fmt.Println("[-] Подходящих кандидатов не найдено.")
+		return
+	}
 
-	fmt.Printf("\n%-30s | %-15s | %-5s | %-5s | %-18s | %-6s\n", "SNI", "IP Address", "Score", "ASN", "TCP/TLS/TTFB", "Status")
-	fmt.Println(strings.Repeat("-", 95))
+	fmt.Printf("[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
+
+	fmt.Printf("%-37.37s | %-15.15s | %-13.13s | %-5s | %-9s | %-20.20s | %s\n", "Цель (SNI)", "IP адрес", "ALPN", "HTTP", "DATA", "Сервер", "RTT")
+	fmt.Println(strings.Repeat("-", 115))
+
 	for _, r := range results {
-		fmt.Printf("%-30s | %-15s | %-5.0f | %-5d | %-4d/%-4d/%-4d ms | %-6d\n",
-			r.SNI, r.IP, r.Score, r.ASN,
-			r.Timings.TCP.Milliseconds(), r.Timings.TLS.Milliseconds(), r.Timings.TTFB.Milliseconds(), r.HTTPStatus)
+		srv := r.Server
+		if srv == "" { srv = "-" }
+		if len(srv) > 20 { srv = srv[:20] }
+
+		dataStr := fmt.Sprintf("%d B", r.DataBytes)
+		rttStr := fmt.Sprintf("%d ms", r.Timings.Total().Milliseconds())
+
+		fmt.Printf("%-37.37s | %-15.15s | %-13.13s | %-5d | %-9s | %-20.20s | %s\n",
+			r.SNI, r.IP, r.ALPN, r.HTTPStatus, dataStr, srv, rttStr)
 	}
+
+	best := results[0]
+	fmt.Println("\n===================================================================================================================")
+	fmt.Println("                                   РЕКОМЕНДУЕМАЯ КОНФИГУРАЦИЯ REALITY (HTTP/2)")
+	fmt.Println("===================================================================================================================")
+	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
+	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
+	fmt.Printf("Параметры: ALPN: %s, HTTP Status: %d, Server: %s, Body: %d B, RTT: %d ms\n", 
+		best.ALPN, best.HTTPStatus, best.Server, best.DataBytes, best.Timings.Total().Milliseconds())
 }
