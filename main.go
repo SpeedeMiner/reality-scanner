@@ -55,6 +55,8 @@ const (
 	FlagPadded     = 0x08
 	FlagPriority   = 0x20
 	FlagAck        = 0x01
+
+	maxCTNamesPerRoot = 100
 )
 
 var (
@@ -93,11 +95,11 @@ type Timings struct {
 	TCP          time.Duration
 	TLS          time.Duration
 	H2FirstFrame time.Duration
-	HTTPHeaders  time.Duration
+	H2Headers    time.Duration
 }
 
 func (t Timings) TotalLatency() time.Duration {
-	return t.TCP + t.TLS + t.HTTPHeaders
+	return t.TCP + t.TLS + t.H2Headers
 }
 
 type PeerSettingsProfile struct {
@@ -117,14 +119,14 @@ type PeerSettingsProfile struct {
 }
 
 type RealityScore struct {
-	TLSQuality     float64 // 20 max
-	Certificate    float64 // 20 max
-	H2Profile      float64 // 20 max
-	ServerProfile  float64 // 10 max
-	HTTPBehavior   float64 // 10 max
-	DNSConsistency float64 // 10 max
-	Latency        float64 // 10 max
-	Total          float64 // 100 max (Base)
+	TLSQuality     float64
+	Certificate    float64
+	H2Profile      float64
+	ServerProfile  float64
+	HTTPBehavior   float64
+	DNSConsistency float64
+	Latency        float64
+	Total          float64
 }
 
 type Candidate struct {
@@ -142,7 +144,7 @@ type Candidate struct {
 	Country           string
 	CDNStrong         bool
 	CDNWeak           bool
-	Score             float64 // Final Score (Total - DomainPenalty)
+	Score             float64
 	DomainPenalty     float64
 	RealityScore      RealityScore
 	CertChainValid    bool
@@ -150,9 +152,11 @@ type Candidate struct {
 	StreamReset       bool
 	GoAwaySeen        bool
 	DNSMatched        bool
-	DomainQuality     string // "Normal", "DynDNS", "JunkTLD", "Numeric"
+	PTRDiscovered     bool
+	SeedProvided      bool
+	CTDiscovered      bool
+	DomainQuality     string
 
-	// REALITY Suitability attributes
 	CertIssuer            string
 	CertSubject           string
 	CertSANCount          int
@@ -165,34 +169,40 @@ type Candidate struct {
 }
 
 type TargetPair struct {
-	IP  string
-	SNI string
+	IP            string
+	SNI           string
+	PTRDiscovered bool
+	SeedProvided  bool
+	CTDiscovered  bool
 }
 
 // ================= TELEMETRY & CIRCUIT BREAKER =================
 
 type PipelineStats struct {
-	mu               sync.Mutex
-	IPSampled        int
-	IPWithPTR        int
-	CRTAttempts      int
-	CRTSuccess       int
-	CRTFailed        int
-	CRTTimeouts      int
-	CRTHTTP4xx       int
-	CRTHTTP5xx       int
-	CRTNetErr        int
-	CRTDecodeErr     int
-	CRTUniqueSANs    int
-	DNSValidPairs    int
-	TCPConnected     int
-	TLSHandshakeOK   int
-	TLSValidationErr int
-	H2HeadersOK      int
-	EndStreamOK      int
-	ASNFiltered      int
-	CountryFiltered  int
-	CDNDropped       int
+	mu                    sync.Mutex
+	IPSampled             int
+	IPWithPTR             int
+	CRTAttempts           int
+	CRTSuccess            int
+	CRTFailed             int
+	CRTTimeouts           int
+	CRTHTTP4xx            int
+	CRTHTTP5xx            int
+	CRTNetErr             int
+	CRTDecodeErr          int
+	CTFallbackAttempts    int
+	CTFallbackSuccess     int
+	CTFallbackFailed      int
+	UniqueDiscoveredNames int
+	DNSValidPairs         int
+	TCPConnected          int
+	TLSHandshakeOK        int
+	TLSValidationErr      int
+	H2HeadersOK           int
+	EndStreamOK           int
+	ASNFiltered           int
+	CountryFiltered       int
+	CDNDropped            int
 }
 
 var stats PipelineStats
@@ -227,7 +237,6 @@ func (cb *CRTCircuitBreaker) RecordFailure(err error) {
 	if !isCriticalCRTError(err) {
 		return
 	}
-
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
@@ -235,7 +244,7 @@ func (cb *CRTCircuitBreaker) RecordFailure(err error) {
 	if cb.failures >= cb.threshold && !cb.disabled {
 		cb.disabled = true
 		cb.disabledAt = time.Now()
-		fmt.Printf("[!] CRTCircuitBreaker: crt.sh временно отключен на %v после %d критических сбоев.\n", cb.cooldown, cb.failures)
+		fmt.Printf("[!] CRTCircuitBreaker: crt.sh временно отключен на %v после %d сбоев.\n", cb.cooldown, cb.failures)
 	}
 }
 
@@ -243,6 +252,8 @@ func (cb *CRTCircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.failures = 0
+	cb.disabled = false
+	cb.disabledAt = time.Time{}
 }
 
 func (cb *CRTCircuitBreaker) IsDisabled() bool {
@@ -251,7 +262,6 @@ func (cb *CRTCircuitBreaker) IsDisabled() bool {
 
 	if cb.disabled {
 		if time.Since(cb.disabledAt) > cb.cooldown {
-			// Cooldown истёк — пробуем восстановить работу (Half-Open / Closed)
 			cb.disabled = false
 			cb.failures = 0
 			return false
@@ -261,26 +271,34 @@ func (cb *CRTCircuitBreaker) IsDisabled() bool {
 	return false
 }
 
-var crtBreaker = &CRTCircuitBreaker{threshold: 5, cooldown: 60 * time.Second}
+var (
+	crtBreaker     = &CRTCircuitBreaker{threshold: 5, cooldown: 5 * time.Minute}
+	certSpotterSem = make(chan struct{}, 4)
 
-type ProbeStage int
-
-const (
-	ProbeStageTCP ProbeStage = iota
-	ProbeStageTLS
-	ProbeStageTLSValidation
-	ProbeStageH2
-	ProbeStageHeaders
-	ProbeStageComplete
+	crtRateMu      sync.Mutex
+	crtNextRequest time.Time
 )
 
-type ProbeError struct {
-	Stage ProbeStage
-	Err   error
-}
+func waitCRT(ctx context.Context) error {
+	for {
+		crtRateMu.Lock()
+		now := time.Now()
+		if !now.Before(crtNextRequest) {
+			crtNextRequest = now.Add(12 * time.Second)
+			crtRateMu.Unlock()
+			return nil
+		}
+		wait := time.Until(crtNextRequest)
+		crtRateMu.Unlock()
 
-func (e *ProbeError) Error() string {
-	return e.Err.Error()
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // ================= CACHES =================
@@ -318,7 +336,7 @@ var (
 	dnsGroup singleflight.Group
 )
 
-// ================= MATH & UTILS =================
+// ================= UTILS =================
 
 func gcd(a, b uint64) uint64 {
 	for b != 0 {
@@ -378,7 +396,186 @@ func classifyDomainQuality(sni string) string {
 	return "Normal"
 }
 
-// ================= DOWNLOAD & VALIDATE DATABASES =================
+// ================= CT DISCOVERY =================
+
+func gatherCrtSh(ctx context.Context, domain string, client *http.Client) ([]string, error) {
+	urlStr := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", url.QueryEscape(domain))
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		stats.mu.Lock()
+		stats.CRTNetErr++
+		stats.mu.Unlock()
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		stats.mu.Lock()
+		if errors.Is(err, context.DeadlineExceeded) {
+			stats.CRTTimeouts++
+		} else {
+			stats.CRTNetErr++
+		}
+		stats.mu.Unlock()
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		stats.mu.Lock()
+		stats.CRTHTTP4xx++
+		stats.mu.Unlock()
+		return nil, fmt.Errorf("crt.sh HTTP status 4xx: %d", resp.StatusCode)
+	}
+	if resp.StatusCode >= 500 {
+		stats.mu.Lock()
+		stats.CRTHTTP5xx++
+		stats.mu.Unlock()
+		return nil, fmt.Errorf("crt.sh HTTP status 5xx: %d", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("crt.sh HTTP status %d", resp.StatusCode)
+	}
+
+	var ctRes []struct {
+		NameValue string `json:"name_value"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ctRes); err != nil {
+		stats.mu.Lock()
+		stats.CRTDecodeErr++
+		stats.mu.Unlock()
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	var subs []string
+	for _, rec := range ctRes {
+		for _, part := range strings.Split(rec.NameValue, "\n") {
+			if d := CleanDomain(part); d != "" {
+				if _, exists := seen[d]; !exists {
+					seen[d] = struct{}{}
+					subs = append(subs, d)
+				}
+			}
+		}
+	}
+	return subs, nil
+}
+
+func gatherCertSpotter(ctx context.Context, domain string, client *http.Client) ([]string, error) {
+	urlStr := fmt.Sprintf(
+		"https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names",
+		url.QueryEscape(domain),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("certspotter HTTP status %d", resp.StatusCode)
+	}
+
+	var issuances []struct {
+		DNSNames []string `json:"dns_names"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&issuances); err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{})
+	var result []string
+
+	for _, issuance := range issuances {
+		for _, name := range issuance.DNSNames {
+			name = strings.TrimSpace(name)
+			if d := CleanDomain(name); d != "" {
+				if _, exists := seen[d]; !exists {
+					seen[d] = struct{}{}
+					result = append(result, d)
+				}
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func gatherCertSpotterLimited(ctx context.Context, domain string, client *http.Client) ([]string, error) {
+	select {
+	case certSpotterSem <- struct{}{}:
+		defer func() { <-certSpotterSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return gatherCertSpotter(ctx, domain, client)
+}
+
+func gatherCTDomains(ctx context.Context, domain string, client *http.Client) ([]string, error) {
+	if !crtBreaker.IsDisabled() {
+		if err := waitCRT(ctx); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+		} else if !crtBreaker.IsDisabled() {
+			requestCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+			defer cancel()
+
+			stats.mu.Lock()
+			stats.CRTAttempts++
+			stats.mu.Unlock()
+
+			result, err := gatherCrtSh(requestCtx, domain, client)
+			if err == nil {
+				stats.mu.Lock()
+				stats.CRTSuccess++
+				stats.mu.Unlock()
+				crtBreaker.RecordSuccess()
+				if len(result) > maxCTNamesPerRoot {
+					result = result[:maxCTNamesPerRoot]
+				}
+				return result, nil
+			}
+
+			stats.mu.Lock()
+			stats.CRTFailed++
+			stats.mu.Unlock()
+			crtBreaker.RecordFailure(err)
+		}
+	}
+
+	stats.mu.Lock()
+	stats.CTFallbackAttempts++
+	stats.mu.Unlock()
+
+	spotCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	result, err := gatherCertSpotterLimited(spotCtx, domain, client)
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+
+	if err != nil {
+		stats.CTFallbackFailed++
+		return nil, err
+	}
+
+	stats.CTFallbackSuccess++
+	if len(result) > maxCTNamesPerRoot {
+		result = result[:maxCTNamesPerRoot]
+	}
+	return result, nil
+}
+
+// ================= DB & IP HELPERS =================
 
 func ensureDB(path, dbURL string) error {
 	if fi, err := os.Stat(path); err == nil {
@@ -388,9 +585,6 @@ func ensureDB(path, dbURL string) error {
 				return nil
 			}
 		}
-		fmt.Printf("[*] Существующий файл базы %s поврежден или устарел. Перекачиваем...\n", path)
-	} else {
-		fmt.Printf("[*] Файл %s не найден. Загружаем с GitHub...\n", path)
 	}
 
 	tempFile := path + ".tmp"
@@ -424,14 +618,12 @@ func ensureDB(path, dbURL string) error {
 	testDB, err := geoip2.Open(tempFile)
 	if err != nil {
 		os.Remove(tempFile)
-		return fmt.Errorf("downloaded file is not a valid MaxMind database: %v", err)
+		return fmt.Errorf("invalid MaxMind database: %v", err)
 	}
 	testDB.Close()
 
 	return os.Rename(tempFile, path)
 }
-
-// ================= IP DETECTION =================
 
 func readPublicIPv4(resp *http.Response) (string, error) {
 	defer resp.Body.Close()
@@ -460,21 +652,16 @@ func getPublicIP(targetIP string) (string, error) {
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
-
-	resp, err := client.Get("https://api.ipify.org")
-	if err == nil {
+	if resp, err := client.Get("https://api.ipify.org"); err == nil {
 		if ip, err := readPublicIPv4(resp); err == nil {
 			return ip, nil
 		}
 	}
-
-	resp, err = client.Get("http://ip-api.com/line/?fields=query")
-	if err == nil {
+	if resp, err := client.Get("http://ip-api.com/line/?fields=query"); err == nil {
 		if ip, err := readPublicIPv4(resp); err == nil {
 			return ip, nil
 		}
 	}
-
 	return "", fmt.Errorf("failed to fetch valid public IPv4")
 }
 
@@ -509,7 +696,7 @@ func fetchASNCIDRs(asn uint) ([]string, error) {
 	return cidrs, nil
 }
 
-// ================= CIDR MERGE & SAMPLER =================
+// ================= CIDR & SAMPLING =================
 
 type ipRange struct {
 	start uint64
@@ -621,8 +808,6 @@ func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
 	return result
 }
 
-// ================= OSINT & DNS VALIDATION =================
-
 func resolveIPv4Cached(ctx context.Context, domain string) ([]string, error) {
 	v, err, _ := dnsGroup.Do(domain, func() (interface{}, error) {
 		if cached, ok := dnsCache.Get(domain); ok {
@@ -649,73 +834,29 @@ func resolveIPv4Cached(ctx context.Context, domain string) ([]string, error) {
 	return v.([]string), nil
 }
 
-func gatherCrtSh(ctx context.Context, domain string, client *http.Client) ([]string, error) {
-	urlStr := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", url.QueryEscape(domain))
-	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-	if err != nil {
-		stats.mu.Lock()
-		stats.CRTNetErr++
-		stats.mu.Unlock()
-		return nil, err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		stats.mu.Lock()
-		if errors.Is(err, context.DeadlineExceeded) {
-			stats.CRTTimeouts++
-		} else {
-			stats.CRTNetErr++
-		}
-		stats.mu.Unlock()
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		stats.mu.Lock()
-		stats.CRTHTTP4xx++
-		stats.mu.Unlock()
-		return nil, fmt.Errorf("crt.sh HTTP status 4xx: %d", resp.StatusCode)
-	}
-	if resp.StatusCode >= 500 {
-		stats.mu.Lock()
-		stats.CRTHTTP5xx++
-		stats.mu.Unlock()
-		return nil, fmt.Errorf("crt.sh HTTP status 5xx: %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("crt.sh HTTP status %d", resp.StatusCode)
-	}
-
-	var ctRes []struct {
-		NameValue string `json:"name_value"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&ctRes); err != nil {
-		stats.mu.Lock()
-		stats.CRTDecodeErr++
-		stats.mu.Unlock()
-		return nil, err
-	}
-
-	seen := make(map[string]struct{})
-	var subs []string
-	for _, rec := range ctRes {
-		for _, part := range strings.Split(rec.NameValue, "\n") {
-			if d := CleanDomain(part); d != "" {
-				if _, exists := seen[d]; !exists {
-					seen[d] = struct{}{}
-					subs = append(subs, d)
-				}
-			}
-		}
-	}
-	return subs, nil
-}
-
-// ================= HTTP/2 VALIDATOR =================
+// ================= HTTP/2 PROBE =================
 
 const clientAdvertisedMaxFrameSize = 16384
+
+type ProbeStage int
+
+const (
+	ProbeStageTCP ProbeStage = iota
+	ProbeStageTLS
+	ProbeStageTLSValidation
+	ProbeStageH2
+	ProbeStageHeaders
+	ProbeStageComplete
+)
+
+type ProbeError struct {
+	Stage ProbeStage
+	Err   error
+}
+
+func (e *ProbeError) Error() string {
+	return e.Err.Error()
+}
 
 func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
 	conn.SetWriteDeadline(time.Now().Add(timeout))
@@ -759,11 +900,14 @@ func buildWindowUpdateFrame(streamID uint32, increment uint32) []byte {
 	return buildH2Frame(FrameWindowUpdate, 0, streamID, payload)
 }
 
-func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *ProbeError) {
+func ProbeH2(ctx context.Context, ip, sni string, ptrDiscovered, seedProvided, ctDiscovered bool, cfg Config) (*Candidate, *ProbeError) {
 	cand := &Candidate{
 		IP:            ip,
 		SNI:           sni,
 		DNSMatched:    true,
+		PTRDiscovered: ptrDiscovered,
+		SeedProvided:  seedProvided,
+		CTDiscovered:  ctDiscovered,
 		DomainQuality: classifyDomainQuality(sni),
 	}
 
@@ -813,7 +957,7 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	cand.CertSANCount = len(cert.DNSNames) + len(cert.IPAddresses)
 
 	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
-		return cand, &ProbeError{Stage: ProbeStageTLSValidation, Err: fmt.Errorf("certificate is expired or not yet valid")}
+		return cand, &ProbeError{Stage: ProbeStageTLSValidation, Err: fmt.Errorf("certificate expired or not yet valid")}
 	}
 
 	if err := cert.VerifyHostname(sni); err != nil {
@@ -828,7 +972,6 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 		cand.CertChainValid = true
 	}
 
-	t2 := time.Now()
 	wTo := time.Duration(cfg.H2WriteTimeoutMs) * time.Millisecond
 
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil {
@@ -841,6 +984,8 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
 
+	requestSent := time.Now()
+
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
 
 	const maxInboundFrameSize = uint32(clientAdvertisedMaxFrameSize)
@@ -849,7 +994,7 @@ func ProbeH2(ctx context.Context, ip, sni string, cfg Config) (*Candidate, *Prob
 	headerBlocks := bytes.Buffer{}
 	decoder := hpack.NewDecoder(4096, nil)
 
-	gotFirstByte := false
+	firstFrameSeen := false
 	var expectingContinuation bool
 	var activeStreamID uint32
 
@@ -860,10 +1005,6 @@ ReadLoop:
 		}
 		n, err := uConn.Read(buf)
 		if n > 0 {
-			if !gotFirstByte {
-				cand.Timings.H2FirstFrame = time.Since(t2)
-				gotFirstByte = true
-			}
 			recvBuf.Write(buf[:n])
 		}
 
@@ -872,13 +1013,16 @@ ReadLoop:
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
 
 			if length > maxInboundFrameSize {
-				return cand, &ProbeError{
-					Stage: ProbeStageH2,
-					Err:   fmt.Errorf("incoming frame exceeds client receive limit: %d > %d", length, maxInboundFrameSize),
-				}
+				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("inbound frame exceeds limit: %d", length)}
 			}
 			if uint32(recvBuf.Len()) < 9+length {
 				break
+			}
+
+			// Фиксация времени появления полноценного 9-байтового заголовка первого входящего H2-фрейма
+			if !firstFrameSeen {
+				cand.Timings.H2FirstFrame = time.Since(requestSent)
+				firstFrameSeen = true
 			}
 
 			frameType, flags := data[3], data[4]
@@ -902,9 +1046,8 @@ ReadLoop:
 					}
 					break
 				}
-
 				if length%6 != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length: %d", length)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length")}
 				}
 
 				seenSettings := make(map[uint16]bool)
@@ -937,13 +1080,13 @@ ReadLoop:
 						prof.HasMaxConcurrentStreams = true
 					case 4:
 						if val > 0x7fffffff {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS_INITIAL_WINDOW_SIZE: %d", val)}
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid INITIAL_WINDOW_SIZE: %d", val)}
 						}
 						prof.InitialWindowSize = val
 						prof.HasInitialWindowSize = true
 					case 5:
 						if val < 16384 || val > 16777215 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS_MAX_FRAME_SIZE: %d", val)}
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid MAX_FRAME_SIZE: %d", val)}
 						}
 						prof.MaxFrameSize = val
 						prof.HasMaxFrameSize = true
@@ -964,41 +1107,28 @@ ReadLoop:
 				}
 				cand.H2SettingsAckSent = true
 
-			case FrameWindowUpdate:
-				if length != 4 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid WINDOW_UPDATE length: %d", length)}
-				}
-				inc := binary.BigEndian.Uint32(payload) & 0x7FFFFFFF
-				if inc == 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("WINDOW_UPDATE increment is 0")}
-				}
-
 			case FrameHeaders:
 				if streamID == 1 {
 					if (flags & FlagEndStream) != 0 {
 						cand.EndStreamSeen = true
 					}
-
 					actualPayload := payload
-					var padLen int
 					if flags&FlagPadded != 0 {
 						if len(actualPayload) < 1 {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED flag set but payload too short")}
 						}
-						padLen = int(actualPayload[0])
+						padLen := int(actualPayload[0])
 						actualPayload = actualPayload[1:]
+						if padLen > len(actualPayload) {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("padding exceeds payload")}
+						}
+						actualPayload = actualPayload[:len(actualPayload)-padLen]
 					}
 					if flags&FlagPriority != 0 {
 						if len(actualPayload) < 5 {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PRIORITY flag set but payload too short")}
 						}
 						actualPayload = actualPayload[5:]
-					}
-					if padLen > 0 {
-						if len(actualPayload) < padLen {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("padding exceeds actual payload")}
-						}
-						actualPayload = actualPayload[:len(actualPayload)-padLen]
 					}
 
 					headerBlocks.Write(actualPayload)
@@ -1015,21 +1145,16 @@ ReadLoop:
 						parseHeaders(cand, headers)
 						headerBlocks.Reset()
 						if !cand.H2HeadersReceived {
-							cand.Timings.HTTPHeaders = time.Since(t2)
+							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
 						}
 					}
 				}
 			case FrameContinuation:
-				if !expectingContinuation {
+				if !expectingContinuation || streamID != activeStreamID {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("unexpected CONTINUATION")}
 				}
-				if streamID != activeStreamID {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("CONTINUATION stream mismatch")}
-				}
-
 				headerBlocks.Write(payload)
-
 				if (flags & FlagEndHeaders) != 0 {
 					expectingContinuation = false
 					headers, err := decoder.DecodeFull(headerBlocks.Bytes())
@@ -1039,7 +1164,7 @@ ReadLoop:
 					parseHeaders(cand, headers)
 					headerBlocks.Reset()
 					if !cand.H2HeadersReceived {
-						cand.Timings.HTTPHeaders = time.Since(t2)
+						cand.Timings.H2Headers = time.Since(requestSent)
 						cand.H2HeadersReceived = true
 					}
 				}
@@ -1049,28 +1174,23 @@ ReadLoop:
 					if (flags & FlagEndStream) != 0 {
 						cand.EndStreamSeen = true
 					}
-
 					actualPayload := payload
-					var padLen int
 					if flags&FlagPadded != 0 {
 						if len(actualPayload) < 1 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED flag set but payload too short")}
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED flag set on DATA but payload too short")}
 						}
-						padLen = int(actualPayload[0])
+						padLen := int(actualPayload[0])
 						actualPayload = actualPayload[1:]
-					}
-					if padLen > 0 {
-						if len(actualPayload) < padLen {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("padding exceeds actual payload")}
+						if padLen > len(actualPayload) {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("padding exceeds DATA payload")}
 						}
 						actualPayload = actualPayload[:len(actualPayload)-padLen]
 					}
-
 					cand.BodyBytes += len(actualPayload)
 
-					if length > 0 {
-						inc := uint32(length)
-
+					// RFC 9113: flow control учитывает полный payload включая padding
+					inc := length
+					if inc > 0 {
 						if err := writeH2(uConn, buildWindowUpdateFrame(1, inc), wTo); err != nil {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
@@ -1079,12 +1199,26 @@ ReadLoop:
 						}
 					}
 				}
+			case FrameWindowUpdate:
+				if length != 4 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid WINDOW_UPDATE length: %d", length)}
+				}
+				inc := binary.BigEndian.Uint32(payload) & 0x7fffffff
+				if inc == 0 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("WINDOW_UPDATE increment is zero")}
+				}
 			case FrameRSTStream:
+				if length != 4 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid RST_STREAM length: %d", length)}
+				}
 				if streamID == 1 {
 					cand.StreamReset = true
 					break ReadLoop
 				}
 			case FrameGoAway:
+				if length < 8 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid GOAWAY length: %d", length)}
+				}
 				cand.GoAwaySeen = true
 			}
 
@@ -1137,29 +1271,41 @@ func parseHeaders(cand *Candidate, headers []hpack.HeaderField) {
 	}
 }
 
-// ================= SCORING FUNCTIONS =================
+// ================= SCORING & ENRICHMENT =================
+
+func scorePeerSettings(prof PeerSettingsProfile) float64 {
+	score := 0.0
+	if prof.HasInitialWindowSize && prof.InitialWindowSize >= 65535 {
+		score += 2.0
+	}
+	if prof.HasMaxFrameSize && prof.HasMaxFrameSize >= 16384 {
+		score += 2.0
+	}
+	if prof.HasMaxConcurrentStreams && prof.MaxConcurrentStreams > 0 {
+		score += 1.0
+	}
+	return score
+}
 
 func scoreH2Profile(c *Candidate) float64 {
 	score := 0.0
 	if c.H2SettingsReceived {
-		score += 5
+		score += 5.0
 	}
 	if c.H2SettingsAckReceived {
-		score += 3
-	}
-	if c.H2SettingsAckSent {
-		score += 2
+		score += 3.0
 	}
 	if c.H2DataFrames > 0 {
-		score += 3
+		score += 3.0
 	}
 	if c.BodyBytes > 0 {
-		score += 2
+		score += 2.0
 	}
 	if c.EndStreamSeen {
-		score += 5
+		score += 2.0
 	}
-	return math.Min(score, 20)
+	score += scorePeerSettings(c.InitialPeerSettings)
+	return math.Min(score, 20.0)
 }
 
 func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Config) bool {
@@ -1198,7 +1344,6 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 
 	rs := RealityScore{}
 
-	// 1. TLS Quality (max 20)
 	if cand.CertChainValid {
 		rs.TLSQuality += 15
 	} else {
@@ -1208,7 +1353,6 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		rs.TLSQuality += 5
 	}
 
-	// 2. Certificate Quality (max 20)
 	if cand.CertChainValid {
 		rs.Certificate += 10
 	}
@@ -1216,13 +1360,11 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		rs.Certificate += 10
 	}
 
-	// 3. HTTP/2 Profile (max 20)
 	rs.H2Profile = scoreH2Profile(cand)
 
-	// 4. Server Profile (max 10)
 	if cand.Server != "" && cand.Server != "-" {
 		srvLower := strings.ToLower(cand.Server)
-		if strings.Contains(srvLower, "nginx") || strings.Contains(srvLower, "caddy") || strings.Contains(srvLower, "apache") || strings.Contains(srvLower, "litespeed") || strings.Contains(srvLower, "openresty") {
+		if strings.Contains(srvLower, "nginx") || strings.Contains(srvLower, "caddy") || strings.Contains(srvLower, "apache") || strings.Contains(srvLower, "openresty") {
 			rs.ServerProfile = 10
 		} else {
 			rs.ServerProfile = 6
@@ -1231,7 +1373,6 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		rs.ServerProfile = 3
 	}
 
-	// 5. HTTP Behavior (max 10)
 	switch cand.HTTPStatus {
 	case 200:
 		rs.HTTPBehavior = 10
@@ -1245,14 +1386,17 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		}
 	}
 
-	// 6. DNS Consistency (max 10)
-	if cand.DNSMatched {
-		rs.DNSConsistency = 10
-	} else {
-		rs.DNSConsistency = 0
+	// Вес доверия к provenance домена
+	if cand.PTRDiscovered {
+		rs.DNSConsistency += 6.0
+	}
+	if cand.CTDiscovered {
+		rs.DNSConsistency += 4.0
+	}
+	if !cand.PTRDiscovered && !cand.CTDiscovered && cand.SeedProvided {
+		rs.DNSConsistency += 3.0
 	}
 
-	// 7. Latency (max 10)
 	rtt := cand.Timings.TotalLatency().Milliseconds()
 	if rtt <= 50 {
 		rs.Latency = 10
@@ -1274,6 +1418,9 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	} else if cand.DomainQuality == "Numeric" {
 		scorePenalty = 30.0
 	}
+	if cand.CDNWeak {
+		scorePenalty += 5.0
+	}
 
 	cand.RealityScore = rs
 	cand.DomainPenalty = scorePenalty
@@ -1285,7 +1432,6 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, countryDB *geoip2.Reader) []Candidate {
 	var mu sync.Mutex
 	var validPairs []TargetPair
-
 	var pairSeen sync.Map
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
@@ -1298,6 +1444,10 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 	for _, ip := range sampledIPs {
 		ip := ip
 		g1.Go(func() error {
+			ptrDomains := make(map[string]struct{})
+			seedDomains := make(map[string]struct{})
+			ctDomains := make(map[string]struct{})
+
 			var localDomains []string
 
 			names, err := net.DefaultResolver.LookupAddr(gCtx1, ip)
@@ -1305,6 +1455,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 				ptrFound := false
 				for _, n := range names {
 					if d := CleanDomain(n); d != "" {
+						ptrDomains[d] = struct{}{}
 						localDomains = append(localDomains, d)
 						ptrFound = true
 					}
@@ -1315,77 +1466,64 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 					stats.mu.Unlock()
 				}
 			}
-			localDomains = append(localDomains, cfg.Domains...)
+
+			for _, d := range cfg.Domains {
+				if cleaned := CleanDomain(d); cleaned != "" {
+					seedDomains[cleaned] = struct{}{}
+					localDomains = append(localDomains, cleaned)
+				}
+			}
 			if cfg.DirectSNI != "" {
-				localDomains = append(localDomains, cfg.DirectSNI)
+				if cleaned := CleanDomain(cfg.DirectSNI); cleaned != "" {
+					seedDomains[cleaned] = struct{}{}
+					localDomains = append(localDomains, cleaned)
+				}
 			}
 
 			localDomains = uniqueDomains(localDomains)
-
 			var allDomains []string
 			allDomains = append(allDomains, localDomains...)
 
-			if !crtBreaker.IsDisabled() {
-				rootDomains := make(map[string]bool)
-				for _, dom := range localDomains {
-					root := GetRootDomain(dom)
-					if root != "" {
-						rootDomains[root] = true
-					}
+			rootDomains := make(map[string]bool)
+			for _, dom := range localDomains {
+				root := GetRootDomain(dom)
+				if root != "" {
+					rootDomains[root] = true
 				}
+			}
 
-				for root := range rootDomains {
-					if crtBreaker.IsDisabled() {
-						break
+			for root := range rootDomains {
+				v, err, _ := crtGroup.Do(root, func() (interface{}, error) {
+					if cached, ok := crtCache.Get(root); ok {
+						return cached, nil
 					}
-					subs, ok := crtCache.Get(root)
-					if !ok {
-						v, err, _ := crtGroup.Do(root, func() (interface{}, error) {
-							if cached, ok := crtCache.Get(root); ok {
-								return cached, nil
-							}
 
-							stats.mu.Lock()
-							stats.CRTAttempts++
-							stats.mu.Unlock()
+					result, err := gatherCTDomains(gCtx1, root, httpClient)
+					if err != nil {
+						return nil, err
+					}
 
-							crtCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-							defer cancel()
-							result, err := gatherCrtSh(crtCtx, root, httpClient)
+					crtCache.Put(root, result)
 
-							stats.mu.Lock()
-							if err != nil {
-								stats.CRTFailed++
-								stats.mu.Unlock()
-								crtBreaker.RecordFailure(err)
-								return nil, err
-							}
-							stats.CRTSuccess++
-							stats.mu.Unlock()
-							crtBreaker.RecordSuccess()
-
-							crtCache.Put(root, result)
-
-							uniqueCount := 0
-							for _, d := range result {
-								if _, loaded := crtSeen.LoadOrStore(d, true); !loaded {
-									uniqueCount++
-								}
-							}
-
-							if uniqueCount > 0 {
-								stats.mu.Lock()
-								stats.CRTUniqueSANs += uniqueCount
-								stats.mu.Unlock()
-							}
-
-							return result, nil
-						})
-						if err == nil && v != nil {
-							subs = v.([]string)
+					uniqueCount := 0
+					for _, d := range result {
+						if _, loaded := crtSeen.LoadOrStore(d, true); !loaded {
+							uniqueCount++
 						}
 					}
-					allDomains = append(allDomains, subs...)
+					if uniqueCount > 0 {
+						stats.mu.Lock()
+						stats.UniqueDiscoveredNames += uniqueCount
+						stats.mu.Unlock()
+					}
+					return result, nil
+				})
+				if err == nil && v != nil {
+					subs := v.([]string)
+					for _, s := range subs {
+						ctDomains[s] = struct{}{}
+						allDomains = append(allDomains, s)
+					}
 				}
 			}
 
@@ -1398,8 +1536,18 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 						if resolvedIP == ip {
 							pairKey := ip + "\x00" + dom
 							if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
+								_, isPTR := ptrDomains[dom]
+								_, isSeed := seedDomains[dom]
+								_, isCT := ctDomains[dom]
+
 								mu.Lock()
-								validPairs = append(validPairs, TargetPair{IP: ip, SNI: dom})
+								validPairs = append(validPairs, TargetPair{
+									IP:            ip,
+									SNI:           dom,
+									PTRDiscovered: isPTR,
+									SeedProvided:  isSeed,
+									CTDiscovered:  isCT,
+								})
 								mu.Unlock()
 							}
 							break
@@ -1426,7 +1574,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, asnDB, co
 	for _, p := range validPairs {
 		p := p
 		g2.Go(func() error {
-			cand, pErr := ProbeH2(gCtx2, p.IP, p.SNI, cfg)
+			cand, pErr := ProbeH2(gCtx2, p.IP, p.SNI, p.PTRDiscovered, p.SeedProvided, p.CTDiscovered, cfg)
 
 			tcpOK := pErr == nil || pErr.Stage > ProbeStageTCP
 			tlsOK := pErr == nil || pErr.Stage > ProbeStageTLS
@@ -1487,11 +1635,11 @@ func main() {
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
 	flag.IntVar(&cfg.H2WriteTimeoutMs, "h2-write", 2000, "H2 Write timeout ms")
 	flag.Int64Var(&cfg.Seed, "seed", time.Now().UnixNano(), "Random seed")
-	flag.StringVar(&cfg.TargetCountry, "c", "", "Hard Filter: Target Country Code (GeoIP level)")
+	flag.StringVar(&cfg.TargetCountry, "c", "", "Hard Filter: Target Country Code")
 	flag.UintVar(&cfg.TargetASN, "asn", 0, "Hard Filter: Target ASN constraint")
 	flag.StringVar(&cfg.TargetIP, "target-ip", "", "Remote Hosting target IP")
 	flag.StringVar(&cfg.DirectSNI, "sni", "", "Fallback SNI for Direct mode")
-	flag.BoolVar(&cfg.ScanEntireASN, "scan-all-asn", false, "Scan all ASN prefixes instead of just the target's local IPv4 prefix")
+	flag.BoolVar(&cfg.ScanEntireASN, "scan-all-asn", false, "Scan all ASN prefixes")
 	flag.StringVar(&domainsStr, "domains", "", "Comma-separated seed domains for OSINT")
 	flag.StringVar(&cfg.GeoIPPath, "geoip", "GeoLite2-Country.mmdb", "Path to Country DB")
 	flag.StringVar(&cfg.ASNPath, "asn-db", "GeoLite2-ASN.mmdb", "Path to ASN DB")
@@ -1526,19 +1674,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// -------------------------------------------------------------
-	// АВТОМАТИЧЕСКАЯ ЗАГРУЗКА И ВАЛИДАЦИЯ БАЗ MAXMIND
-	// -------------------------------------------------------------
-	asnDBUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"
-	if err := ensureDB(cfg.ASNPath, asnDBUrl); err != nil {
+	if err := ensureDB(cfg.ASNPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"); err != nil {
 		log.Fatalf("[-] Ошибка загрузки базы ASN (%s): %v", cfg.ASNPath, err)
 	}
-
-	countryDBUrl := "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
-	if err := ensureDB(cfg.GeoIPPath, countryDBUrl); err != nil {
+	if err := ensureDB(cfg.GeoIPPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"); err != nil {
 		log.Fatalf("[-] Ошибка загрузки базы Country (%s): %v", cfg.GeoIPPath, err)
 	}
-	// -------------------------------------------------------------
 
 	var asnDB, countryDB *geoip2.Reader
 	if db, err := geoip2.Open(cfg.ASNPath); err == nil {
@@ -1609,12 +1750,10 @@ func main() {
 		merged := MergeCIDRs(cfg.CIDRs)
 		sampledIPs := SampleIPs(merged, cfg.MaxIPs, cfg.Seed)
 
-		fmt.Printf("[*] Целевой IP:              %s\n", vpsQueryIP)
-		fmt.Printf("[*] Announcing ASN:          AS%d\n", cfg.TargetASN)
+		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
+		fmt.Printf("[*] Announcing ASN:        AS%d\n", cfg.TargetASN)
 		if !cfg.ScanEntireASN {
 			fmt.Printf("[*] Фокус на IPv4 prefix:    %s\n", localPrefix)
-		} else if localPrefix != "" {
-			fmt.Printf("[*] Найден IPv4 prefix %s, но включен скан всего ASN\n", localPrefix)
 		}
 		fmt.Printf("[*] Страна сервера:          %s (MaxMind GeoIP)\n", cfg.TargetCountry)
 		fmt.Printf("[*] Подсетей для скана:      %d\n", len(merged))
@@ -1634,22 +1773,14 @@ func main() {
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("[*] IP отобрано для пула:      %d\n", stats.IPSampled)
 	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", stats.IPWithPTR)
-	if stats.CRTAttempts > 0 && stats.CRTSuccess == 0 {
-		fmt.Printf("[!] ВНИМАНИЕ: ни один запрос к crt.sh не завершился успешно.\n")
-		fmt.Printf("    Детали ошибок: Таймаутов: %d, Ошибок сети: %d, HTTP 4xx: %d, HTTP 5xx: %d, Ошибок парсинга: %d\n",
-			stats.CRTTimeouts, stats.CRTNetErr, stats.CRTHTTP4xx, stats.CRTHTTP5xx, stats.CRTDecodeErr)
-	}
-	fmt.Printf("[*] Запросов к crt.sh (Всего): %d (Успешно: %d, Ошибок: %d)\n", stats.CRTAttempts, stats.CRTSuccess, stats.CRTFailed)
-	fmt.Printf("[*] Уникальных SAN найдено:    %d\n", stats.CRTUniqueSANs)
+	fmt.Printf("[*] crt.sh:                    Попыток: %d (Успешно: %d, Ошибок: %d)\n", stats.CRTAttempts, stats.CRTSuccess, stats.CRTFailed)
+	fmt.Printf("[*] Cert Spotter Fallback:     Попыток: %d (Успешно: %d, Ошибок: %d)\n", stats.CTFallbackAttempts, stats.CTFallbackSuccess, stats.CTFallbackFailed)
+	fmt.Printf("[*] Уникальных DNS имён (CT):  %d\n", stats.UniqueDiscoveredNames)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", stats.DNSValidPairs)
 	fmt.Printf("[*] Успешных TCP соединений:   %d\n", stats.TCPConnected)
 	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", stats.TLSHandshakeOK)
 	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", stats.TLSValidationErr)
 	fmt.Printf("[*] С откликом H2 Headers:     %d\n", stats.H2HeadersOK)
-	fmt.Printf("[*] Полных H2 ответов (END):   %d\n", stats.EndStreamOK)
-	fmt.Printf("[*] Отсеяно по ASN:            %d\n", stats.ASNFiltered)
-	fmt.Printf("[*] Отсеяно по Стране:         %d\n", stats.CountryFiltered)
-	fmt.Printf("[*] Отсеяно CDN (Strong):      %d\n", stats.CDNDropped)
 	fmt.Printf("[*] Финальных кандидатов:      %d\n", len(results))
 
 	if len(results) == 0 {
@@ -1659,7 +1790,7 @@ func main() {
 
 	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
 	fmt.Printf("%-32.32s | %-15.15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-4s | %-4s | %-6s | %-7s\n",
-		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DNS", "LAT", "STATUS", "TTFB")
+		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DNS", "LAT", "STATUS", "TOTAL")
 	fmt.Println(strings.Repeat("-", 125))
 
 	for _, r := range results {
@@ -1681,6 +1812,6 @@ func main() {
 	fmt.Printf("TLS: %.0f/20 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DNS: %.0f/10 | LATENCY: %.0f/10\n",
 		best.RealityScore.TLSQuality, best.RealityScore.Certificate, best.RealityScore.H2Profile, best.RealityScore.ServerProfile, best.RealityScore.HTTPBehavior, best.RealityScore.DNSConsistency, best.RealityScore.Latency)
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
-	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, TTFB: %d ms)\n", 
+	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Latency: %d ms)\n", 
 		best.RealityScore.Total, best.DomainPenalty, best.Score, best.HTTPStatus, best.Timings.TotalLatency().Milliseconds())
 }
