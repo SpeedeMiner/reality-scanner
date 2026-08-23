@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,6 +54,7 @@ var bannedTLDs = map[string]bool{
 var cdnHeaders = []string{"cf-ray", "x-amz-cf-id", "x-cache", "x-served-by", "cdn-loop"}
 var cdnServers = []string{"cloudflare", "fastly", "akamai", "ddos-guard", "qrator", "sucuri", "amazon"}
 var cdnPTRs = []string{".cloudfront.net", ".fastly.net", ".akamaiedge.net", ".cloudflare.net"}
+var tldRegex = regexp.MustCompile(`^[a-z]{2,24}$`)
 
 // ================= СТРУКТУРЫ =================
 type Target struct {
@@ -73,7 +75,6 @@ type ValidResult struct {
 
 // ================= УТИЛИТЫ =================
 func addAPIJitter(rng *rand.Rand) {
-	// Jitter только для HTTP API, чтобы не дудосить OTX
 	time.Sleep(time.Duration(50+rng.Intn(150)) * time.Millisecond)
 }
 
@@ -93,13 +94,12 @@ func ensureDBExists(filepath, downloadURL string) error {
 
 	log.Printf("[*] База %s не найдена. Начинаем скачивание...", filepath)
 	
-	// Скачиваем во временный файл
 	tmpFile, err := os.CreateTemp("", "mmdb-*")
 	if err != nil {
 		return fmt.Errorf("создание temp файла: %v", err)
 	}
 	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath) // Удалит, если переименование не сработает
+	defer os.Remove(tmpPath)
 
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Get(downloadURL)
@@ -120,7 +120,6 @@ func ensureDBExists(filepath, downloadURL string) error {
 	}
 	tmpFile.Close()
 
-	// Атомарное переименование
 	if err := os.Rename(tmpPath, filepath); err != nil {
 		return fmt.Errorf("ошибка rename: %v", err)
 	}
@@ -195,7 +194,7 @@ func getPrefixes(asn uint) []string {
 
 	var prefixes []string
 	for _, p := range result.Data.Prefixes {
-		if !strings.Contains(p.Prefix, ":") { // Игнорируем IPv6
+		if !strings.Contains(p.Prefix, ":") {
 			prefixes = append(prefixes, p.Prefix)
 		}
 	}
@@ -215,12 +214,10 @@ func generateAndShuffleIPs(prefixes []string, maxIPs int, rng *rand.Rand) []stri
 		ones, _ := ipnet.Mask.Size()
 		var subnets []string
 
-		// Разбиваем крупные блоки на /24
 		if ones < 24 {
 			for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); incIPBy(ip, 256) {
 				subnets = append(subnets, fmt.Sprintf("%d.%d.%d.0/24", ip[0], ip[1], ip[2]))
 			}
-			// Честное сэмплирование: перемешиваем /24 и берем MaxSampled24
 			rng.Shuffle(len(subnets), func(i, j int) { subnets[i], subnets[j] = subnets[j], subnets[i] })
 			if len(subnets) > MaxSampled24 {
 				subnets = subnets[:MaxSampled24]
@@ -229,13 +226,11 @@ func generateAndShuffleIPs(prefixes []string, maxIPs int, rng *rand.Rand) []stri
 			subnets = []string{pStr}
 		}
 
-		// Извлекаем IP из выбранных /24
 		for _, sub := range subnets {
 			subIP, subNet, _ := net.ParseCIDR(sub)
 			for ip := subIP.Mask(subNet.Mask); subNet.Contains(ip); inc(ip) {
 				ip4 := ip.To4()
 				if ip4 != nil {
-					// Игнорируем .0 и .255 в контексте /24
 					if ip4[3] == 0 || ip4[3] == 255 {
 						continue
 					}
@@ -245,7 +240,6 @@ func generateAndShuffleIPs(prefixes []string, maxIPs int, rng *rand.Rand) []stri
 		}
 	}
 
-	// Финальный Anti-IDS шаффл пула IP
 	rng.Shuffle(len(allIPs), func(i, j int) { allIPs[i], allIPs[j] = allIPs[j], allIPs[i] })
 
 	if maxIPs > 0 && len(allIPs) > maxIPs {
@@ -276,7 +270,7 @@ func cleanDomain(d string) string {
 		return ""
 	}
 	tld := parts[len(parts)-1]
-	if !regexp.MustCompile(`^[a-z]{2,24}$`).MatchString(tld) || bannedTLDs[tld] {
+	if !tldRegex.MatchString(tld) || bannedTLDs[tld] {
 		return ""
 	}
 	if strings.ContainsAny(d, " \t\r\n/\\:*?\"'<>|#%&={}~`!@$^()+[]") {
@@ -299,7 +293,7 @@ func getPassiveDNS(ip string, rng *rand.Rand) []string {
 	var domains []string
 	client := &http.Client{Timeout: 5 * time.Second}
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/IPv4/%s/passive_dns", ip), nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
 	if resp, err := client.Do(req); err == nil {
 		defer resp.Body.Close()
 		var res struct {
@@ -357,7 +351,6 @@ func validateFCrDNS(ctx context.Context, ip string, domains []string) []string {
 }
 
 func probeIPStealth(ctx context.Context, ip string, rng *rand.Rand) (string, []string) {
-	// DNS Lookups без джиттера (естественное поведение ОС)
 	candidateDomains := getPTR(ctx, ip)
 	
 	if len(candidateDomains) == 0 {
@@ -383,7 +376,7 @@ func buildH2HeadersEncoder(sni string) []byte {
 	encoder.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	encoder.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
 	encoder.WriteField(hpack.HeaderField{Name: ":authority", Value: sni})
-	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"})
+	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0"})
 	return buf.Bytes()
 }
 
@@ -439,7 +432,6 @@ func verifyH2(ctx context.Context, ip, sni string, dialTimeout time.Duration) *V
 	
 	status, server := "", "-"
 	dataBytes := 0
-	endStream := false
 	isCDN := false
 
 	uConn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
@@ -461,21 +453,20 @@ ReadLoop:
 			data := recvBuf.Bytes()
 			length := int(data[0])<<16 | int(data[1])<<8 | int(data[2])
 			if recvBuf.Len() < 9+length {
-				break ReadLoop // Ждем поступления данных
+				break ReadLoop 
 			}
 
 			frameType := data[3]
 			flags := data[4]
-			// streamId := binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
 			payload := data[9 : 9+length]
 			recvBuf.Next(9 + length)
 
 			if frameType == FrameGoAway || frameType == FrameRSTStream {
-				return nil // Сервер сбросил соединение
+				return nil 
 			}
 
 			if frameType == FrameSettings && (flags&0x01) == 0 {
-				uConn.Write(buildH2Frame(FrameSettings, 0x01, 0, []byte{})) // ACK
+				uConn.Write(buildH2Frame(FrameSettings, 0x01, 0, []byte{}))
 			} 
 			
 			if frameType == FrameHeaders || frameType == FrameContinuation {
@@ -491,7 +482,6 @@ ReadLoop:
 						if hName == "server" {
 							server = h.Value
 						}
-						// CDN check by custom headers
 						for _, ch := range cdnHeaders {
 							if hName == ch {
 								isCDN = true
@@ -506,7 +496,6 @@ ReadLoop:
 			}
 
 			if (flags & FlagEndStream) != 0 {
-				endStream = true
 				break ReadLoop
 			}
 		}
@@ -550,7 +539,6 @@ func main() {
 		log.Println("[!] Предупреждение: большое кол-во воркеров может вызвать ban или drop пакетов.")
 	}
 
-	// Перехват SIGINT (Ctrl+C) для сохранения результатов
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -598,7 +586,6 @@ func main() {
 		}
 	}
 
-	// Генератор со своим seed
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	ips := generateAndShuffleIPs(targetPrefixes, *maxIPs, rng)
 	totalIPs := len(ips)
@@ -619,7 +606,7 @@ func main() {
 			defer wg.Done()
 			localRng := rand.New(rand.NewSource(time.Now().UnixNano()))
 			for ip := range jobs {
-				if ctx.Err() != nil { return } // Ранний выход по Ctrl+C
+				if ctx.Err() != nil { return }
 				ctxReq, cancelReq := context.WithTimeout(ctx, 4*time.Second)
 				_, doms := probeIPStealth(ctxReq, ip, localRng)
 				cancelReq()
