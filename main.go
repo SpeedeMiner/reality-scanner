@@ -93,10 +93,17 @@ type Config struct {
 	Domains          []string
 	GeoIPPath        string
 	ASNPath          string
+	
 	NoPTR            bool
 	NoCT             bool
 	NoPassive        bool
 	NoReverseIP      bool
+
+	// API Keys
+	VTKey          string
+	URLScanKey     string
+	ChaosKey       string
+	SecTrailsKey   string
 }
 
 // ================= DOMAIN PROVENANCE =================
@@ -111,6 +118,10 @@ const (
 	SourceAlienVault
 	SourceWayback
 	SourceHackerTarget
+	SourceVirusTotal
+	SourceSecurityTrails
+	SourceChaos
+	SourceURLScan
 )
 
 func (s DomainSource) Has(flag DomainSource) bool {
@@ -849,7 +860,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		r.mu.Lock()
 		if time.Now().Before(r.cbUntil) {
 			r.mu.Unlock()
-			return nil, nil // Circuit Open
+			return nil, nil
 		}
 		r.mu.Unlock()
 
@@ -913,7 +924,149 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 }
 
 // -------------------------------------------------
-// Implementations
+// Implementations: Enterprise API Providers
+// -------------------------------------------------
+
+type vtDomainProvider struct { Key string }
+func (p *vtDomainProvider) Name() string                 { return "VirusTotal" }
+func (p *vtDomainProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
+func (p *vtDomainProvider) QueryType() ProviderQueryType { return QueryDomain }
+func (p *vtDomainProvider) SourceBit() DomainSource      { return SourceVirusTotal }
+func (p *vtDomainProvider) MaxRoots() int                { return 100 }
+func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
+	u := fmt.Sprintf("https://www.virustotal.com/api/v3/domains/%s/subdomains?limit=40", url.QueryEscape(query))
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Add("x-apikey", p.Key)
+	resp, err := client.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK { return nil, &ProviderHTTPError{StatusCode: resp.StatusCode} }
+	var res struct { Data []struct { Id string `json:"id"` } `json:"data"` }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil { return nil, err }
+	var subs []string
+	for _, item := range res.Data {
+		if d := CleanDomain(item.Id); d != "" { subs = append(subs, d) }
+	}
+	return subs, nil
+}
+
+type vtIPProvider struct { Key string }
+func (p *vtIPProvider) Name() string                 { return "VirusTotal" }
+func (p *vtIPProvider) Category() DiscoveryCategory  { return CatReverseIP }
+func (p *vtIPProvider) QueryType() ProviderQueryType { return QueryIP }
+func (p *vtIPProvider) SourceBit() DomainSource      { return SourceVirusTotal }
+func (p *vtIPProvider) MaxRoots() int                { return 0 }
+func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
+	u := fmt.Sprintf("https://www.virustotal.com/api/v3/ip_addresses/%s/resolutions?limit=40", url.QueryEscape(query))
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Add("x-apikey", p.Key)
+	resp, err := client.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK { return nil, &ProviderHTTPError{StatusCode: resp.StatusCode} }
+	var res struct { Data []struct { Attributes struct { HostName string `json:"host_name"` } `json:"attributes"` } `json:"data"` }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil { return nil, err }
+	var subs []string
+	for _, item := range res.Data {
+		if d := CleanDomain(item.Attributes.HostName); d != "" { subs = append(subs, d) }
+	}
+	return subs, nil
+}
+
+type urlScanDomainProvider struct { Key string }
+func (p *urlScanDomainProvider) Name() string                 { return "URLScan" }
+func (p *urlScanDomainProvider) Category() DiscoveryCategory  { return CatArchive }
+func (p *urlScanDomainProvider) QueryType() ProviderQueryType { return QueryDomain }
+func (p *urlScanDomainProvider) SourceBit() DomainSource      { return SourceURLScan }
+func (p *urlScanDomainProvider) MaxRoots() int                { return 100 }
+func (p *urlScanDomainProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
+	u := fmt.Sprintf("https://urlscan.io/api/v1/search/?q=domain:%s", url.QueryEscape(query))
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Add("API-Key", p.Key)
+	resp, err := client.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK { return nil, &ProviderHTTPError{StatusCode: resp.StatusCode} }
+	var res struct { Results []struct { Page struct { Domain string `json:"domain"` } `json:"page"` } `json:"results"` }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil { return nil, err }
+	var subs []string
+	for _, item := range res.Results {
+		if d := CleanDomain(item.Page.Domain); d != "" { subs = append(subs, d) }
+	}
+	return subs, nil
+}
+
+type urlScanIPProvider struct { Key string }
+func (p *urlScanIPProvider) Name() string                 { return "URLScan" }
+func (p *urlScanIPProvider) Category() DiscoveryCategory  { return CatArchive }
+func (p *urlScanIPProvider) QueryType() ProviderQueryType { return QueryIP }
+func (p *urlScanIPProvider) SourceBit() DomainSource      { return SourceURLScan }
+func (p *urlScanIPProvider) MaxRoots() int                { return 0 }
+func (p *urlScanIPProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
+	u := fmt.Sprintf("https://urlscan.io/api/v1/search/?q=page.ip:%s", url.QueryEscape(query))
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Add("API-Key", p.Key)
+	resp, err := client.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK { return nil, &ProviderHTTPError{StatusCode: resp.StatusCode} }
+	var res struct { Results []struct { Page struct { Domain string `json:"domain"` } `json:"page"` } `json:"results"` }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil { return nil, err }
+	var subs []string
+	for _, item := range res.Results {
+		if d := CleanDomain(item.Page.Domain); d != "" { subs = append(subs, d) }
+	}
+	return subs, nil
+}
+
+type securityTrailsProvider struct { Key string }
+func (p *securityTrailsProvider) Name() string                 { return "SecurityTrails" }
+func (p *securityTrailsProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
+func (p *securityTrailsProvider) QueryType() ProviderQueryType { return QueryDomain }
+func (p *securityTrailsProvider) SourceBit() DomainSource      { return SourceSecurityTrails }
+func (p *securityTrailsProvider) MaxRoots() int                { return 100 }
+func (p *securityTrailsProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
+	u := fmt.Sprintf("https://api.securitytrails.com/v1/domain/%s/subdomains", url.QueryEscape(query))
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Add("APIKEY", p.Key)
+	resp, err := client.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK { return nil, &ProviderHTTPError{StatusCode: resp.StatusCode} }
+	var res struct { Subdomains []string `json:"subdomains"` }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil { return nil, err }
+	var subs []string
+	for _, sub := range res.Subdomains {
+		if d := CleanDomain(sub + "." + query); d != "" { subs = append(subs, d) }
+	}
+	return subs, nil
+}
+
+type chaosProvider struct { Key string }
+func (p *chaosProvider) Name() string                 { return "Chaos" }
+func (p *chaosProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
+func (p *chaosProvider) QueryType() ProviderQueryType { return QueryDomain }
+func (p *chaosProvider) SourceBit() DomainSource      { return SourceChaos }
+func (p *chaosProvider) MaxRoots() int                { return 100 }
+func (p *chaosProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
+	u := fmt.Sprintf("https://dns.projectdiscovery.io/dns/%s/subdomains", url.QueryEscape(query))
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Add("Authorization", p.Key)
+	resp, err := client.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK { return nil, &ProviderHTTPError{StatusCode: resp.StatusCode} }
+	var res struct { Subdomains []string `json:"subdomains"` }
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil { return nil, err }
+	var subs []string
+	for _, sub := range res.Subdomains {
+		if d := CleanDomain(sub + "." + query); d != "" { subs = append(subs, d) }
+	}
+	return subs, nil
+}
+
+// -------------------------------------------------
+// Implementations: Public Providers
 // -------------------------------------------------
 
 type crtShProvider struct{}
@@ -1070,7 +1223,7 @@ func (p *hackerTargetProvider) Name() string                 { return "HackerTar
 func (p *hackerTargetProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *hackerTargetProvider) QueryType() ProviderQueryType { return QueryIP }
 func (p *hackerTargetProvider) SourceBit() DomainSource      { return SourceHackerTarget }
-func (p *hackerTargetProvider) MaxRoots() int                { return 0 } // IP Provider
+func (p *hackerTargetProvider) MaxRoots() int                { return 0 }
 func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
 	u := fmt.Sprintf("https://api.hackertarget.com/reverseiplookup/?q=%s", url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -2047,7 +2200,7 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	}
 
 	sourceCount := 0
-	for _, src := range []DomainSource{SourcePTR, SourceCRTSh, SourceCertSpotter, SourceAlienVault, SourceWayback, SourceHackerTarget, SourceSeed} {
+	for _, src := range []DomainSource{SourcePTR, SourceCRTSh, SourceCertSpotter, SourceAlienVault, SourceWayback, SourceHackerTarget, SourceSeed, SourceVirusTotal, SourceSecurityTrails, SourceChaos, SourceURLScan} {
 		if cand.Sources.Has(src) {
 			sourceCount++
 		}
@@ -2077,13 +2230,13 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	}
 
 	diversity := 0
-	if cand.Sources.Has(SourcePTR) || cand.Sources.Has(SourceHackerTarget) {
+	if cand.Sources.Has(SourcePTR) || cand.Sources.Has(SourceHackerTarget) || cand.Sources.Has(SourceVirusTotal) {
 		diversity++
 	}
 	if cand.Sources.Has(SourceCRTSh) || cand.Sources.Has(SourceCertSpotter) {
 		diversity++
 	}
-	if cand.Sources.Has(SourceAlienVault) || cand.Sources.Has(SourceWayback) {
+	if cand.Sources.Has(SourceAlienVault) || cand.Sources.Has(SourceWayback) || cand.Sources.Has(SourceSecurityTrails) || cand.Sources.Has(SourceChaos) || cand.Sources.Has(SourceURLScan) {
 		diversity++
 	}
 	if cand.Sources.Has(SourceSeed) {
@@ -2174,6 +2327,21 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		extProviders = append(extProviders, NewRunner(&hackerTargetProvider{}, ProviderConfig{Timeout: 6 * time.Second, MinInterval: 2 * time.Second, MaxNames: 200}))
 	}
 
+	if cfg.VTKey != "" {
+		extProviders = append(extProviders, NewRunner(&vtDomainProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 200}))
+		extProviders = append(extProviders, NewRunner(&vtIPProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 200}))
+	}
+	if cfg.URLScanKey != "" {
+		extProviders = append(extProviders, NewRunner(&urlScanDomainProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 200}))
+		extProviders = append(extProviders, NewRunner(&urlScanIPProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 200}))
+	}
+	if cfg.SecTrailsKey != "" {
+		extProviders = append(extProviders, NewRunner(&securityTrailsProvider{Key: cfg.SecTrailsKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 200}))
+	}
+	if cfg.ChaosKey != "" {
+		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 200}))
+	}
+
 	var ipProviders []*ProviderRunner
 	var domainProviders []*ProviderRunner
 	for _, p := range extProviders {
@@ -2237,6 +2405,15 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			if s.Has(SourceHackerTarget) {
 				sc += 8
 			}
+			if s.Has(SourceVirusTotal) {
+				sc += 6
+			}
+			if s.Has(SourceSecurityTrails) {
+				sc += 5
+			}
+			if s.Has(SourceChaos) {
+				sc += 5
+			}
 			if s.Has(SourceCRTSh) {
 				sc += 4
 			}
@@ -2244,6 +2421,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				sc += 4
 			}
 			if s.Has(SourceAlienVault) {
+				sc += 3
+			}
+			if s.Has(SourceURLScan) {
 				sc += 3
 			}
 			if s.Has(SourceWayback) {
@@ -2387,7 +2567,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					pairKey := resolvedIP + "\x00" + dom
 					if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
 						mu.Lock()
-						genericMask := domainSources[dom] &^ (SourcePTR | SourceHackerTarget)
+						genericMask := domainSources[dom] &^ (SourcePTR | SourceHackerTarget | SourceVirusTotal | SourceURLScan)
 						specificMask := pairSources[pairKey]
 						finalMask := genericMask | specificMask
 
@@ -2476,6 +2656,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 	_ = g2.Wait()
 
+	// IP Clustering: 1 Best SNI per IP
 	ipClusters := make(map[string][]Candidate)
 	for _, c := range candidates {
 		ipClusters[c.IP] = append(ipClusters[c.IP], c)
@@ -2517,6 +2698,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}{
 		{"crt.sh", CatCertificate}, {"CertSpotter", CatCertificate},
 		{"AlienVault", CatPassiveDNS}, {"WaybackMachine", CatArchive}, {"HackerTarget", CatReverseIP},
+		{"VirusTotal", CatReverseIP}, {"URLScan", CatArchive}, {"SecurityTrails", CatPassiveDNS}, {"Chaos", CatPassiveDNS},
 	}
 	for _, p := range providersInfo {
 		catMap[p.n] = p.c
@@ -2591,6 +2773,13 @@ func main() {
 	flag.BoolVar(&cfg.NoCT, "no-ct", false, "Disable Certificate Transparency lookups (crt.sh/CertSpotter)")
 	flag.BoolVar(&cfg.NoPassive, "no-passive", false, "Disable Passive DNS OSINT (AlienVault, Wayback)")
 	flag.BoolVar(&cfg.NoReverseIP, "no-reverse-ip", false, "Disable Reverse IP lookups (HackerTarget)")
+
+	// Интегрированные дефолтные API ключи:
+	flag.StringVar(&cfg.VTKey, "vt-key", "dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5", "VirusTotal API Key")
+	flag.StringVar(&cfg.URLScanKey, "urlscan-key", "01a032ae-681d-7718-821b-c6fd33aa11a7", "URLScan.io API Key")
+	flag.StringVar(&cfg.ChaosKey, "chaos-key", "e3c91ed9-2f79-4147-807f-43dd150003e4", "ProjectDiscovery Chaos API Key")
+	flag.StringVar(&cfg.SecTrailsKey, "sectrails-key", "", "SecurityTrails API Key")
+
 	flag.Parse()
 
 	if cfg.Workers < 1 {
@@ -2649,7 +2838,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("[-] DNSCrypt list: %v", err)
 	}
-	fmt.Printf("[DNS] Получено %d уникальных resolver stamps\n", len(stamps))
 	
 	dnsPool := buildDNSPool(dnsCtx, stamps)
 	dnsPool.sortByRTT()
@@ -2744,7 +2932,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
+	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
 	fmt.Printf("%-32.32s | %-15.15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
 		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "TCP", "TLS", "H2")
 	fmt.Println(strings.Repeat("-", 126))
