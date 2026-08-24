@@ -67,8 +67,9 @@ const (
 	MaxDiscoveredDomains = 50000
 	LimitValidPairs      = 10000
 
-	providerMaxAttempts    = 3
-	providerCBThreshold    = 8
+	// FAST-FAIL НАСТРОЙКИ (Оптимизировано для быстрой отбраковки мёртвых источников)
+	providerMaxAttempts    = 2 // Снижено с 3 до 2
+	providerCBThreshold    = 2 // Снижено с 8 до 2 (2 полностью упавших корня = отключение источника)
 	providerCBCooldown     = 2 * time.Minute
 	provider429CBCooldown  = 5 * time.Minute
 	providerBackoffInitial = 750 * time.Millisecond
@@ -1236,7 +1237,7 @@ func isTransientProviderError(err error) bool {
 	if errors.As(err, &httpErr) {
 		switch httpErr.StatusCode {
 		case http.StatusTooManyRequests,
-			http.StatusForbidden, 
+			http.StatusForbidden,
 			http.StatusInternalServerError,
 			http.StatusBadGateway,
 			http.StatusServiceUnavailable,
@@ -1316,8 +1317,9 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			}
 
 			httpStatus := providerHTTPStatus(err)
-			if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
-				break 
+			// Мгновенный FAST-FAIL (обрыв попыток) если провайдер мёртв или заблокировал нас
+			if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden || httpStatus >= 500 {
+				break
 			}
 
 			if !isTransientProviderError(err) || attempt == providerMaxAttempts {
@@ -1389,10 +1391,16 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 
 			pipeStats.recordProviderStat(statName, r.Category(), StatFailed, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), retries)
 
-			if isTransientProviderError(err) && !errors.Is(err, context.Canceled) {
+			if !errors.Is(err, context.Canceled) {
 				r.mu.Lock()
 				r.cbFailures++
-				if r.cbFailures >= providerCBThreshold || httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
+				
+				// Мгновенное срабатывание Circuit Breaker для WAF-блокировок и мёртвых API
+				isHardCB := httpStatus == http.StatusTooManyRequests || 
+				            httpStatus == http.StatusForbidden || 
+				            httpStatus >= 500
+
+				if r.cbFailures >= providerCBThreshold || isHardCB {
 					cooldown := providerCBCooldown
 					if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
 						cooldown = provider429CBCooldown
@@ -2267,19 +2275,12 @@ func RunStageC(
 		return
 	}
 
-	providerRoots, allocStats := distributeRoots(
-		roots,
-		providers,
-		20,
-		cfg,
-	)
+	providerRoots, allocStats := distributeRoots(roots, providers, 20, cfg)
 
 	pipeStats.mu.Lock()
 	pipeStats.Alloc = allocStats
 	pipeStats.StageC.TotalRoots = len(roots)
-	pipeStats.StageC.Assigned =
-		allocStats.AssignedRoots +
-			allocStats.OverlappedAssignments
+	pipeStats.StageC.Assigned = allocStats.AssignedRoots + allocStats.OverlappedAssignments
 	pipeStats.mu.Unlock()
 
 	providerLimits := make(map[*ProviderRunner]int, len(providers))
@@ -2287,7 +2288,10 @@ func RunStageC(
 
 	for _, p := range providers {
 		limit := effectiveRootLimit(p, cfg)
-		if limit <= 0 || limit > len(roots) {
+		if limit <= 0 {
+			limit = len(roots)
+		}
+		if limit > len(roots) {
 			limit = len(roots)
 		}
 		providerLimits[p] = limit
@@ -2314,13 +2318,13 @@ func RunStageC(
 
 	totalCapacity := 0
 	for _, p := range providers {
-		totalCapacity += providerLimits[p]
+		totalCapacity += providerLimits[p] * 2 // x2 квота для ретраев 
 	}
 	if totalCapacity < 1 {
 		totalCapacity = 1
 	}
 
-	resultsCh := make(chan stageResult, totalCapacity*2)
+	resultsCh := make(chan stageResult, totalCapacity)
 	var workerWG sync.WaitGroup
 
 	for _, p := range providers {
@@ -2335,14 +2339,7 @@ func RunStageC(
 			go func() {
 				defer workerWG.Done()
 				for root := range jobQueues[p] {
-					res := p.Execute(
-						ctx,
-						root.Domain,
-						client,
-						pipeStats,
-						rtCaches,
-					)
-
+					res := p.Execute(ctx, root.Domain, client, pipeStats, rtCaches)
 					resultsCh <- stageResult{
 						provider: p,
 						root:     root,
@@ -2468,6 +2465,7 @@ SchedulerLoop:
 					continue
 				}
 
+				// Квота на ретрай = 100% от первичной квоты
 				if providerUsed[candidate] < providerLimits[candidate]*2 {
 					nextP = candidate
 					break
@@ -3698,7 +3696,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	var extProviders []*ProviderRunner
 	if !cfg.NoCT {
-		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 12 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 12 * time.Second, MaxNames: 1000, MaxRoots: 30, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 2 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
