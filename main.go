@@ -87,6 +87,7 @@ var (
 	stampRe  = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
 
 	ErrProviderNoData = errors.New("provider returned no data")
+	ErrDNSNXDomain    = errors.New("NXDOMAIN")
 )
 
 type Config struct {
@@ -196,6 +197,7 @@ func rankRootSources(s DomainSource) int {
 	return score
 }
 
+// Pipeline-scoped state to avoid global variable contamination across re-runs.
 type DiscoveryState struct {
 	mu                          sync.RWMutex
 	domainEvidence              map[string]Evidence
@@ -214,40 +216,41 @@ func NewDiscoveryState() *DiscoveryState {
 	}
 }
 
+func (s *DiscoveryState) acceptDomainLocked(d string) bool {
+	if _, exists := s.domainsToResolve[d]; exists {
+		return true
+	}
+	if s.domainsCount >= MaxDiscoveredDomains {
+		s.droppedDomainsByGlobalLimit++
+		return false
+	}
+	s.domainsToResolve[d] = struct{}{}
+	s.domainsCount++
+	return true
+}
+
 func (s *DiscoveryState) AddDomainSource(d string, direct, inherited DomainSource) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.acceptDomainLocked(d) {
+		return
+	}
 	ev := s.domainEvidence[d]
 	ev.Direct |= direct
 	ev.Inherited |= inherited
 	s.domainEvidence[d] = ev
-
-	if _, exists := s.domainsToResolve[d]; !exists {
-		if s.domainsCount < MaxDiscoveredDomains {
-			s.domainsToResolve[d] = struct{}{}
-			s.domainsCount++
-		} else {
-			s.droppedDomainsByGlobalLimit++
-		}
-	}
 }
 
 func (s *DiscoveryState) AddPairSource(ip, d string, src DomainSource) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.acceptDomainLocked(d) {
+		return
+	}
 	key := ip + "\x00" + d
 	evP := s.pairEvidence[key]
 	evP.Direct |= src
 	s.pairEvidence[key] = evP
-
-	if _, exists := s.domainsToResolve[d]; !exists {
-		if s.domainsCount < MaxDiscoveredDomains {
-			s.domainsToResolve[d] = struct{}{}
-			s.domainsCount++
-		} else {
-			s.droppedDomainsByGlobalLimit++
-		}
-	}
 }
 
 // ================= MODELS =================
@@ -300,10 +303,10 @@ type Candidate struct {
 	SNI                   string
 	ALPN                  string
 	H2HeadersReceived     bool
-	ResponseHeadersParsed bool // Отслеживает первый ответ HEADERS
-	ResponseTrailersSeen  bool // Отслеживает trailers
-	H2ProtocolConfirmed   bool // Истинное подтверждение работы H2
-	TLS13                 bool // Подтверждение TLS 1.3
+	ResponseHeadersParsed bool
+	ResponseTrailersSeen  bool
+	H2ProtocolConfirmed   bool
+	TLS13                 bool
 	HTTPStatus            int
 	Location              string
 	BodyBytes             int
@@ -398,7 +401,7 @@ type PipelineStats struct {
 	DNSValidPairs         int
 	TCPConnected          int
 	TLSHandshake          int
-	NoPeerCertificates    int // Вынесено отдельно от ошибок валидации
+	NoPeerCertificates    int
 	TLSValidationFailures int
 	H2HeadersOK           int
 	EndStreamOK           int
@@ -464,6 +467,7 @@ func (s *PipelineStats) recordProviderStat(name string, cat DiscoveryCategory, r
 	}
 }
 
+// Pipeline-scoped caches to avoid global leakage.
 type RuntimeCaches struct {
 	ProvCache *SafeCache
 	ProvGroup *singleflight.Group
@@ -1158,14 +1162,11 @@ func (r *ProviderRunner) waitRate(ctx context.Context) error {
 	}
 
 	r.mu.Lock()
-
 	now := time.Now()
 	slot := now
-
 	if now.Before(r.nextAllowed) {
 		slot = r.nextAllowed
 	}
-
 	r.nextAllowed = slot.Add(r.Config.MinInterval)
 	r.mu.Unlock()
 
@@ -1176,7 +1177,6 @@ func (r *ProviderRunner) waitRate(ctx context.Context) error {
 
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
-
 	select {
 	case <-timer.C:
 		return nil
@@ -1404,7 +1404,9 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 // -------------------------------------------------
 // Implementations: Free Providers (No API Keys)
 // -------------------------------------------------
+
 type shodanInternetDBProvider struct{}
+
 func (p *shodanInternetDBProvider) Name() string                 { return "Shodan InternetDB" }
 func (p *shodanInternetDBProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *shodanInternetDBProvider) QueryType() ProviderQueryType { return QueryIP }
@@ -1421,12 +1423,14 @@ func (p *shodanInternetDBProvider) Fetch(ctx context.Context, query string, clie
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrProviderNoData
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
+
 	var res struct {
 		Hostnames []string `json:"hostnames"`
 	}
@@ -1437,6 +1441,7 @@ func (p *shodanInternetDBProvider) Fetch(ctx context.Context, query string, clie
 }
 
 type anubisProvider struct{}
+
 func (p *anubisProvider) Name() string                 { return "Anubis DB" }
 func (p *anubisProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *anubisProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1453,6 +1458,7 @@ func (p *anubisProvider) Fetch(ctx context.Context, query string, client *http.C
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1464,6 +1470,7 @@ func (p *anubisProvider) Fetch(ctx context.Context, query string, client *http.C
 }
 
 type threatMinerProvider struct{}
+
 func (p *threatMinerProvider) Name() string                 { return "ThreatMiner" }
 func (p *threatMinerProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *threatMinerProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1480,6 +1487,7 @@ func (p *threatMinerProvider) Fetch(ctx context.Context, query string, client *h
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1493,6 +1501,7 @@ func (p *threatMinerProvider) Fetch(ctx context.Context, query string, client *h
 }
 
 type hackerTargetHostSearchProvider struct{}
+
 func (p *hackerTargetHostSearchProvider) Name() string                 { return "HT HostSearch" }
 func (p *hackerTargetHostSearchProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *hackerTargetHostSearchProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1509,15 +1518,19 @@ func (p *hackerTargetHostSearchProvider) Fetch(ctx context.Context, query string
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
+
 	buf := new(bytes.Buffer)
 	_, _ = buf.ReadFrom(resp.Body)
 	content := buf.String()
+
 	if strings.Contains(strings.ToLower(content), "api count exceeded") {
 		return nil, &ProviderHTTPError{StatusCode: http.StatusTooManyRequests, Body: content}
 	}
+
 	var result []string
 	for _, line := range strings.Split(content, "\n") {
 		parts := strings.Split(line, ",")
@@ -1529,6 +1542,7 @@ func (p *hackerTargetHostSearchProvider) Fetch(ctx context.Context, query string
 }
 
 type crtShProvider struct{}
+
 func (p *crtShProvider) Name() string                 { return "crt.sh" }
 func (p *crtShProvider) Category() DiscoveryCategory  { return CatCertificate }
 func (p *crtShProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1545,6 +1559,7 @@ func (p *crtShProvider) Fetch(ctx context.Context, query string, client *http.Cl
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1564,6 +1579,7 @@ func (p *crtShProvider) Fetch(ctx context.Context, query string, client *http.Cl
 }
 
 type certSpotterProvider struct{}
+
 func (p *certSpotterProvider) Name() string                 { return "CertSpotter" }
 func (p *certSpotterProvider) Category() DiscoveryCategory  { return CatCertificate }
 func (p *certSpotterProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1575,20 +1591,24 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 	if maxPages <= 0 {
 		maxPages = 1
 	}
+
 	for page := 0; page < maxPages; page++ {
 		u := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", url.QueryEscape(query))
 		if after != "" {
 			u += "&after=" + url.QueryEscape(after)
 		}
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return result, err
 		}
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+
 		resp, err := client.Do(req)
 		if err != nil {
 			return result, err
 		}
+
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1597,6 +1617,7 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 			}
 			return nil, errProv
 		}
+
 		var issuances []struct {
 			ID       string   `json:"id"`
 			DNSNames []string `json:"dns_names"`
@@ -1609,9 +1630,11 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 			}
 			return nil, err
 		}
+
 		if len(issuances) == 0 {
 			break
 		}
+
 		previousAfter := after
 		for _, iss := range issuances {
 			result = append(result, iss.DNSNames...)
@@ -1625,6 +1648,7 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 }
 
 type alienVaultProvider struct{}
+
 func (p *alienVaultProvider) Name() string                 { return "AlienVault" }
 func (p *alienVaultProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *alienVaultProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1635,6 +1659,7 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 	if maxPages <= 0 {
 		maxPages = 1
 	}
+
 	u := fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/domain/%s/passive_dns", url.QueryEscape(query))
 	for page := 0; page < maxPages; page++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -1642,10 +1667,12 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			return result, err
 		}
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+
 		resp, err := client.Do(req)
 		if err != nil {
 			return result, err
 		}
+
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1654,6 +1681,7 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			}
 			return nil, errProv
 		}
+
 		var otxRes struct {
 			PassiveDNS []struct {
 				Hostname string `json:"hostname"`
@@ -1668,12 +1696,15 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			}
 			return nil, err
 		}
+
 		for _, entry := range otxRes.PassiveDNS {
 			result = append(result, entry.Hostname)
 		}
+
 		if otxRes.Next == "" {
 			break
 		}
+
 		previousURL := u
 		if !strings.HasPrefix(otxRes.Next, "http") {
 			if strings.HasPrefix(otxRes.Next, "/api") {
@@ -1683,7 +1714,7 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			}
 		} else {
 			if !strings.HasPrefix(otxRes.Next, "https://otx.alienvault.com") {
-				break
+				break // Avoid SSRF/leaving domain
 			}
 			u = otxRes.Next
 		}
@@ -1695,11 +1726,13 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 }
 
 type waybackProvider struct{}
+
 func (p *waybackProvider) Name() string                 { return "WaybackMachine" }
 func (p *waybackProvider) Category() DiscoveryCategory  { return CatArchive }
 func (p *waybackProvider) QueryType() ProviderQueryType { return QueryDomain }
 func (p *waybackProvider) SourceBit() DomainSource      { return SourceWayback }
 func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.Client, cfg ProviderConfig) ([]string, error) {
+	// Single sweep limit due to lack of stable fast pagination
 	u := fmt.Sprintf("https://web.archive.org/cdx/search/cdx?url=*.%s/*&output=json&collapse=urlkey&fl=original&limit=10000", url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -1711,6 +1744,7 @@ func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1731,6 +1765,7 @@ func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.
 }
 
 type hackerTargetProvider struct{}
+
 func (p *hackerTargetProvider) Name() string                 { return "HackerTarget" }
 func (p *hackerTargetProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *hackerTargetProvider) QueryType() ProviderQueryType { return QueryIP }
@@ -1747,6 +1782,7 @@ func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1762,7 +1798,9 @@ func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *
 // -------------------------------------------------
 // Implementations: Enterprise API Providers
 // -------------------------------------------------
+
 type vtDomainProvider struct{ Key string }
+
 func (p *vtDomainProvider) Name() string                 { return "VirusTotal" }
 func (p *vtDomainProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *vtDomainProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1774,6 +1812,7 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 	if maxPages <= 0 {
 		maxPages = 3
 	}
+
 	for page := 0; page < maxPages; page++ {
 		u := fmt.Sprintf("https://www.virustotal.com/api/v3/domains/%s/subdomains?limit=40", url.QueryEscape(query))
 		if cursor != "" {
@@ -1783,12 +1822,14 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 		if err != nil {
 			return subs, err
 		}
+
 		req.Header.Add("x-apikey", p.Key)
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
 		resp, err := client.Do(req)
 		if err != nil {
 			return subs, err
 		}
+
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1813,6 +1854,7 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 			}
 			return nil, err
 		}
+
 		for _, item := range res.Data {
 			subs = append(subs, item.Id)
 		}
@@ -1825,6 +1867,7 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 }
 
 type vtIPProvider struct{ Key string }
+
 func (p *vtIPProvider) Name() string                 { return "VirusTotal" }
 func (p *vtIPProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *vtIPProvider) QueryType() ProviderQueryType { return QueryIP }
@@ -1836,6 +1879,7 @@ func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Cli
 	if maxPages <= 0 {
 		maxPages = 3
 	}
+
 	for page := 0; page < maxPages; page++ {
 		u := fmt.Sprintf("https://www.virustotal.com/api/v3/ip_addresses/%s/resolutions?limit=40", url.QueryEscape(query))
 		if cursor != "" {
@@ -1845,12 +1889,14 @@ func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Cli
 		if err != nil {
 			return subs, err
 		}
+
 		req.Header.Add("x-apikey", p.Key)
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
 		resp, err := client.Do(req)
 		if err != nil {
 			return subs, err
 		}
+
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1877,6 +1923,7 @@ func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Cli
 			}
 			return nil, err
 		}
+
 		for _, item := range res.Data {
 			subs = append(subs, item.Attributes.HostName)
 		}
@@ -1901,9 +1948,11 @@ type URLScanSearchResponse struct {
 func fetchURLScanSearch(ctx context.Context, query string, key string, client *http.Client, maxPages int) ([]string, error) {
 	var domains []string
 	searchAfter := ""
+
 	if maxPages <= 0 {
 		maxPages = 1
 	}
+
 	for page := 0; page < maxPages; page++ {
 		values := url.Values{}
 		values.Set("q", query)
@@ -1911,19 +1960,20 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 		if searchAfter != "" {
 			values.Set("search_after", searchAfter)
 		}
+
 		reqURL := "https://urlscan.io/api/v1/search/?" + values.Encode()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
 			return domains, err
 		}
-		// Важно: заголовок в нижнем регистре api-key
 		req.Header.Set("api-key", key)
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
-		
+
 		resp, err := client.Do(req)
 		if err != nil {
 			return domains, err
 		}
+
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1932,6 +1982,7 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 			}
 			return nil, errProv
 		}
+
 		var res URLScanSearchResponse
 		err = json.NewDecoder(resp.Body).Decode(&res)
 		resp.Body.Close()
@@ -1941,50 +1992,42 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 			}
 			return nil, err
 		}
+
 		for _, item := range res.Results {
 			domains = append(domains, item.Page.Domain)
 		}
+
 		if !res.HasMore || len(res.Results) == 0 {
 			break
 		}
-		
+
 		lastSort := res.Results[len(res.Results)-1].Sort
 		if len(lastSort) > 0 {
-			parts := make([]string, 0, len(lastSort))
-			for _, raw := range lastSort {
-				var v interface{}
-				if err := json.Unmarshal(raw, &v); err != nil {
-					return domains, fmt.Errorf("invalid urlscan sort value: %w", err)
-				}
-				switch x := v.(type) {
-				case string:
-					parts = append(parts, x)
-				default:
-					parts = append(parts, fmt.Sprint(x))
-				}
-			}
-			newSearchAfter := strings.Join(parts, ",")
+			b, _ := json.Marshal(lastSort)
+			newSearchAfter := string(b)
 			if searchAfter == newSearchAfter {
-				break
+				break // Prevents looping if cursor doesn't move
 			}
 			searchAfter = newSearchAfter
 		} else {
-			break
+			break // Cannot paginate without sort array
 		}
 	}
 	return domains, nil
 }
 
 type urlScanDomainProvider struct{ Key string }
+
 func (p *urlScanDomainProvider) Name() string                 { return "URLScan" }
 func (p *urlScanDomainProvider) Category() DiscoveryCategory  { return CatArchive }
 func (p *urlScanDomainProvider) QueryType() ProviderQueryType { return QueryDomain }
 func (p *urlScanDomainProvider) SourceBit() DomainSource      { return SourceURLScan }
 func (p *urlScanDomainProvider) Fetch(ctx context.Context, query string, client *http.Client, cfg ProviderConfig) ([]string, error) {
-	return fetchURLScanSearch(ctx, "domain:"+query, p.Key, client, cfg.MaxPages)
+	return fetchURLScanSearch(ctx, "page.domain:"+query, p.Key, client, cfg.MaxPages)
 }
 
 type urlScanIPProvider struct{ Key string }
+
 func (p *urlScanIPProvider) Name() string                 { return "URLScan" }
 func (p *urlScanIPProvider) Category() DiscoveryCategory  { return CatArchive }
 func (p *urlScanIPProvider) QueryType() ProviderQueryType { return QueryIP }
@@ -1994,6 +2037,7 @@ func (p *urlScanIPProvider) Fetch(ctx context.Context, query string, client *htt
 }
 
 type securityTrailsProvider struct{ Key string }
+
 func (p *securityTrailsProvider) Name() string                 { return "SecurityTrails" }
 func (p *securityTrailsProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *securityTrailsProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -2028,6 +2072,7 @@ func (p *securityTrailsProvider) Fetch(ctx context.Context, query string, client
 }
 
 type chaosProvider struct{ Key string }
+
 func (p *chaosProvider) Name() string                 { return "Chaos" }
 func (p *chaosProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *chaosProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -2267,11 +2312,12 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 	pTCP := s.TCPConnected
 	pTLS := s.TLSHandshake
 	pTLSVal := s.TLSValidationFailures
-	pNoCert := s.NoPeerCertificates
 	pH2Head := s.H2HeadersOK
 
+	catMap := make(map[string]DiscoveryCategory)
 	localStats := make(map[string]ProviderStats)
 	for k, v := range s.ProviderStats {
+		catMap[k] = v.Category
 		localStats[k] = *v
 	}
 	allocStats := s.Alloc
@@ -2352,7 +2398,6 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 	}
 	fmt.Printf("[*] Успешных TCP соединений:   %d\n", pTCP)
 	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", pTLS)
-	fmt.Printf("[*] Отсутствие сертификатов:   %d\n", pNoCert)
 	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", pTLSVal)
 	fmt.Printf("[*] С откликом H2 Headers:     %d\n", pH2Head)
 	fmt.Printf("[*] Финальных IP-кластеров:    %d\n", clustered)
@@ -2662,8 +2707,6 @@ func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]s
 	return ips, nil
 }
 
-var ErrDNSNXDomain = errors.New("NXDOMAIN")
-
 func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCaches *RuntimeCaches) ([]string, error) {
 	domain = CleanDomain(domain)
 	if domain == "" {
@@ -2715,13 +2758,18 @@ type ProbeError struct {
 func (e *ProbeError) Error() string { return e.Err.Error() }
 
 func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
-	conn.SetWriteDeadline(time.Now().Add(timeout))
-	n, err := conn.Write(b)
-	if err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
-	if n != len(b) {
-		return fmt.Errorf("short write")
+	for len(b) > 0 {
+		n, err := conn.Write(b)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		b = b[n:]
 	}
 	return nil
 }
@@ -2770,51 +2818,41 @@ func buildWindowUpdateFrame(streamID uint32, increment uint32) []byte {
 }
 
 func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) error {
-	weakCount := 0
-	blockStatus := 0
+	var status int
 	hasStatus := false
-
 	for _, h := range headers {
-		hName := strings.ToLower(strings.TrimSpace(h.Name))
-
-		if hName == ":status" {
-			n, err := strconv.Atoi(strings.TrimSpace(h.Value))
+		name := strings.ToLower(strings.TrimSpace(h.Name))
+		if name != ":status" {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(h.Value))
+		if err != nil || n < 100 || n > 999 {
 			if err != nil {
 				return fmt.Errorf("invalid :status value %q: %w", h.Value, err)
 			}
-			if n < 100 || n > 999 {
-				return fmt.Errorf("invalid HTTP status: %d", n)
-			}
-			blockStatus = n
-			hasStatus = true
+			return fmt.Errorf("invalid HTTP status: %d", n)
 		}
+		status = n
+		hasStatus = true
 	}
-
 	if !hasStatus {
 		return fmt.Errorf("response HEADERS missing :status")
 	}
-
-	isInformational := blockStatus >= 100 && blockStatus < 200
-	isFinalResponse := blockStatus >= 200
-
-	if isInformational {
-		// 1xx - это промежуточный ответ, не выставляем ResponseHeadersParsed
+	if status >= 100 && status < 200 {
 		return nil
 	}
-
-	if isFinalResponse && !cand.ResponseHeadersParsed {
-		cand.HTTPStatus = blockStatus
+	if !cand.ResponseHeadersParsed {
+		cand.HTTPStatus = status
 		cand.ResponseHeadersParsed = true
-
+		weakCount := 0
 		for _, h := range headers {
-			hName := strings.ToLower(strings.TrimSpace(h.Name))
-			hValLower := strings.ToLower(h.Value)
-
-			switch hName {
+			name := strings.ToLower(strings.TrimSpace(h.Name))
+			valueLower := strings.ToLower(h.Value)
+			switch name {
 			case "server":
 				cand.Server = h.Value
 				for _, cdn := range cdnStrong {
-					if strings.Contains(hValLower, cdn) {
+					if strings.Contains(valueLower, cdn) {
 						cand.CDNStatus = CDNConfirmed
 						cand.CDNProvider = cdn
 					}
@@ -2827,36 +2865,29 @@ func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) error {
 				cand.CDNStatus = CDNConfirmed
 				cand.CDNProvider = "cloudflare"
 			}
-
-			if strings.HasPrefix(hName, "x-amz-cf-") ||
-				strings.HasPrefix(hName, "x-sucuri-") ||
-				strings.HasPrefix(hName, "x-akamai-") {
+			if strings.HasPrefix(name, "x-amz-cf-") || strings.HasPrefix(name, "x-sucuri-") || strings.HasPrefix(name, "x-akamai-") {
 				cand.CDNStatus = CDNConfirmed
 				if cand.CDNProvider == "" {
 					cand.CDNProvider = "headers"
 				}
 			}
-
-			for _, cdnH := range cdnWeak {
-				if hName == cdnH {
+			for _, weak := range cdnWeak {
+				if name == weak {
 					weakCount++
 				}
 			}
 		}
-
 		if cand.CDNStatus == CDNStatusUnknown && weakCount > 0 {
 			cand.CDNStatus = CDNLikely
 		}
 	}
-
 	return nil
 }
 
 func parseTrailers(cand *Candidate, headers []hpack.HeaderField) error {
 	cand.ResponseTrailersSeen = true
-	// По RFC 9113 pseudo-headers (начинающиеся с двоеточия) запрещены в trailers
 	for _, h := range headers {
-		if len(h.Name) > 0 && h.Name[0] == ':' {
+		if strings.HasPrefix(strings.TrimSpace(h.Name), ":") {
 			return fmt.Errorf("pseudo-header %q found in trailers", h.Name)
 		}
 	}
@@ -2897,24 +2928,17 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	cand.Timings.TLS = time.Since(t1)
 	uConn.SetDeadline(time.Time{})
 
-	state := uConn.ConnectionState()
-
-	// Фактическая проверка TLS 1.3
-	if state.Version != tls.VersionTLS13 {
-		return cand, &ProbeError{
-			Stage: ProbeStageTLS,
-			Err:   fmt.Errorf("unexpected TLS version: 0x%x", state.Version),
-		}
-	}
-	cand.TLS13 = true
-
-	// При этом базовая логика с ALPN тоже сохраняется
-	if state.NegotiatedProtocol == "h2" {
+	if uConn.ConnectionState().NegotiatedProtocol == "h2" {
 		cand.ALPN = "h2"
 	} else {
 		cand.ALPN = "h2 (no ALPN)"
 	}
 
+	state := uConn.ConnectionState()
+	if state.Version != tls.VersionTLS13 {
+		return cand, &ProbeError{Stage: ProbeStageTLS, Err: fmt.Errorf("unexpected TLS version: 0x%x", state.Version)}
+	}
+	cand.TLS13 = true
 	if len(state.PeerCertificates) == 0 {
 		return cand, &ProbeError{Stage: ProbeStageTLSValidation, Err: fmt.Errorf("no peer certificates provided")}
 	}
@@ -2939,18 +2963,16 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 		opts.Intermediates.AddCert(c)
 	}
 
-	// CertChainValid here defines manual verification success (non-fatal)
+	// CertChainValid here defines manual verification success
 	if _, err := cert.Verify(opts); err == nil {
 		cand.CertSNIMatch = true
 		cand.CertChainValid = true
 	} else {
-		cand.CertChainValid = false
 		cand.CertSNIMatch = (cert.VerifyHostname(sni) == nil)
 	}
 
 	wTo := time.Duration(cfg.H2WriteTimeoutMs) * time.Millisecond
 
-	// Принудительно шлём HTTP/2 preface, чтобы удостовериться в поддержке
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil {
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
@@ -3007,22 +3029,13 @@ ReadLoop:
 				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("expected CONTINUATION frame")}
 			}
 
-			// Строгая проверка stream ID по RFC
-			switch frameType {
-			case FrameSettings, FrameGoAway:
-				if streamID != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
-				}
-			case FrameHeaders, FrameData, FrameRSTStream, FrameContinuation:
-				if streamID == 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use non-zero stream", frameType)}
-				}
-			}
-
 			switch frameType {
 			case FrameSettings:
 				if length%6 != 0 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length")}
+				}
+				if streamID != 0 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("SETTINGS on non-zero stream")}
 				}
 				if flags&FlagAck != 0 {
 					if length != 0 {
@@ -3122,20 +3135,14 @@ ReadLoop:
 						if err != nil {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
-						
-						if !cand.ResponseHeadersParsed {
-							if err := parseResponseHeaders(cand, headers); err != nil {
-								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-							}
-						} else {
+						if cand.ResponseHeadersParsed {
 							if err := parseTrailers(cand, headers); err != nil {
 								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 							}
+						} else if err := parseResponseHeaders(cand, headers); err != nil {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
-						
 						headerBlocks.Reset()
-						
-						// Фиксируем тайминг первого финального ответа
 						if cand.ResponseHeadersParsed && !cand.H2HeadersReceived {
 							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
@@ -3143,37 +3150,27 @@ ReadLoop:
 					}
 				}
 			case FrameContinuation:
-				if !expectingContinuation {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("unexpected CONTINUATION frame")}
-				}
-				if streamID != activeStreamID {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("CONTINUATION stream mismatch: got %d, want %d", streamID, activeStreamID)}
-				}
-				headerBlocks.Write(payload)
-				if (flags & FlagEndHeaders) != 0 {
-					expectingContinuation = false
-					headers, err := decoder.DecodeFull(headerBlocks.Bytes())
+				if streamID == activeStreamID {
+					headerBlocks.Write(payload)
+					if (flags & FlagEndHeaders) != 0 {
+						expectingContinuation = false
+						headers, err := decoder.DecodeFull(headerBlocks.Bytes())
 						if err != nil {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
-						
-						if !cand.ResponseHeadersParsed {
-							if err := parseResponseHeaders(cand, headers); err != nil {
-								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-							}
-						} else {
+						if cand.ResponseHeadersParsed {
 							if err := parseTrailers(cand, headers); err != nil {
 								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 							}
+						} else if err := parseResponseHeaders(cand, headers); err != nil {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
-						
 						headerBlocks.Reset()
-						
-						// Фиксируем тайминг первого финального ответа
 						if cand.ResponseHeadersParsed && !cand.H2HeadersReceived {
 							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
 						}
+					}
 				}
 			case FrameData:
 				if streamID == 1 {
@@ -3242,12 +3239,12 @@ ReadLoop:
 	if !cand.EndStreamSeen {
 		return cand, &ProbeError{Stage: ProbeStageComplete, Err: fmt.Errorf("response did not reach END_STREAM")}
 	}
-
-	// Явная фиксация того, что это действительно работающий H2
 	if cand.H2SettingsReceived && cand.H2HeadersReceived && cand.HTTPStatus >= 200 && cand.EndStreamSeen {
 		cand.H2ProtocolConfirmed = true
 	}
-
+	if !cand.H2ProtocolConfirmed {
+		return cand, &ProbeError{Stage: ProbeStageComplete, Err: fmt.Errorf("HTTP/2 session not fully confirmed")}
+	}
 	return cand, nil
 }
 
@@ -3291,21 +3288,10 @@ func scoreH2Profile(c *Candidate) float64 {
 }
 
 func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bool {
-	// Доказательство реальной HTTP/2 сессии, а не просто пустых или ошибочных ответов
-	if !cand.H2ProtocolConfirmed {
-		return false
-	}
-
 	rs := RealityScore{}
-
-	// Использование фактического состояния TLS 1.3
-	if cand.TLS13 {
-		rs.TLSQuality += 10.0
-	}
 	if cand.ALPN == "h2" {
 		rs.TLSQuality += 10.0
 	}
-
 	if cand.CertValidTime {
 		rs.Certificate += 5.0
 	}
@@ -3764,8 +3750,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	})
 
 	pipeStats.mu.Lock()
-	pipeStats.DNSUniqueResolvedIPs = uniqueResolvedCount
-	pipeStats.DNSUniqueTargetIPs = uniqueTargetCount
 	pipeStats.DNSValidPairs = len(validPairs)
 	fmt.Printf("[+] Stage D Завершён. Подтверждено DNS-пар (IP+SNI): %d\n", pipeStats.DNSValidPairs)
 	pipeStats.mu.Unlock()
@@ -3836,11 +3820,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				pipeStats.TLSHandshake++
 			}
 			if pErr != nil && pErr.Stage == ProbeStageTLSValidation {
-				if strings.Contains(pErr.Err.Error(), "no peer certificates") {
-					pipeStats.NoPeerCertificates++
-				} else {
-					pipeStats.TLSValidationFailures++
-				}
+				pipeStats.TLSValidationFailures++
 			}
 			if cand != nil && cand.H2HeadersReceived {
 				pipeStats.H2HeadersOK++
@@ -3945,15 +3925,18 @@ func main() {
 	flag.BoolVar(&cfg.NoPassive, "no-passive", false, "Disable Passive DNS OSINT")
 	flag.BoolVar(&cfg.NoReverseIP, "no-reverse-ip", false, "Disable Reverse IP lookups")
 
-	flag.StringVar(&cfg.VTKey, "vt-key", os.Getenv("dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5"), "VirusTotal API Key")
-	flag.StringVar(&cfg.URLScanKey, "urlscan-key", os.Getenv("01a032ae-681d-7718-821b-c6fd33aa11a7"), "URLScan.io API Key")
-	flag.StringVar(&cfg.ChaosKey, "chaos-key", os.Getenv("e3c91ed9-2f79-4147-807f-43dd150003e4"), "ProjectDiscovery Chaos API Key")
-	flag.StringVar(&cfg.SecTrailsKey, "sectrails-key", os.Getenv("SECURITYTRAILS_API_KEY"), "SecurityTrails API Key")
+	flag.StringVar(&cfg.VTKey, "vt-key", os.Getenv("VT_API_KEY"), "VirusTotal API Key")
+	flag.StringVar(&cfg.URLScanKey, "urlscan-key", os.Getenv("URLSCAN_API_KEY"), "URLScan.io API Key")
+	flag.StringVar(&cfg.ChaosKey, "chaos-key", os.Getenv("CHAOS_API_KEY"), "ProjectDiscovery Chaos API Key")
+	flag.StringVar(&cfg.SecTrailsKey, "sectrails-key", "", "SecurityTrails API Key")
 
 	flag.Parse()
 
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
+	}
+	if cfg.TCPTimeoutMs <= 0 || cfg.TLSTimeoutMs <= 0 || cfg.H2ReadTimeoutMs <= 0 || cfg.H2WriteTimeoutMs <= 0 {
+		log.Fatal("[-] timeout flags must be > 0")
 	}
 	cfg.Mode = Mode(modeStr)
 	cfg.CIDRs = flag.Args()
@@ -4123,10 +4106,10 @@ func main() {
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
 	fmt.Printf("Подробности лучшего кандидата:\n")
-	fmt.Printf("TLS: %.0f/20 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | LATENCY: TCP %dms, TLS %dms, H2 %dms\n",
+	fmt.Printf("TLS: %.0f/10 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | LATENCY: TCP %dms, TLS %dms, H2 %dms\n",
 		best.RealityScore.TLSQuality, best.RealityScore.Certificate, best.RealityScore.H2Profile, best.RealityScore.ServerProfile, best.RealityScore.HTTPBehavior, best.RealityScore.DiscoveryScore,
 		best.Timings.TCP.Milliseconds(), best.Timings.TLS.Milliseconds(), best.Timings.H2Headers.Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
-	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n",
+	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/90 (HTTP: %d, Total Probe Latency: %d ms)\n",
 		best.RealityScore.Total, best.DomainPenalty, best.Score, best.HTTPStatus, best.Timings.TotalProbeLatency().Milliseconds())
 }
