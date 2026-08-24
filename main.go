@@ -179,6 +179,7 @@ type Candidate struct {
 	Score             float64
 	DomainPenalty     float64
 	RealityScore      RealityScore
+	CertChainValid    bool
 	EndStreamSeen     bool
 	StreamReset       bool
 	GoAwaySeen        bool
@@ -191,7 +192,6 @@ type Candidate struct {
 	CertSANCount          int
 	CertValidTime         bool
 	CertSNIMatch          bool
-	CertChainValid        bool
 	SettingsFramesCount   int
 	SettingsAckCount      int
 	SettingsChanges       int
@@ -238,6 +238,7 @@ type PipelineStats struct {
 	DNSValidPairs       int
 	TCPConnected        int
 	TLSHandshake        int
+	TLSValidation       int
 	H2HeadersOK         int
 	EndStreamOK         int
 
@@ -379,85 +380,6 @@ func classifyDomainQuality(sni string) string {
 		return "Numeric"
 	}
 	return "Normal"
-}
-
-func rankAndLimitDomains(domains []string, max int) []string {
-	unique := uniqueDomains(domains)
-	if max <= 0 || len(unique) == 0 {
-		return nil
-	}
-
-	type rankedDomain struct {
-		domain string
-		score  int
-	}
-
-	ranked := make([]rankedDomain, 0, len(unique))
-	scoreDomain := func(d string) int {
-		s := 0
-		l := len(d)
-		switch {
-		case l <= 15:
-			s += 20
-		case l <= 25:
-			s += 15
-		case l <= 35:
-			s += 10
-		default:
-			s += 5
-		}
-		switch {
-		case strings.HasPrefix(d, "www."):
-			s += 20
-		case strings.HasPrefix(d, "api."):
-			s += 15
-		case strings.HasPrefix(d, "remote."):
-			s += 10
-		case strings.HasPrefix(d, "web."):
-			s += 10
-		case strings.HasPrefix(d, "app."):
-			s += 8
-		}
-		for _, prefix := range []string{
-			"autodiscover.", "autoconfig.", "cpanel.", "webmail.",
-			"panel.", "admin.", "ns1.", "ns2.", "ns3.", "ns4.",
-			"smtp.", "imap.", "pop.", "mx.", "vpn.",
-		} {
-			if strings.HasPrefix(d, prefix) {
-				s -= 15
-				break
-			}
-		}
-		labels := strings.Split(d, ".")
-		if len(labels) > 0 {
-			first := labels[0]
-			if uuidLabelRe.MatchString(first) {
-				s -= 20
-			}
-		}
-		return s
-	}
-
-	for _, d := range unique {
-		ranked = append(ranked, rankedDomain{domain: d, score: scoreDomain(d)})
-	}
-
-	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].score != ranked[j].score {
-			return ranked[i].score > ranked[j].score
-		}
-		return len(ranked[i].domain) < len(ranked[j].domain)
-	})
-
-	if len(ranked) > max {
-		ranked = ranked[:max]
-	}
-
-	result := make([]string, 0, len(ranked))
-	for _, r := range ranked {
-		result = append(result, r.domain)
-	}
-	return result
 }
 
 // ================= SNI PROVIDERS =================
@@ -611,7 +533,11 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			return nil, err
 		}
 
-		cleanRes := rankAndLimitDomains(res, r.Config.MaxNames)
+		cleanRes := uniqueDomains(res)
+		if r.Config.MaxNames > 0 && len(cleanRes) > r.Config.MaxNames {
+			cleanRes = cleanRes[:r.Config.MaxNames]
+		}
+
 		recordProviderStat(r.Name(), r.Category(), true, false, len(cleanRes))
 		provCache.Put(cacheKey, cleanRes)
 		return cleanRes, nil
@@ -1157,15 +1083,15 @@ func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte
 
 func buildClientSettingsFrame() []byte {
 	payload := make([]byte, 30)
-	binary.BigEndian.PutUint16(payload[0:2], 1)
-	binary.BigEndian.PutUint32(payload[2:6], 65536)
-	binary.BigEndian.PutUint16(payload[6:8], 2)
-	binary.BigEndian.PutUint32(payload[8:12], 0)
-	binary.BigEndian.PutUint16(payload[12:14], 3)
-	binary.BigEndian.PutUint32(payload[14:18], 1000)
-	binary.BigEndian.PutUint16(payload[18:20], 4)
+	binary.BigEndian.PutUint16(payload[0:2], 1)       // HEADER_TABLE_SIZE
+	binary.BigEndian.PutUint32(payload[2:6], 65536)   
+	binary.BigEndian.PutUint16(payload[6:8], 2)       // ENABLE_PUSH
+	binary.BigEndian.PutUint32(payload[8:12], 0)      
+	binary.BigEndian.PutUint16(payload[12:14], 3)     // MAX_CONCURRENT_STREAMS
+	binary.BigEndian.PutUint32(payload[14:18], 1000)  
+	binary.BigEndian.PutUint16(payload[18:20], 4)     // INITIAL_WINDOW_SIZE
 	binary.BigEndian.PutUint32(payload[20:24], 6291456)
-	binary.BigEndian.PutUint16(payload[24:26], 6)
+	binary.BigEndian.PutUint16(payload[24:26], 6)     // MAX_HEADER_LIST_SIZE
 	binary.BigEndian.PutUint32(payload[26:30], 262144)
 	return buildH2Frame(FrameSettings, 0, 0, payload)
 }
@@ -1883,25 +1809,25 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		score := func(s DomainSource) int {
 			sc := 0
 			if s.Has(SourcePTR) {
-				sc += 3
+				sc += 10
 			}
 			if s.Has(SourceHackerTarget) {
-				sc += 3
+				sc += 8
 			}
 			if s.Has(SourceCRTSh) {
-				sc += 3
+				sc += 4
 			}
 			if s.Has(SourceCertSpotter) {
-				sc += 3
+				sc += 4
 			}
 			if s.Has(SourceAlienVault) {
-				sc += 2
+				sc += 3
 			}
 			if s.Has(SourceWayback) {
-				sc += 1
+				sc += 2
 			}
 			if s.Has(SourceSeed) {
-				sc += 2
+				sc += 5
 			}
 			return sc
 		}
