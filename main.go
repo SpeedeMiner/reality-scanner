@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -152,6 +153,14 @@ type RealityScore struct {
 	Total          float64
 }
 
+type CDNStatus string
+
+const (
+	CDNConfirmed CDNStatus = "Confirmed"
+	CDNLikely    CDNStatus = "Likely"
+	CDNUnknown   CDNStatus = "Unknown"
+)
+
 type Candidate struct {
 	IP                string
 	SNI               string
@@ -166,11 +175,10 @@ type Candidate struct {
 	ASN               uint
 	Country           string
 	CDNProvider       string
-	CDNConfidence     int
+	CDNStatus         CDNStatus
 	Score             float64
 	DomainPenalty     float64
 	RealityScore      RealityScore
-	CertChainValid    bool
 	EndStreamSeen     bool
 	StreamReset       bool
 	GoAwaySeen        bool
@@ -181,6 +189,9 @@ type Candidate struct {
 	CertIssuer            string
 	CertSubject           string
 	CertSANCount          int
+	CertValidTime         bool
+	CertSNIMatch          bool
+	CertChainValid        bool
 	SettingsFramesCount   int
 	SettingsAckCount      int
 	SettingsChanges       int
@@ -216,13 +227,17 @@ type PipelineStats struct {
 	DNSQueries          int
 	DNSSuccess          int
 	DNSFailed           int
+	DNSNXDomain         int
+	DNSTimeout          int
+	DNSTemporary        int
+	DNSNoIPv4           int
+	DNSOtherErr         int
 	DNSResolvedIPs      int
 	DNSIPsInTargetRange int
 	DNSTargetDomains    int
 	DNSValidPairs       int
 	TCPConnected        int
 	TLSHandshake        int
-	TLSValidation       int
 	H2HeadersOK         int
 	EndStreamOK         int
 
@@ -288,6 +303,19 @@ var (
 	dnsCache  = NewSafeCache()
 	dnsGroup  singleflight.Group
 )
+
+// ================= CUSTOM DNS RESOLVER =================
+
+var publicDNS = []string{"1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"}
+var dnsCounter atomic.Uint64
+var dnsResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 2 * time.Second}
+		i := dnsCounter.Add(1) % uint64(len(publicDNS))
+		return d.DialContext(ctx, "udp", publicDNS[i])
+	},
+}
 
 // ================= UTILS =================
 
@@ -536,7 +564,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		r.mu.Lock()
 		if time.Now().Before(r.cbUntil) {
 			r.mu.Unlock()
-			return nil, nil
+			return nil, nil // Circuit Open
 		}
 		r.mu.Unlock()
 
@@ -736,7 +764,7 @@ func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.
 	var result []string
 	for i, row := range cdx {
 		if i == 0 || len(row) < 1 {
-			continue
+			continue // Skip header
 		}
 		if parsed, err := url.Parse(row[0]); err == nil && parsed.Hostname() != "" {
 			if d := CleanDomain(parsed.Hostname()); d != "" {
@@ -753,7 +781,7 @@ func (p *hackerTargetProvider) Name() string                 { return "HackerTar
 func (p *hackerTargetProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *hackerTargetProvider) QueryType() ProviderQueryType { return QueryIP }
 func (p *hackerTargetProvider) SourceBit() DomainSource      { return SourceHackerTarget }
-func (p *hackerTargetProvider) MaxRoots() int                { return 0 }
+func (p *hackerTargetProvider) MaxRoots() int                { return 0 } // IP Provider
 func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *http.Client) ([]string, error) {
 	u := fmt.Sprintf("https://api.hackertarget.com/reverseiplookup/?q=%s", url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -1039,10 +1067,10 @@ func resolveIPv4Cached(ctx context.Context, domain string) ([]string, error) {
 		if cached, ok := dnsCache.Get(domain); ok {
 			return cached, nil
 		}
-		dnsCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		dnsCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 		defer cancel()
 
-		ips, err := net.DefaultResolver.LookupIP(dnsCtx, "ip4", domain)
+		ips, err := dnsResolver.LookupIP(dnsCtx, "ip4", domain)
 		if err != nil {
 			return nil, err
 		}
@@ -1127,6 +1155,21 @@ func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte
 	return append(header, payload...)
 }
 
+func buildClientSettingsFrame() []byte {
+	payload := make([]byte, 30)
+	binary.BigEndian.PutUint16(payload[0:2], 1)
+	binary.BigEndian.PutUint32(payload[2:6], 65536)
+	binary.BigEndian.PutUint16(payload[6:8], 2)
+	binary.BigEndian.PutUint32(payload[8:12], 0)
+	binary.BigEndian.PutUint16(payload[12:14], 3)
+	binary.BigEndian.PutUint32(payload[14:18], 1000)
+	binary.BigEndian.PutUint16(payload[18:20], 4)
+	binary.BigEndian.PutUint32(payload[20:24], 6291456)
+	binary.BigEndian.PutUint16(payload[24:26], 6)
+	binary.BigEndian.PutUint32(payload[26:30], 262144)
+	return buildH2Frame(FrameSettings, 0, 0, payload)
+}
+
 func buildWindowUpdateFrame(streamID uint32, increment uint32) []byte {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, increment&0x7FFFFFFF)
@@ -1139,6 +1182,7 @@ func ProbeH2(ctx context.Context, ip, sni string, sources DomainSource, cfg Conf
 		SNI:           sni,
 		Sources:       sources,
 		DomainQuality: classifyDomainQuality(sni),
+		CDNStatus:     CDNUnknown,
 	}
 
 	t0 := time.Now()
@@ -1177,7 +1221,6 @@ func ProbeH2(ctx context.Context, ip, sni string, sources DomainSource, cfg Conf
 	}
 
 	cert := state.PeerCertificates[0]
-
 	cand.CertIssuer = cert.Issuer.CommonName
 	if cand.CertIssuer == "" && len(cert.Issuer.Organization) > 0 {
 		cand.CertIssuer = cert.Issuer.Organization[0]
@@ -1186,9 +1229,8 @@ func ProbeH2(ctx context.Context, ip, sni string, sources DomainSource, cfg Conf
 	cand.CertSANCount = len(cert.DNSNames) + len(cert.IPAddresses)
 
 	now := time.Now()
-	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
-		return cand, &ProbeError{Stage: ProbeStageTLSValidation, Err: fmt.Errorf("certificate expired")}
-	}
+	cand.CertValidTime = now.After(cert.NotBefore) && now.Before(cert.NotAfter)
+	cand.CertSNIMatch = (cert.VerifyHostname(sni) == nil)
 
 	opts := x509.VerifyOptions{
 		DNSName:       sni,
@@ -1198,7 +1240,6 @@ func ProbeH2(ctx context.Context, ip, sni string, sources DomainSource, cfg Conf
 	for _, c := range state.PeerCertificates[1:] {
 		opts.Intermediates.AddCert(c)
 	}
-
 	if _, err := cert.Verify(opts); err == nil {
 		cand.CertChainValid = true
 	}
@@ -1208,7 +1249,7 @@ func ProbeH2(ctx context.Context, ip, sni string, sources DomainSource, cfg Conf
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil {
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
-	if err := writeH2(uConn, buildH2Frame(FrameSettings, 0, 0, []byte{}), wTo); err != nil {
+	if err := writeH2(uConn, buildClientSettingsFrame(), wTo); err != nil {
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
 	if err := writeH2(uConn, buildH2Frame(FrameHeaders, FlagEndHeaders|FlagEndStream, 1, buildH2HeadersEncoder(sni)), wTo); err != nil {
@@ -1486,10 +1527,11 @@ ReadLoop:
 }
 
 func parseHeaders(cand *Candidate, headers []hpack.HeaderField) {
+	weakCount := 0
 	for _, h := range headers {
 		hName := strings.ToLower(h.Name)
 		hVal := strings.ToLower(h.Value)
-		
+
 		if hName == ":status" {
 			fmt.Sscanf(hVal, "%d", &cand.HTTPStatus)
 		}
@@ -1497,7 +1539,7 @@ func parseHeaders(cand *Candidate, headers []hpack.HeaderField) {
 			cand.Server = h.Value
 			for _, cdn := range cdnStrong {
 				if strings.Contains(hVal, cdn) {
-					cand.CDNConfidence += 3
+					cand.CDNStatus = CDNConfirmed
 					cand.CDNProvider = cdn
 				}
 			}
@@ -1508,14 +1550,12 @@ func parseHeaders(cand *Candidate, headers []hpack.HeaderField) {
 		if hName == "location" {
 			cand.Location = h.Value
 		}
-		
+
 		if hName == "cf-ray" {
-			cand.CDNConfidence += 3
-			if cand.CDNProvider == "" {
-				cand.CDNProvider = "cloudflare"
-			}
+			cand.CDNStatus = CDNConfirmed
+			cand.CDNProvider = "cloudflare"
 		} else if strings.HasPrefix(hName, "x-amz-cf-") || strings.HasPrefix(hName, "x-sucuri-") || strings.HasPrefix(hName, "x-akamai-") {
-			cand.CDNConfidence += 2
+			cand.CDNStatus = CDNConfirmed
 			if cand.CDNProvider == "" {
 				cand.CDNProvider = "headers"
 			}
@@ -1523,51 +1563,58 @@ func parseHeaders(cand *Candidate, headers []hpack.HeaderField) {
 
 		for _, cdnH := range cdnWeak {
 			if hName == cdnH {
-				cand.CDNConfidence += 1
+				weakCount++
 			}
 		}
+	}
+	if cand.CDNStatus == CDNUnknown && weakCount > 0 {
+		cand.CDNStatus = CDNLikely
 	}
 }
 
 // ================= SCORING & ENRICHMENT =================
 
-func scorePeerSettings(prof PeerSettingsProfile) float64 {
-	score := 0.0
-	if prof.HasInitialWindowSize {
-		if prof.InitialWindowSize == 65535 {
-			score += 0.5
-		} else if prof.InitialWindowSize > 65535 {
-			score += 1.0
-		}
-	}
-	if prof.HasMaxFrameSize {
-		if prof.MaxFrameSize == 16384 {
-			score += 0.5
-		} else if prof.MaxFrameSize > 16384 {
-			score += 1.0
-		}
-	}
-	if prof.HasMaxConcurrentStreams && prof.MaxConcurrentStreams > 0 {
-		score += 1.0
-	}
-	return score
-}
-
 func scoreH2Profile(c *Candidate) float64 {
 	score := 0.0
 	if c.H2SettingsReceived {
-		score += 5.0
+		score += 4.0
 	}
+
+	prof := c.InitialPeerSettings
+	if prof.HasMaxConcurrentStreams && prof.MaxConcurrentStreams > 0 && prof.MaxConcurrentStreams <= 1000 {
+		score += 2.0
+	}
+
+	if prof.HasInitialWindowSize {
+		if prof.InitialWindowSize == 65535 {
+			score += 1.0
+		} else if prof.InitialWindowSize > 65535 {
+			score += 3.0
+		}
+	}
+
+	if prof.HasMaxFrameSize {
+		if prof.MaxFrameSize == 16384 {
+			score += 1.0
+		} else if prof.MaxFrameSize > 16384 {
+			score += 3.0
+		}
+	}
+
+	if c.SettingsChanges > 0 {
+		score += 2.0
+	}
+
 	if c.H2DataFrames > 0 {
-		score += 3.0
+		score += 2.0
 	}
 	if c.BodyBytes > 0 {
-		score += 2.0
+		score += 1.0
 	}
 	if c.EndStreamSeen {
 		score += 2.0
 	}
-	score += scorePeerSettings(c.InitialPeerSettings)
+
 	return math.Min(score, 20.0)
 }
 
@@ -1598,7 +1645,7 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		stats.mu.Unlock()
 		return false
 	}
-	if cand.CDNConfidence >= 3 {
+	if cand.CDNStatus == CDNConfirmed {
 		stats.mu.Lock()
 		stats.CDNDropped++
 		stats.mu.Unlock()
@@ -1607,20 +1654,18 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 
 	rs := RealityScore{}
 
-	if cand.CertChainValid {
-		rs.TLSQuality += 15
-	} else {
-		rs.TLSQuality += 5
-	}
 	if cand.ALPN == "h2" {
-		rs.TLSQuality += 5
+		rs.TLSQuality += 10.0
 	}
 
-	if cand.CertChainValid {
-		rs.Certificate += 10
+	if cand.CertValidTime {
+		rs.Certificate += 5.0
 	}
-	if cand.CertIssuer != "" && !strings.Contains(strings.ToLower(cand.CertIssuer), "localhost") {
-		rs.Certificate += 10
+	if cand.CertSNIMatch {
+		rs.Certificate += 10.0
+	}
+	if cand.CertChainValid {
+		rs.Certificate += 5.0
 	}
 
 	rs.H2Profile = scoreH2Profile(cand)
@@ -1649,19 +1694,16 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		}
 	}
 
-	sourceCount := 0
-	for _, src := range []DomainSource{SourcePTR, SourceCRTSh, SourceCertSpotter, SourceAlienVault, SourceWayback, SourceHackerTarget, SourceSeed} {
-		if cand.Sources.Has(src) {
-			sourceCount++
-		}
-	}
-	
+	hasDirect := cand.Sources.Has(SourcePTR) || cand.Sources.Has(SourceHackerTarget)
+	hasCert := cand.Sources.Has(SourceCRTSh) || cand.Sources.Has(SourceCertSpotter)
+	hasPassive := cand.Sources.Has(SourceAlienVault) || cand.Sources.Has(SourceWayback)
+
 	discovery := 0.0
 	if cand.Sources.Has(SourcePTR) {
-		discovery += 2.0
+		discovery += 3.0
 	}
 	if cand.Sources.Has(SourceHackerTarget) {
-		discovery += 2.0
+		discovery += 3.0
 	}
 	if cand.Sources.Has(SourceCRTSh) {
 		discovery += 2.0
@@ -1670,19 +1712,33 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		discovery += 2.0
 	}
 	if cand.Sources.Has(SourceAlienVault) {
-		discovery += 2.0
+		discovery += 1.0
 	}
 	if cand.Sources.Has(SourceWayback) {
 		discovery += 1.0
 	}
 	if cand.Sources.Has(SourceSeed) {
-		discovery += 1.0
-	}
-
-	if sourceCount >= 2 {
 		discovery += 2.0
 	}
-	if sourceCount >= 3 {
+
+	diversity := 0
+	if hasDirect {
+		diversity++
+	}
+	if hasCert {
+		diversity++
+	}
+	if hasPassive {
+		diversity++
+	}
+	if cand.Sources.Has(SourceSeed) {
+		diversity++
+	}
+
+	if diversity >= 2 {
+		discovery += 2.0
+	}
+	if diversity >= 3 {
 		discovery += 2.0
 	}
 	rs.DiscoveryScore = math.Min(discovery, 10.0)
@@ -1701,12 +1757,16 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	rs.Total = rs.TLSQuality + rs.Certificate + rs.H2Profile + rs.ServerProfile + rs.HTTPBehavior + rs.DiscoveryScore + rs.Latency
 
 	scorePenalty := 0.0
-	if cand.DomainQuality == "JunkTLD" {
-		scorePenalty = 15.0
-	} else if cand.DomainQuality == "DynDNS" {
-		scorePenalty = 25.0
-	} else if cand.DomainQuality == "Numeric" {
+	switch cand.DomainQuality {
+	case "Numeric":
 		scorePenalty = 30.0
+	case "DynDNS":
+		scorePenalty = 20.0
+	case "JunkTLD":
+		scorePenalty = 5.0
+	}
+	if cand.CDNStatus == CDNLikely {
+		scorePenalty += 10.0
 	}
 
 	cand.RealityScore = rs
@@ -1775,7 +1835,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		ip := ip
 		g1a.Go(func() error {
 			if !cfg.NoPTR {
-				names, err := net.DefaultResolver.LookupAddr(gCtx1a, ip)
+				names, err := dnsResolver.LookupAddr(gCtx1a, ip)
 				if err == nil {
 					found := false
 					for _, n := range names {
@@ -1823,25 +1883,25 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		score := func(s DomainSource) int {
 			sc := 0
 			if s.Has(SourcePTR) {
-				sc += 10
-			}
-			if s.Has(SourceHackerTarget) {
-				sc += 8
-			}
-			if s.Has(SourceCRTSh) {
-				sc += 4
-			}
-			if s.Has(SourceCertSpotter) {
-				sc += 4
-			}
-			if s.Has(SourceAlienVault) {
 				sc += 3
 			}
-			if s.Has(SourceWayback) {
+			if s.Has(SourceHackerTarget) {
+				sc += 3
+			}
+			if s.Has(SourceCRTSh) {
+				sc += 3
+			}
+			if s.Has(SourceCertSpotter) {
+				sc += 3
+			}
+			if s.Has(SourceAlienVault) {
 				sc += 2
 			}
+			if s.Has(SourceWayback) {
+				sc += 1
+			}
 			if s.Has(SourceSeed) {
-				sc += 5
+				sc += 2
 			}
 			return sc
 		}
@@ -1913,6 +1973,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		}
 	}
 
+	var uniqueResolvedIPs sync.Map
+	var uniqueTargetIPs sync.Map
+
 	g1c, gCtx1c := errgroup.WithContext(ctx)
 	g1c.SetLimit(cfg.Workers)
 	for _, dom := range allDomains {
@@ -1926,25 +1989,48 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			stats.mu.Unlock()
 
 			ips, err := resolveIPv4Cached(gCtx1c, dom)
-			if err != nil || len(ips) == 0 {
-				stats.mu.Lock()
+
+			stats.mu.Lock()
+			if err != nil {
 				stats.DNSFailed++
+				var dnsErr *net.DNSError
+				if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+					stats.DNSTimeout++
+				} else if errors.As(err, &dnsErr) {
+					if dnsErr.IsNotFound {
+						stats.DNSNXDomain++
+					} else if dnsErr.Timeout() {
+						stats.DNSTimeout++
+					} else if dnsErr.Temporary() {
+						stats.DNSTemporary++
+					} else {
+						stats.DNSOtherErr++
+					}
+				} else {
+					stats.DNSOtherErr++
+				}
 				stats.mu.Unlock()
 				return nil
 			}
 
-			stats.mu.Lock()
+			if len(ips) == 0 {
+				stats.DNSFailed++
+				stats.DNSNoIPv4++
+				stats.mu.Unlock()
+				return nil
+			}
+
 			stats.DNSSuccess++
 			stats.DNSResolvedIPs += len(ips)
 			stats.mu.Unlock()
 
 			matched := false
 			for _, resolvedIP := range ips {
+				uniqueResolvedIPs.Store(resolvedIP, struct{}{})
+
 				if ipInRanges(resolvedIP, scanRanges) {
+					uniqueTargetIPs.Store(resolvedIP, struct{}{})
 					matched = true
-					stats.mu.Lock()
-					stats.DNSIPsInTargetRange++
-					stats.mu.Unlock()
 
 					pairKey := resolvedIP + "\x00" + dom
 					if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
@@ -1975,8 +2061,23 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 	_ = g1c.Wait()
 
+	uniqueResolvedCount := 0
+	uniqueResolvedIPs.Range(func(k, v interface{}) bool {
+		uniqueResolvedCount++
+		return true
+	})
+
+	uniqueTargetCount := 0
+	uniqueTargetIPs.Range(func(k, v interface{}) bool {
+		uniqueTargetCount++
+		return true
+	})
+
+	stats.mu.Lock()
 	stats.DNSValidPairs = len(validPairs)
 	fmt.Printf("[+] Этап 1 завершен. Подтверждено DNS-пар (IP+SNI): %d\n", stats.DNSValidPairs)
+	stats.mu.Unlock()
+
 	if len(validPairs) == 0 {
 		return nil
 	}
@@ -2033,6 +2134,66 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		return candidates[i].Timings.TotalProbeLatency() < candidates[j].Timings.TotalProbeLatency()
 	})
 
+	stats.mu.Lock()
+	fmt.Println("\n===================================================================================================================")
+	fmt.Println("                                   ТЕЛЕМЕТРИЯ СКАНИРОВАНИЯ (PIPELINE STATS)")
+	fmt.Println("===================================================================================================================")
+	fmt.Printf("[*] IP отобрано для пула:      %d\n", stats.IPSampled)
+	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", stats.IPWithPTR)
+
+	fmt.Println("\nSNI/Hostname Discovery Providers:")
+
+	categories := map[DiscoveryCategory][]string{}
+	catMap := make(map[string]DiscoveryCategory)
+
+	providersInfo := []struct {
+		n string
+		c DiscoveryCategory
+	}{
+		{"crt.sh", CatCertificate}, {"CertSpotter", CatCertificate},
+		{"AlienVault", CatPassiveDNS}, {"WaybackMachine", CatArchive}, {"HackerTarget", CatReverseIP},
+	}
+	for _, p := range providersInfo {
+		catMap[p.n] = p.c
+	}
+
+	for name := range stats.ProviderStats {
+		cat := catMap[name]
+		categories[cat] = append(categories[cat], name)
+	}
+
+	catNames := make([]string, 0, len(categories))
+	for c := range categories {
+		catNames = append(catNames, string(c))
+	}
+	sort.Strings(catNames)
+
+	for _, catStr := range catNames {
+		cat := DiscoveryCategory(catStr)
+		names := categories[cat]
+		fmt.Printf("  [%s]\n", cat)
+		sort.Strings(names)
+		for _, name := range names {
+			p := stats.ProviderStats[name]
+			fmt.Printf("    %-15s : Попыток: %d (Успех: %d, Ошибок: %d, Таймаутов: %d) -> Найдено имён: %d\n", name, p.Attempts, p.Success, p.Failed, p.Timeouts, p.Names)
+		}
+	}
+
+	fmt.Printf("\n[*] DNS Lookups:               %d (Успех: %d, Ошибок: %d)\n", stats.DNSQueries, stats.DNSSuccess, stats.DNSFailed)
+	fmt.Printf("    Детали DNS ошибок:         NXDOMAIN: %d, Timeout: %d, Temporary: %d, NoIPv4: %d, Other: %d\n",
+		stats.DNSNXDomain, stats.DNSTimeout, stats.DNSTemporary, stats.DNSNoIPv4, stats.DNSOtherErr)
+	fmt.Printf("[*] DNS Resolved IPs (Всего):  %d\n", stats.DNSResolvedIPs)
+	fmt.Printf("[*] DNS Unique IPs:            %d\n", uniqueResolvedCount)
+	fmt.Printf("[*] DNS Unique Target IPs:     %d\n", uniqueTargetCount)
+	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", stats.DNSTargetDomains)
+	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", stats.DNSValidPairs)
+	fmt.Printf("[*] Успешных TCP соединений:   %d\n", stats.TCPConnected)
+	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", stats.TLSHandshake)
+	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", stats.TLSValidation)
+	fmt.Printf("[*] С откликом H2 Headers:     %d\n", stats.H2HeadersOK)
+	fmt.Printf("[*] Финальных кандидатов:      %d\n", len(candidates))
+	stats.mu.Unlock()
+
 	return candidates
 }
 
@@ -2058,7 +2219,7 @@ func main() {
 	flag.StringVar(&domainsStr, "domains", "", "Comma-separated seed domains for OSINT")
 	flag.StringVar(&cfg.GeoIPPath, "geoip", "GeoLite2-Country.mmdb", "Path to Country DB")
 	flag.StringVar(&cfg.ASNPath, "asn-db", "GeoLite2-ASN.mmdb", "Path to ASN DB")
-	
+
 	flag.BoolVar(&cfg.NoPTR, "no-ptr", false, "Disable Reverse DNS PTR lookups")
 	flag.BoolVar(&cfg.NoCT, "no-ct", false, "Disable Certificate Transparency lookups (crt.sh/CertSpotter)")
 	flag.BoolVar(&cfg.NoPassive, "no-passive", false, "Disable Passive DNS OSINT (AlienVault, Wayback)")
@@ -2078,12 +2239,16 @@ func main() {
 			}
 		}
 	}
-	
+
 	if cfg.Mode != ModeAuto && cfg.Mode != ModeDirect {
 		log.Fatalf("[-] Unknown mode: %s", cfg.Mode)
 	}
 	if cfg.Mode == ModeDirect && len(cfg.CIDRs) == 0 {
 		log.Fatal("[-] Direct mode requires at least one IPv4 CIDR")
+	}
+
+	if cfg.MaxIPs == -1 {
+		fmt.Printf("[!] ВНИМАНИЕ: Выбран режим полного сканирования (--max-ips=-1). Для крупных ASN это может занять очень много времени!\n")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -2153,28 +2318,32 @@ func main() {
 			}
 		}
 
+		var samplingCIDRs []string
 		if !cfg.ScanEntireASN {
 			if localPrefix == "" {
 				log.Fatal("[-] Target IP is not present in ASN announced prefixes. Use --scan-all-asn to force full scan.")
 			}
-			cfg.CIDRs = []string{localPrefix}
+			samplingCIDRs = []string{localPrefix}
 		} else {
-			cfg.CIDRs = cidrs
+			samplingCIDRs = cidrs
 		}
 
-		merged := MergeCIDRs(cfg.CIDRs)
-		sampledIPs := SampleIPs(merged, cfg.MaxIPs, cfg.Seed)
+		samplingRanges := MergeCIDRs(samplingCIDRs)
+		sampledIPs := SampleIPs(samplingRanges, cfg.MaxIPs, cfg.Seed)
+
+		dnsRanges := MergeCIDRs(cidrs)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
 		fmt.Printf("[*] Announcing ASN:        AS%d\n", cfg.TargetASN)
 		if !cfg.ScanEntireASN {
-			fmt.Printf("[*] Фокус на IPv4 prefix:    %s\n", localPrefix)
+			fmt.Printf("[*] Фокус на IPv4 prefix:    %s (DNS-валидация по всем %d префиксам ASN)\n", localPrefix, len(cidrs))
+		} else {
+			fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN\n", len(cidrs))
 		}
 		fmt.Printf("[*] Страна сервера:          %s (MaxMind GeoIP)\n", cfg.TargetCountry)
-		fmt.Printf("[*] Подсетей для скана:      %d\n", len(merged))
-		fmt.Printf("[*] Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
+		fmt.Printf("[*] Подготовлено %d IP адресов для OSINT-сэмплинга. Запуск...\n", len(sampledIPs))
 
-		results = RunPipeline(ctx, cfg, sampledIPs, merged, asnDB, countryDB)
+		results = RunPipeline(ctx, cfg, sampledIPs, dnsRanges, asnDB, countryDB)
 
 	} else if cfg.Mode == ModeDirect {
 		merged := MergeCIDRs(cfg.CIDRs)
@@ -2182,60 +2351,6 @@ func main() {
 		fmt.Printf("[*] Direct Mode: Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
 		results = RunPipeline(ctx, cfg, sampledIPs, merged, asnDB, countryDB)
 	}
-
-	fmt.Println("\n===================================================================================================================")
-	fmt.Println("                                   ТЕЛЕМЕТРИЯ СКАНИРОВАНИЯ (PIPELINE STATS)")
-	fmt.Println("===================================================================================================================")
-	fmt.Printf("[*] IP отобрано для пула:      %d\n", stats.IPSampled)
-	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", stats.IPWithPTR)
-
-	fmt.Println("\nSNI/Hostname Discovery Providers:")
-	
-	categories := map[DiscoveryCategory][]string{}
-	catMap := make(map[string]DiscoveryCategory)
-	
-	providersInfo := []struct{n string; c DiscoveryCategory}{
-		{"crt.sh", CatCertificate}, {"CertSpotter", CatCertificate},
-		{"AlienVault", CatPassiveDNS}, {"WaybackMachine", CatArchive}, {"HackerTarget", CatReverseIP},
-	}
-	for _, p := range providersInfo {
-		catMap[p.n] = p.c
-	}
-
-	stats.mu.Lock()
-	for name := range stats.ProviderStats {
-		cat := catMap[name]
-		categories[cat] = append(categories[cat], name)
-	}
-	
-	catNames := make([]string, 0, len(categories))
-	for c := range categories {
-		catNames = append(catNames, string(c))
-	}
-	sort.Strings(catNames)
-
-	for _, catStr := range catNames {
-		cat := DiscoveryCategory(catStr)
-		names := categories[cat]
-		fmt.Printf("  [%s]\n", cat)
-		sort.Strings(names)
-		for _, name := range names {
-			p := stats.ProviderStats[name]
-			fmt.Printf("    %-15s : Попыток: %d (Успех: %d, Ошибок: %d, Таймаутов: %d) -> Найдено имён: %d\n", name, p.Attempts, p.Success, p.Failed, p.Timeouts, p.Names)
-		}
-	}
-	
-	fmt.Printf("\n[*] DNS Lookups:               %d (Успех: %d, Ошибок: %d)\n", stats.DNSQueries, stats.DNSSuccess, stats.DNSFailed)
-	fmt.Printf("[*] DNS Resolved IPs (Всего):  %d\n", stats.DNSResolvedIPs)
-	fmt.Printf("[*] DNS IPs в целевых CIDR:    %d\n", stats.DNSIPsInTargetRange)
-	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", stats.DNSTargetDomains)
-	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", stats.DNSValidPairs)
-	fmt.Printf("[*] Успешных TCP соединений:   %d\n", stats.TCPConnected)
-	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", stats.TLSHandshake)
-	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", stats.TLSValidation)
-	fmt.Printf("[*] С откликом H2 Headers:     %d\n", stats.H2HeadersOK)
-	fmt.Printf("[*] Финальных кандидатов:      %d\n", len(results))
-	stats.mu.Unlock()
 
 	if len(results) == 0 {
 		fmt.Println("\n[-] Подходящих кандидатов не найдено.")
