@@ -385,10 +385,10 @@ type StageCStats struct {
 	Failed         int
 	Skipped        int
 	Reassigned     int
-	
 	CompletedRoots int
 	LostRoots      int
 	CanceledRoots  int
+	Lost           int
 }
 
 type PipelineStats struct {
@@ -2253,77 +2253,89 @@ func RunStageC(
 	ds *DiscoveryState,
 	rootProvenance map[string]DomainSource,
 ) {
-	providerRoots, allocStats := distributeRoots(roots, providers, 20, cfg)
+	if len(roots) == 0 {
+		return
+	}
+
+	if len(providers) == 0 {
+		pipeStats.mu.Lock()
+		pipeStats.StageC.TotalRoots = len(roots)
+		pipeStats.StageC.LostRoots = len(roots)
+		pipeStats.StageC.Lost = len(roots)
+		pipeStats.mu.Unlock()
+		return
+	}
+
+	providerRoots, allocStats := distributeRoots(
+		roots,
+		providers,
+		20,
+		cfg,
+	)
 
 	pipeStats.mu.Lock()
 	pipeStats.Alloc = allocStats
 	pipeStats.StageC.TotalRoots = len(roots)
-	pipeStats.StageC.Assigned = allocStats.AssignedRoots + allocStats.OverlappedAssignments
+	pipeStats.StageC.Assigned =
+		allocStats.AssignedRoots +
+			allocStats.OverlappedAssignments
 	pipeStats.mu.Unlock()
 
-	providerLimits := make(map[*ProviderRunner]int)
-	providerUsed := make(map[*ProviderRunner]int)
+	providerLimits := make(map[*ProviderRunner]int, len(providers))
+	providerUsed := make(map[*ProviderRunner]int, len(providers))
+
 	for _, p := range providers {
 		limit := effectiveRootLimit(p, cfg)
+
 		if limit <= 0 {
-			limit = 999999
+			limit = len(roots)
 		}
+
+		if limit > len(roots) {
+			limit = len(roots)
+		}
+
 		providerLimits[p] = limit
 		providerUsed[p] = len(providerRoots[p])
 	}
 
-	jobQueues := make(map[*ProviderRunner]chan RootCandidate)
+	jobQueues := make(map[*ProviderRunner]chan RootCandidate, len(providers))
+
 	for _, p := range providers {
-		jobQueues[p] = make(chan RootCandidate, providerLimits[p]+1000)
-	}
-
-	var stateMu sync.Mutex
-	rootStates := make(map[string]RootState)
-	history := make(map[string]map[*ProviderRunner]bool)
-	for _, r := range roots {
-		rootStates[r.Domain] = RootPending
-		history[r.Domain] = make(map[*ProviderRunner]bool)
-	}
-
-	markCompleted := func(domain string) bool {
-		stateMu.Lock()
-		defer stateMu.Unlock()
-		if rootStates[domain] == RootPending {
-			rootStates[domain] = RootCompleted
-			pipeStats.mu.Lock()
-			pipeStats.StageC.CompletedRoots++
-			pipeStats.mu.Unlock()
-			return true
+		queueSize := providerLimits[p]
+		if queueSize < 1 {
+			queueSize = 1
 		}
-		return false
-	}
 
-	markLost := func(domain string) {
-		stateMu.Lock()
-		defer stateMu.Unlock()
-		if rootStates[domain] == RootPending {
-			rootStates[domain] = RootLost
-			pipeStats.mu.Lock()
-			pipeStats.StageC.LostRoots++
-			pipeStats.mu.Unlock()
+		if queueSize > len(roots) {
+			queueSize = len(roots)
 		}
+
+		jobQueues[p] = make(chan RootCandidate, queueSize)
 	}
 
-	var activeTasks sync.WaitGroup
+	type stageResult struct {
+		provider *ProviderRunner
+		root     RootCandidate
+		result   ExecResult
+	}
+
+	totalCapacity := 0
+	for _, p := range providers {
+		totalCapacity += providerLimits[p]
+	}
+
+	if totalCapacity < 1 {
+		totalCapacity = 1
+	}
+
+	resultsCh := make(chan stageResult, totalCapacity)
+
 	var workerWG sync.WaitGroup
-
-	for p, proots := range providerRoots {
-		for _, r := range proots {
-			history[r.Domain][p] = true
-			activeTasks.Add(1)
-			jobQueues[p] <- r
-		}
-	}
-
-	reassignCh := make(chan RootCandidate, len(roots)*len(providers))
 
 	for _, p := range providers {
 		p := p
+
 		workers := p.Config.MaxConcurrent
 		if workers <= 0 {
 			workers = 1
@@ -2331,132 +2343,196 @@ func RunStageC(
 
 		for i := 0; i < workers; i++ {
 			workerWG.Add(1)
+
 			go func() {
 				defer workerWG.Done()
+
 				for root := range jobQueues[p] {
-					if ctx.Err() != nil {
-						activeTasks.Done()
-						continue
+					res := p.Execute(
+						ctx,
+						root.Domain,
+						client,
+						pipeStats,
+						rtCaches,
+					)
+
+					resultsCh <- stageResult{
+						provider: p,
+						root:     root,
+						result:   res,
 					}
-
-					res := p.Execute(ctx, root.Domain, client, pipeStats, rtCaches)
-
-					pipeStats.mu.Lock()
-					pipeStats.StageC.Executed++
-					switch res.Status {
-					case StatSuccess:
-						pipeStats.StageC.Success++
-					case StatNoData:
-						pipeStats.StageC.NoData++
-					case StatPartial:
-						pipeStats.StageC.Partial++
-					case StatFailed:
-						pipeStats.StageC.Failed++
-					case StatSkipped, StatWaitCanceled:
-						pipeStats.StageC.Skipped++
-					}
-					pipeStats.mu.Unlock()
-
-					needsReassign := (res.Status != StatSuccess)
-
-					if res.Status == StatSuccess {
-						markCompleted(root.Domain)
-					}
-
-					if ctx.Err() == nil && needsReassign {
-						activeTasks.Add(1)
-						reassignCh <- root
-					}
-
-					if len(res.Names) > 0 {
-						inheritedSrc := rootProvenance[root.Domain]
-						for _, d := range res.Names {
-							ds.AddDomainSource(d, p.SourceBit(), inheritedSrc)
-						}
-					}
-					activeTasks.Done()
 				}
 			}()
 		}
 	}
 
-	workerWG.Add(1)
-	go func() {
-		defer workerWG.Done()
-		for root := range reassignCh {
-			stateMu.Lock()
-			isCompleted := (rootStates[root.Domain] == RootCompleted)
-			stateMu.Unlock()
+	rootStates := make(map[string]RootState, len(roots))
+	history := make(map[string]map[*ProviderRunner]bool, len(roots))
 
-			if isCompleted {
-				activeTasks.Done()
-				continue
-			}
+	for _, root := range roots {
+		rootStates[root.Domain] = RootPending
+		history[root.Domain] = make(map[*ProviderRunner]bool)
+	}
 
-			stateMu.Lock()
-			tried := history[root.Domain]
-			var nextP *ProviderRunner
+	inFlight := 0
 
-			for _, p := range providers {
-				if !tried[p] {
-					p.mu.Lock()
-					cbOpen := !p.cbUntil.IsZero() && time.Now().Before(p.cbUntil)
-					p.mu.Unlock()
+	for _, p := range providers {
+		for _, root := range providerRoots[p] {
+			history[root.Domain][p] = true
+			jobQueues[p] <- root
+			inFlight++
+		}
+	}
 
-					if !cbOpen && providerUsed[p] < providerLimits[p] {
-						nextP = p
-						break
-					}
+	markCompleted := func(domain string) {
+		if rootStates[domain] != RootPending {
+			return
+		}
+
+		rootStates[domain] = RootCompleted
+
+		pipeStats.mu.Lock()
+		pipeStats.StageC.CompletedRoots++
+		pipeStats.mu.Unlock()
+	}
+
+	markLost := func(domain string) {
+		if rootStates[domain] != RootPending {
+			return
+		}
+
+		rootStates[domain] = RootLost
+
+		pipeStats.mu.Lock()
+		pipeStats.StageC.LostRoots++
+		pipeStats.StageC.Lost++
+		pipeStats.mu.Unlock()
+	}
+
+	markCanceled := func(domain string) {
+		if rootStates[domain] != RootPending {
+			return
+		}
+
+		rootStates[domain] = RootCanceled
+
+		pipeStats.mu.Lock()
+		pipeStats.StageC.CanceledRoots++
+		pipeStats.mu.Unlock()
+	}
+
+SchedulerLoop:
+	for inFlight > 0 {
+
+		select {
+		case <-ctx.Done():
+			for _, root := range roots {
+				if rootStates[root.Domain] == RootPending {
+					markCanceled(root.Domain)
 				}
 			}
 
-			if nextP != nil {
-				tried[nextP] = true
-				providerUsed[nextP]++
-				pipeStats.mu.Lock()
-				pipeStats.StageC.Reassigned++
-				pipeStats.mu.Unlock()
+			break SchedulerLoop
 
-				activeTasks.Add(1)
-				jobQueues[nextP] <- root
-			} else {
-				markLost(root.Domain)
-			}
-			stateMu.Unlock()
-			
-			activeTasks.Done()
-		}
-	}()
+		case item := <-resultsCh:
+			inFlight--
 
-	go func() {
-		activeTasks.Wait()
-		close(reassignCh)
-		for _, p := range providers {
-			close(jobQueues[p])
-		}
-	}()
+			p := item.provider
+			root := item.root
+			res := item.result
 
-	waitCh := make(chan struct{})
-	go func() {
-		workerWG.Wait()
-		close(waitCh)
-	}()
-
-	select {
-	case <-waitCh:
-	case <-ctx.Done():
-	}
-
-	stateMu.Lock()
-	for _, r := range roots {
-		if rootStates[r.Domain] == RootPending {
-			rootStates[r.Domain] = RootCanceled
 			pipeStats.mu.Lock()
-			pipeStats.StageC.CanceledRoots++
+
+			pipeStats.StageC.Executed++
+
+			switch res.Status {
+			case StatSuccess:
+				pipeStats.StageC.Success++
+
+			case StatNoData:
+				pipeStats.StageC.NoData++
+
+			case StatPartial:
+				pipeStats.StageC.Partial++
+
+			case StatFailed:
+				pipeStats.StageC.Failed++
+
+			case StatSkipped, StatWaitCanceled:
+				pipeStats.StageC.Skipped++
+			}
+
 			pipeStats.mu.Unlock()
+
+			if len(res.Names) > 0 {
+				inheritedSrc := rootProvenance[root.Domain]
+
+				for _, d := range res.Names {
+					ds.AddDomainSource(
+						d,
+						p.SourceBit(),
+						inheritedSrc,
+					)
+				}
+			}
+
+			if rootStates[root.Domain] != RootPending {
+				continue
+			}
+
+			switch res.Status {
+			case StatSuccess, StatNoData, StatPartial:
+				markCompleted(root.Domain)
+				continue
+			}
+
+			var nextP *ProviderRunner
+			tried := history[root.Domain]
+
+			for _, candidate := range providers {
+				if tried[candidate] {
+					continue
+				}
+
+				candidate.mu.Lock()
+				cbOpen := !candidate.cbUntil.IsZero() &&
+					time.Now().Before(candidate.cbUntil)
+				candidate.mu.Unlock()
+
+				if cbOpen {
+					continue
+				}
+
+				if providerUsed[candidate] >= providerLimits[candidate] {
+					continue
+				}
+
+				nextP = candidate
+				break
+			}
+
+			if nextP == nil {
+				markLost(root.Domain)
+				continue
+			}
+
+			history[root.Domain][nextP] = true
+			providerUsed[nextP]++
+
+			pipeStats.mu.Lock()
+			pipeStats.StageC.Reassigned++
+			pipeStats.mu.Unlock()
+
+			jobQueues[nextP] <- root
+			inFlight++
 		}
 	}
-	stateMu.Unlock()
+
+	for _, p := range providers {
+		close(jobQueues[p])
+	}
+
+	workerWG.Wait()
 }
 
 func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *DiscoveryState) {
@@ -3794,14 +3870,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	})
 
 	fmt.Printf("[*] STAGE C: Domain OSINT (Distributing %d Roots)...\n", len(rootsRanked))
-	if len(domainProviders) > 0 {
-		RunStageC(ctx, rootsRanked, domainProviders, cfg, httpClient, pipeStats, rtCaches, ds, rootProvenance)
-	} else {
-		pipeStats.mu.Lock()
-		pipeStats.StageC.TotalRoots = len(rootsRanked)
-		pipeStats.StageC.LostRoots = len(rootsRanked)
-		pipeStats.mu.Unlock()
-	}
+	RunStageC(ctx, rootsRanked, domainProviders, cfg, httpClient, pipeStats, rtCaches, ds, rootProvenance)
 
 	var allDomains []string
 	ds.mu.RLock()
