@@ -87,7 +87,6 @@ var (
 	stampRe  = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
 
 	ErrProviderNoData = errors.New("provider returned no data")
-	ErrDNSNXDomain    = errors.New("NXDOMAIN")
 )
 
 type Config struct {
@@ -115,10 +114,9 @@ type Config struct {
 	NoPassive        bool
 	NoReverseIP      bool
 
-	VTKey        string
-	URLScanKey   string
-	ChaosKey     string
-	SecTrailsKey string
+	VTKey      string
+	URLScanKey string
+	ChaosKey   string
 }
 
 // ================= EVIDENCE & PROVENANCE =================
@@ -135,7 +133,6 @@ const (
 	SourceHackerTarget
 	SourceVirusTotalDomain
 	SourceVirusTotalIP
-	SourceSecurityTrails
 	SourceChaos
 	SourceURLScan
 	SourceAnubis
@@ -173,9 +170,6 @@ func rankRootSources(s DomainSource) int {
 	if s.Has(SourceVirusTotalIP) || s.Has(SourceVirusTotalDomain) {
 		score += 6
 	}
-	if s.Has(SourceSecurityTrails) {
-		score += 5
-	}
 	if s.Has(SourceChaos) {
 		score += 5
 	}
@@ -197,7 +191,6 @@ func rankRootSources(s DomainSource) int {
 	return score
 }
 
-// Pipeline-scoped state to avoid global variable contamination across re-runs.
 type DiscoveryState struct {
 	mu                          sync.RWMutex
 	domainEvidence              map[string]Evidence
@@ -216,25 +209,19 @@ func NewDiscoveryState() *DiscoveryState {
 	}
 }
 
-func (s *DiscoveryState) acceptDomainLocked(d string) bool {
-	if _, exists := s.domainsToResolve[d]; exists {
-		return true
-	}
-	if s.domainsCount >= MaxDiscoveredDomains {
-		s.droppedDomainsByGlobalLimit++
-		return false
-	}
-	s.domainsToResolve[d] = struct{}{}
-	s.domainsCount++
-	return true
-}
-
 func (s *DiscoveryState) AddDomainSource(d string, direct, inherited DomainSource) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.acceptDomainLocked(d) {
-		return
+
+	if _, exists := s.domainsToResolve[d]; !exists {
+		if s.domainsCount >= MaxDiscoveredDomains {
+			s.droppedDomainsByGlobalLimit++
+			return
+		}
+		s.domainsToResolve[d] = struct{}{}
+		s.domainsCount++
 	}
+
 	ev := s.domainEvidence[d]
 	ev.Direct |= direct
 	ev.Inherited |= inherited
@@ -244,9 +231,16 @@ func (s *DiscoveryState) AddDomainSource(d string, direct, inherited DomainSourc
 func (s *DiscoveryState) AddPairSource(ip, d string, src DomainSource) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.acceptDomainLocked(d) {
-		return
+
+	if _, exists := s.domainsToResolve[d]; !exists {
+		if s.domainsCount >= MaxDiscoveredDomains {
+			s.droppedDomainsByGlobalLimit++
+			return
+		}
+		s.domainsToResolve[d] = struct{}{}
+		s.domainsCount++
 	}
+
 	key := ip + "\x00" + d
 	evP := s.pairEvidence[key]
 	evP.Direct |= src
@@ -381,6 +375,22 @@ const (
 	StatWaitCanceled
 )
 
+type StageCStats struct {
+	TotalRoots     int
+	Assigned       int
+	Executed       int
+	Success        int
+	NoData         int
+	Partial        int
+	Failed         int
+	Skipped        int
+	Reassigned     int
+	
+	CompletedRoots int
+	LostRoots      int
+	CanceledRoots  int
+}
+
 type PipelineStats struct {
 	mu                    sync.Mutex
 	IPSampled             int
@@ -410,6 +420,7 @@ type PipelineStats struct {
 	CDNDropped            int
 
 	Alloc         TotalAllocationStats
+	StageC        StageCStats
 	ProviderStats map[string]*ProviderStats
 }
 
@@ -467,7 +478,6 @@ func (s *PipelineStats) recordProviderStat(name string, cat DiscoveryCategory, r
 	}
 }
 
-// Pipeline-scoped caches to avoid global leakage.
 type RuntimeCaches struct {
 	ProvCache *SafeCache
 	ProvGroup *singleflight.Group
@@ -507,7 +517,9 @@ func (c *SafeDNSCache) Get(key string) (*DNSCacheEntry, bool) {
 	}
 	if time.Now().After(v.Expires) {
 		c.mu.Lock()
-		delete(c.data, key)
+		if v2, ok2 := c.data[key]; ok2 && time.Now().After(v2.Expires) {
+			delete(c.data, key)
+		}
 		c.mu.Unlock()
 		return nil, false
 	}
@@ -529,6 +541,7 @@ func (c *SafeDNSCache) Put(key string, entry *DNSCacheEntry, ttl time.Duration) 
 
 type CacheItem struct {
 	Values  []string
+	Status  StatResult
 	Expires time.Time
 }
 
@@ -540,26 +553,31 @@ type SafeCache struct {
 func NewSafeCache() *SafeCache {
 	return &SafeCache{data: make(map[string]CacheItem)}
 }
-func (c *SafeCache) Get(key string) ([]string, bool) {
+
+func (c *SafeCache) Get(key string) ([]string, StatResult, bool) {
 	c.mu.RLock()
 	v, ok := c.data[key]
 	c.mu.RUnlock()
 	if !ok {
-		return nil, false
+		return nil, StatFailed, false
 	}
 	if time.Now().After(v.Expires) {
 		c.mu.Lock()
-		delete(c.data, key)
+		if v2, ok2 := c.data[key]; ok2 && time.Now().After(v2.Expires) {
+			delete(c.data, key)
+		}
 		c.mu.Unlock()
-		return nil, false
+		return nil, StatFailed, false
 	}
-	return append([]string(nil), v.Values...), true
+	return append([]string(nil), v.Values...), v.Status, true
 }
-func (c *SafeCache) Put(key string, vals []string, ttl time.Duration) {
+
+func (c *SafeCache) Put(key string, vals []string, status StatResult, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.data[key] = CacheItem{
 		Values:  append([]string(nil), vals...),
+		Status:  status,
 		Expires: time.Now().Add(ttl),
 	}
 }
@@ -1116,6 +1134,11 @@ type ProviderConfig struct {
 	MaxPages      int
 }
 
+type ExecResult struct {
+	Names  []string
+	Status StatResult
+}
+
 type SNIProvider interface {
 	Name() string
 	Category() DiscoveryCategory
@@ -1177,6 +1200,7 @@ func (r *ProviderRunner) waitRate(ctx context.Context) error {
 
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
+
 	select {
 	case <-timer.C:
 		return nil
@@ -1235,12 +1259,12 @@ func isTransientProviderError(err error) bool {
 	return false
 }
 
-func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http.Client, pipeStats *PipelineStats, rtCaches *RuntimeCaches) []string {
+func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http.Client, pipeStats *PipelineStats, rtCaches *RuntimeCaches) ExecResult {
 	statName := r.StatsKey()
 	cacheKey := fmt.Sprintf("%s:%d:%s:maxnames=%d:maxpages=%d", r.Name(), r.QueryType(), query, r.Config.MaxNames, r.Config.MaxPages)
 
-	if cached, ok := rtCaches.ProvCache.Get(cacheKey); ok {
-		return cached
+	if cached, status, ok := rtCaches.ProvCache.Get(cacheKey); ok {
+		return ExecResult{Names: cached, Status: status}
 	}
 
 	v, _, _ := rtCaches.ProvGroup.Do(cacheKey, func() (interface{}, error) {
@@ -1251,7 +1275,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 
 		if cbOpen {
 			pipeStats.recordProviderStat(statName, r.Category(), StatSkipped, false, 0, 0, 0, 0, 0, 0, fmt.Sprintf("circuit-open until %s", cbUntil.Format(time.RFC3339)), 0)
-			return nil, nil
+			return ExecResult{nil, StatSkipped}, nil
 		}
 
 		var (
@@ -1263,14 +1287,14 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		for attempt := 1; attempt <= providerMaxAttempts; attempt++ {
 			if errWait := r.waitRate(ctx); errWait != nil {
 				pipeStats.recordProviderStat(statName, r.Category(), StatWaitCanceled, false, 0, 0, 0, 0, 0, 0, fmt.Sprintf("wait cancelled: %v", errWait), retries)
-				return nil, errWait
+				return ExecResult{nil, StatWaitCanceled}, nil
 			}
 
 			if r.sem != nil {
 				select {
 				case r.sem <- struct{}{}:
 				case <-ctx.Done():
-					return nil, ctx.Err()
+					return ExecResult{nil, StatWaitCanceled}, nil
 				}
 			}
 
@@ -1287,7 +1311,12 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			}
 
 			if errors.Is(err, context.Canceled) {
-				break // Fatal cancellation of the pipeline, DO NOT RETRY
+				break
+			}
+
+			httpStatus := providerHTTPStatus(err)
+			if httpStatus == http.StatusTooManyRequests {
+				break
 			}
 
 			if !isTransientProviderError(err) || attempt == providerMaxAttempts {
@@ -1309,14 +1338,13 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ExecResult{nil, StatWaitCanceled}, nil
 			}
 		}
 
 		httpStatus := providerHTTPStatus(err)
 		isTimeout := errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)
 
-		// Validation and Metrics
 		rawCount := len(rawRes)
 		var validRes []string
 		invalidCount := 0
@@ -1348,14 +1376,14 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				r.mu.Unlock()
 
 				pipeStats.recordProviderStat(statName, r.Category(), StatNoData, false, 0, 0, 0, 0, 0, httpStatus, err.Error(), retries)
-				rtCaches.ProvCache.Put(cacheKey, []string{}, 2*time.Minute)
-				return []string{}, nil
+				rtCaches.ProvCache.Put(cacheKey, []string{}, StatNoData, 2*time.Minute)
+				return ExecResult{[]string{}, StatNoData}, nil
 			}
 
 			if len(cleanRes) > 0 {
 				pipeStats.recordProviderStat(statName, r.Category(), StatPartial, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), retries)
-				// Do not cache Partial, allows recovery on next attempts.
-				return cleanRes, nil
+				rtCaches.ProvCache.Put(cacheKey, cleanRes, StatPartial, 2*time.Minute)
+				return ExecResult{cleanRes, StatPartial}, nil
 			}
 
 			pipeStats.recordProviderStat(statName, r.Category(), StatFailed, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), retries)
@@ -1363,7 +1391,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			if isTransientProviderError(err) && !errors.Is(err, context.Canceled) {
 				r.mu.Lock()
 				r.cbFailures++
-				if r.cbFailures >= providerCBThreshold {
+				if r.cbFailures >= providerCBThreshold || httpStatus == http.StatusTooManyRequests {
 					cooldown := providerCBCooldown
 					if httpStatus == http.StatusTooManyRequests {
 						cooldown = provider429CBCooldown
@@ -1376,7 +1404,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				r.cbFailures = 0
 				r.mu.Unlock()
 			}
-			return nil, err
+			return ExecResult{nil, StatFailed}, nil
 		}
 
 		r.mu.Lock()
@@ -1386,27 +1414,25 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 
 		if len(cleanRes) == 0 {
 			pipeStats.recordProviderStat(statName, r.Category(), StatNoData, false, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, "http 200: no valid names found", retries)
-			rtCaches.ProvCache.Put(cacheKey, []string{}, 2*time.Minute)
-			return []string{}, nil
+			rtCaches.ProvCache.Put(cacheKey, []string{}, StatNoData, 2*time.Minute)
+			return ExecResult{[]string{}, StatNoData}, nil
 		}
 
 		pipeStats.recordProviderStat(statName, r.Category(), StatSuccess, false, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, 0, "", retries)
-		rtCaches.ProvCache.Put(cacheKey, cleanRes, 10*time.Minute)
-		return cleanRes, nil
+		rtCaches.ProvCache.Put(cacheKey, cleanRes, StatSuccess, 10*time.Minute)
+		return ExecResult{cleanRes, StatSuccess}, nil
 	})
 
 	if v != nil {
-		return v.([]string)
+		return v.(ExecResult)
 	}
-	return nil
+	return ExecResult{nil, StatFailed}
 }
 
 // -------------------------------------------------
 // Implementations: Free Providers (No API Keys)
 // -------------------------------------------------
-
 type shodanInternetDBProvider struct{}
-
 func (p *shodanInternetDBProvider) Name() string                 { return "Shodan InternetDB" }
 func (p *shodanInternetDBProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *shodanInternetDBProvider) QueryType() ProviderQueryType { return QueryIP }
@@ -1423,14 +1449,12 @@ func (p *shodanInternetDBProvider) Fetch(ctx context.Context, query string, clie
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrProviderNoData
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
-
 	var res struct {
 		Hostnames []string `json:"hostnames"`
 	}
@@ -1441,7 +1465,6 @@ func (p *shodanInternetDBProvider) Fetch(ctx context.Context, query string, clie
 }
 
 type anubisProvider struct{}
-
 func (p *anubisProvider) Name() string                 { return "Anubis DB" }
 func (p *anubisProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *anubisProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1458,7 +1481,6 @@ func (p *anubisProvider) Fetch(ctx context.Context, query string, client *http.C
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1470,7 +1492,6 @@ func (p *anubisProvider) Fetch(ctx context.Context, query string, client *http.C
 }
 
 type threatMinerProvider struct{}
-
 func (p *threatMinerProvider) Name() string                 { return "ThreatMiner" }
 func (p *threatMinerProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *threatMinerProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1487,7 +1508,6 @@ func (p *threatMinerProvider) Fetch(ctx context.Context, query string, client *h
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1501,7 +1521,6 @@ func (p *threatMinerProvider) Fetch(ctx context.Context, query string, client *h
 }
 
 type hackerTargetHostSearchProvider struct{}
-
 func (p *hackerTargetHostSearchProvider) Name() string                 { return "HT HostSearch" }
 func (p *hackerTargetHostSearchProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *hackerTargetHostSearchProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1518,19 +1537,15 @@ func (p *hackerTargetHostSearchProvider) Fetch(ctx context.Context, query string
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
-
 	buf := new(bytes.Buffer)
 	_, _ = buf.ReadFrom(resp.Body)
 	content := buf.String()
-
 	if strings.Contains(strings.ToLower(content), "api count exceeded") {
 		return nil, &ProviderHTTPError{StatusCode: http.StatusTooManyRequests, Body: content}
 	}
-
 	var result []string
 	for _, line := range strings.Split(content, "\n") {
 		parts := strings.Split(line, ",")
@@ -1542,7 +1557,6 @@ func (p *hackerTargetHostSearchProvider) Fetch(ctx context.Context, query string
 }
 
 type crtShProvider struct{}
-
 func (p *crtShProvider) Name() string                 { return "crt.sh" }
 func (p *crtShProvider) Category() DiscoveryCategory  { return CatCertificate }
 func (p *crtShProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1559,7 +1573,6 @@ func (p *crtShProvider) Fetch(ctx context.Context, query string, client *http.Cl
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1579,7 +1592,6 @@ func (p *crtShProvider) Fetch(ctx context.Context, query string, client *http.Cl
 }
 
 type certSpotterProvider struct{}
-
 func (p *certSpotterProvider) Name() string                 { return "CertSpotter" }
 func (p *certSpotterProvider) Category() DiscoveryCategory  { return CatCertificate }
 func (p *certSpotterProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1591,24 +1603,20 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 	if maxPages <= 0 {
 		maxPages = 1
 	}
-
 	for page := 0; page < maxPages; page++ {
 		u := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", url.QueryEscape(query))
 		if after != "" {
 			u += "&after=" + url.QueryEscape(after)
 		}
-
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return result, err
 		}
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
-
 		resp, err := client.Do(req)
 		if err != nil {
 			return result, err
 		}
-
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1617,7 +1625,6 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 			}
 			return nil, errProv
 		}
-
 		var issuances []struct {
 			ID       string   `json:"id"`
 			DNSNames []string `json:"dns_names"`
@@ -1630,11 +1637,9 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 			}
 			return nil, err
 		}
-
 		if len(issuances) == 0 {
 			break
 		}
-
 		previousAfter := after
 		for _, iss := range issuances {
 			result = append(result, iss.DNSNames...)
@@ -1648,7 +1653,6 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 }
 
 type alienVaultProvider struct{}
-
 func (p *alienVaultProvider) Name() string                 { return "AlienVault" }
 func (p *alienVaultProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *alienVaultProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1659,7 +1663,6 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 	if maxPages <= 0 {
 		maxPages = 1
 	}
-
 	u := fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/domain/%s/passive_dns", url.QueryEscape(query))
 	for page := 0; page < maxPages; page++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -1667,12 +1670,10 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			return result, err
 		}
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
-
 		resp, err := client.Do(req)
 		if err != nil {
 			return result, err
 		}
-
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1681,7 +1682,6 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			}
 			return nil, errProv
 		}
-
 		var otxRes struct {
 			PassiveDNS []struct {
 				Hostname string `json:"hostname"`
@@ -1696,15 +1696,12 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			}
 			return nil, err
 		}
-
 		for _, entry := range otxRes.PassiveDNS {
 			result = append(result, entry.Hostname)
 		}
-
 		if otxRes.Next == "" {
 			break
 		}
-
 		previousURL := u
 		if !strings.HasPrefix(otxRes.Next, "http") {
 			if strings.HasPrefix(otxRes.Next, "/api") {
@@ -1714,7 +1711,7 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			}
 		} else {
 			if !strings.HasPrefix(otxRes.Next, "https://otx.alienvault.com") {
-				break // Avoid SSRF/leaving domain
+				break
 			}
 			u = otxRes.Next
 		}
@@ -1726,13 +1723,11 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 }
 
 type waybackProvider struct{}
-
 func (p *waybackProvider) Name() string                 { return "WaybackMachine" }
 func (p *waybackProvider) Category() DiscoveryCategory  { return CatArchive }
 func (p *waybackProvider) QueryType() ProviderQueryType { return QueryDomain }
 func (p *waybackProvider) SourceBit() DomainSource      { return SourceWayback }
 func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.Client, cfg ProviderConfig) ([]string, error) {
-	// Single sweep limit due to lack of stable fast pagination
 	u := fmt.Sprintf("https://web.archive.org/cdx/search/cdx?url=*.%s/*&output=json&collapse=urlkey&fl=original&limit=10000", url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -1744,7 +1739,6 @@ func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1765,7 +1759,6 @@ func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.
 }
 
 type hackerTargetProvider struct{}
-
 func (p *hackerTargetProvider) Name() string                 { return "HackerTarget" }
 func (p *hackerTargetProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *hackerTargetProvider) QueryType() ProviderQueryType { return QueryIP }
@@ -1782,7 +1775,6 @@ func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, makeProviderHTTPError(resp)
 	}
@@ -1798,9 +1790,7 @@ func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *
 // -------------------------------------------------
 // Implementations: Enterprise API Providers
 // -------------------------------------------------
-
 type vtDomainProvider struct{ Key string }
-
 func (p *vtDomainProvider) Name() string                 { return "VirusTotal" }
 func (p *vtDomainProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *vtDomainProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -1812,7 +1802,6 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 	if maxPages <= 0 {
 		maxPages = 3
 	}
-
 	for page := 0; page < maxPages; page++ {
 		u := fmt.Sprintf("https://www.virustotal.com/api/v3/domains/%s/subdomains?limit=40", url.QueryEscape(query))
 		if cursor != "" {
@@ -1822,14 +1811,12 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 		if err != nil {
 			return subs, err
 		}
-
 		req.Header.Add("x-apikey", p.Key)
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
 		resp, err := client.Do(req)
 		if err != nil {
 			return subs, err
 		}
-
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1854,7 +1841,6 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 			}
 			return nil, err
 		}
-
 		for _, item := range res.Data {
 			subs = append(subs, item.Id)
 		}
@@ -1867,7 +1853,6 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 }
 
 type vtIPProvider struct{ Key string }
-
 func (p *vtIPProvider) Name() string                 { return "VirusTotal" }
 func (p *vtIPProvider) Category() DiscoveryCategory  { return CatReverseIP }
 func (p *vtIPProvider) QueryType() ProviderQueryType { return QueryIP }
@@ -1879,7 +1864,6 @@ func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Cli
 	if maxPages <= 0 {
 		maxPages = 3
 	}
-
 	for page := 0; page < maxPages; page++ {
 		u := fmt.Sprintf("https://www.virustotal.com/api/v3/ip_addresses/%s/resolutions?limit=40", url.QueryEscape(query))
 		if cursor != "" {
@@ -1889,14 +1873,12 @@ func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Cli
 		if err != nil {
 			return subs, err
 		}
-
 		req.Header.Add("x-apikey", p.Key)
 		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
 		resp, err := client.Do(req)
 		if err != nil {
 			return subs, err
 		}
-
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1923,7 +1905,6 @@ func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Cli
 			}
 			return nil, err
 		}
-
 		for _, item := range res.Data {
 			subs = append(subs, item.Attributes.HostName)
 		}
@@ -1948,19 +1929,16 @@ type URLScanSearchResponse struct {
 func fetchURLScanSearch(ctx context.Context, query string, key string, client *http.Client, maxPages int) ([]string, error) {
 	var domains []string
 	searchAfter := ""
-
 	if maxPages <= 0 {
 		maxPages = 1
 	}
-
 	for page := 0; page < maxPages; page++ {
 		values := url.Values{}
 		values.Set("q", query)
-		values.Set("size", "10000") // URLScan API v1 max allowed
+		values.Set("size", "10000")
 		if searchAfter != "" {
 			values.Set("search_after", searchAfter)
 		}
-
 		reqURL := "https://urlscan.io/api/v1/search/?" + values.Encode()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
@@ -1973,7 +1951,6 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 		if err != nil {
 			return domains, err
 		}
-
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -1982,7 +1959,6 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 			}
 			return nil, errProv
 		}
-
 		var res URLScanSearchResponse
 		err = json.NewDecoder(resp.Body).Decode(&res)
 		resp.Body.Close()
@@ -1992,42 +1968,50 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 			}
 			return nil, err
 		}
-
 		for _, item := range res.Results {
 			domains = append(domains, item.Page.Domain)
 		}
-
 		if !res.HasMore || len(res.Results) == 0 {
 			break
 		}
 
 		lastSort := res.Results[len(res.Results)-1].Sort
 		if len(lastSort) > 0 {
-			b, _ := json.Marshal(lastSort)
-			newSearchAfter := string(b)
+			parts := make([]string, 0, len(lastSort))
+			for _, raw := range lastSort {
+				var v interface{}
+				if err := json.Unmarshal(raw, &v); err != nil {
+					return domains, fmt.Errorf("invalid urlscan sort value: %w", err)
+				}
+				switch x := v.(type) {
+				case string:
+					parts = append(parts, x)
+				default:
+					parts = append(parts, fmt.Sprint(x))
+				}
+			}
+			newSearchAfter := strings.Join(parts, ",")
 			if searchAfter == newSearchAfter {
-				break // Prevents looping if cursor doesn't move
+				break
 			}
 			searchAfter = newSearchAfter
 		} else {
-			break // Cannot paginate without sort array
+			break
 		}
 	}
 	return domains, nil
 }
 
 type urlScanDomainProvider struct{ Key string }
-
 func (p *urlScanDomainProvider) Name() string                 { return "URLScan" }
 func (p *urlScanDomainProvider) Category() DiscoveryCategory  { return CatArchive }
 func (p *urlScanDomainProvider) QueryType() ProviderQueryType { return QueryDomain }
 func (p *urlScanDomainProvider) SourceBit() DomainSource      { return SourceURLScan }
 func (p *urlScanDomainProvider) Fetch(ctx context.Context, query string, client *http.Client, cfg ProviderConfig) ([]string, error) {
-	return fetchURLScanSearch(ctx, "page.domain:"+query, p.Key, client, cfg.MaxPages)
+	return fetchURLScanSearch(ctx, "domain:"+query, p.Key, client, cfg.MaxPages)
 }
 
 type urlScanIPProvider struct{ Key string }
-
 func (p *urlScanIPProvider) Name() string                 { return "URLScan" }
 func (p *urlScanIPProvider) Category() DiscoveryCategory  { return CatArchive }
 func (p *urlScanIPProvider) QueryType() ProviderQueryType { return QueryIP }
@@ -2036,43 +2020,7 @@ func (p *urlScanIPProvider) Fetch(ctx context.Context, query string, client *htt
 	return fetchURLScanSearch(ctx, "page.ip:"+query, p.Key, client, cfg.MaxPages)
 }
 
-type securityTrailsProvider struct{ Key string }
-
-func (p *securityTrailsProvider) Name() string                 { return "SecurityTrails" }
-func (p *securityTrailsProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
-func (p *securityTrailsProvider) QueryType() ProviderQueryType { return QueryDomain }
-func (p *securityTrailsProvider) SourceBit() DomainSource      { return SourceSecurityTrails }
-func (p *securityTrailsProvider) Fetch(ctx context.Context, query string, client *http.Client, cfg ProviderConfig) ([]string, error) {
-	u := fmt.Sprintf("https://api.securitytrails.com/v1/domain/%s/subdomains", url.QueryEscape(query))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("APIKEY", p.Key)
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, makeProviderHTTPError(resp)
-	}
-	var res struct {
-		Subdomains []string `json:"subdomains"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, err
-	}
-	var subs []string
-	for _, sub := range res.Subdomains {
-		subs = append(subs, sub+"."+query)
-	}
-	return subs, nil
-}
-
 type chaosProvider struct{ Key string }
-
 func (p *chaosProvider) Name() string                 { return "Chaos" }
 func (p *chaosProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *chaosProvider) QueryType() ProviderQueryType { return QueryDomain }
@@ -2109,18 +2057,23 @@ func (p *chaosProvider) Fetch(ctx context.Context, query string, client *http.Cl
 // ================= PIPELINE SCHEDULING & SAMPLING =================
 
 func sampleForProvider(sampled []string, limit int, seed int64, providerIndex int) []string {
-	if limit <= 0 || limit >= len(sampled) {
-		out := make([]string, len(sampled))
+	n := len(sampled)
+	if limit <= 0 || limit >= n {
+		out := make([]string, n)
 		copy(out, sampled)
 		return out
 	}
-	// Safe derivation avoiding overflow issues by casting to uint64 early
 	h := uint64(seed) + uint64(providerIndex)*0x9E3779B97F4A7C15
 	rng := rand.New(rand.NewSource(int64(h)))
-	indices := rng.Perm(len(sampled))
 
+	indices := make([]int, n)
+	for i := 0; i < n; i++ {
+		indices[i] = i
+	}
 	out := make([]string, limit)
 	for i := 0; i < limit; i++ {
+		j := i + rng.Intn(n-i)
+		indices[i], indices[j] = indices[j], indices[i]
 		out[i] = sampled[indices[i]]
 	}
 	return out
@@ -2152,8 +2105,6 @@ func containsRoot(list []RootCandidate, root string) bool {
 	return false
 }
 
-// distributeRoots splits roots primarily based on MaxRoots limits per provider,
-// then allows cyclic overlapping cross-validation wrapping around the roots array.
 func distributeRoots(roots []RootCandidate, providers []*ProviderRunner, overlapPercent int, cfg Config) (map[*ProviderRunner][]RootCandidate, TotalAllocationStats) {
 	stats := TotalAllocationStats{
 		TotalRoots:         len(roots),
@@ -2166,73 +2117,64 @@ func distributeRoots(roots []RootCandidate, providers []*ProviderRunner, overlap
 		return result, stats
 	}
 
-	primaryCapacity := make(map[*ProviderRunner]int)
-	overlapCapacity := make(map[*ProviderRunner]int)
-	primaryStartIdx := make(map[*ProviderRunner]int)
-
+	capacity := make(map[*ProviderRunner]int)
 	for _, p := range providers {
+		result[p] = make([]RootCandidate, 0)
 		limit := effectiveRootLimit(p, cfg)
 		if limit <= 0 {
 			limit = len(roots)
 		}
-		if overlapPercent > 0 {
-			prim := (limit * 100) / (100 + overlapPercent)
-			if prim == 0 {
-				prim = 1
+		capacity[p] = limit
+	}
+
+	rootIdx := 0
+	for rootIdx < len(roots) {
+		assignedThisRound := 0
+		for _, p := range providers {
+			if rootIdx >= len(roots) {
+				break
 			}
-			ov := limit - prim
-			primaryCapacity[p] = prim
-			overlapCapacity[p] = ov
-		} else {
-			primaryCapacity[p] = limit
-			overlapCapacity[p] = 0
+			if len(result[p]) < capacity[p] {
+				result[p] = append(result[p], roots[rootIdx])
+				stats.PrimaryAssignments[p.StatsKey()]++
+				stats.AssignedRoots++
+				rootIdx++
+				assignedThisRound++
+			}
 		}
-		result[p] = make([]RootCandidate, 0)
+		if assignedThisRound == 0 {
+			break
+		}
 	}
+	stats.UnassignedRoots = len(roots) - rootIdx
 
-	cursor := 0
-	for _, p := range providers {
-		cap := primaryCapacity[p]
-		end := cursor + cap
-		if end > len(roots) {
-			end = len(roots)
-		}
-		primaryStartIdx[p] = cursor
-		if cursor < end {
-			result[p] = append(result[p], roots[cursor:end]...)
-			stats.AssignedRoots += (end - cursor)
-			stats.PrimaryAssignments[p.Name()] += (end - cursor)
-			cursor = end
-		}
-	}
-	stats.UnassignedRoots = len(roots) - cursor
-	if stats.UnassignedRoots < 0 {
-		stats.UnassignedRoots = 0
-	}
-
-	// Add cyclic overlap from the global roots slice
 	if overlapPercent > 0 {
 		for _, p := range providers {
-			ovCap := overlapCapacity[p]
-			if ovCap <= 0 {
+			remaining := capacity[p] - len(result[p])
+			if remaining <= 0 {
 				continue
 			}
-			primLen := len(result[p])
-			if primLen == 0 {
-				continue
-			}
-			// Begin overlap window right after this provider's primary allocation ends
-			startIdx := (primaryStartIdx[p] + primLen) % len(roots)
-			added := 0
 
+			ovCap := (capacity[p] * overlapPercent) / 100
+			if ovCap <= 0 {
+				ovCap = 1
+			}
+			if ovCap > remaining {
+				ovCap = remaining
+			}
+
+			added := 0
 			for j := 0; j < len(roots) && added < ovCap; j++ {
-				cand := roots[(startIdx+j)%len(roots)]
-				if !containsRoot(result[p], cand.Domain) {
-					result[p] = append(result[p], cand)
-					stats.OverlapAssignments[p.Name()]++
-					stats.OverlappedAssignments++
-					added++
+				cand := roots[j]
+
+				if containsRoot(result[p], cand.Domain) {
+					continue
 				}
+
+				result[p] = append(result[p], cand)
+				stats.OverlapAssignments[p.StatsKey()]++
+				stats.OverlappedAssignments++
+				added++
 			}
 		}
 	}
@@ -2267,9 +2209,9 @@ func runProviderJobs(
 					if !ok {
 						return nil
 					}
-					results := provider.Execute(gctx, q, client, pipeStats, rtCaches)
-					if len(results) > 0 {
-						handler(q, results)
+					res := provider.Execute(gctx, q, client, pipeStats, rtCaches)
+					if len(res.Names) > 0 {
+						handler(q, res.Names)
 					}
 				}
 			}
@@ -2291,7 +2233,232 @@ func runProviderJobs(
 	return g.Wait()
 }
 
-// SnapshotAndPrint safely locks the telemetry, deep copies what's needed, unlocks and prints
+type RootState uint8
+
+const (
+	RootPending RootState = iota
+	RootCompleted
+	RootLost
+	RootCanceled
+)
+
+func RunStageC(
+	ctx context.Context,
+	roots []RootCandidate,
+	providers []*ProviderRunner,
+	cfg Config,
+	client *http.Client,
+	pipeStats *PipelineStats,
+	rtCaches *RuntimeCaches,
+	ds *DiscoveryState,
+	rootProvenance map[string]DomainSource,
+) {
+	providerRoots, allocStats := distributeRoots(roots, providers, 20, cfg)
+
+	pipeStats.mu.Lock()
+	pipeStats.Alloc = allocStats
+	pipeStats.StageC.TotalRoots = len(roots)
+	pipeStats.StageC.Assigned = allocStats.AssignedRoots + allocStats.OverlappedAssignments
+	pipeStats.mu.Unlock()
+
+	providerLimits := make(map[*ProviderRunner]int)
+	providerUsed := make(map[*ProviderRunner]int)
+	for _, p := range providers {
+		limit := effectiveRootLimit(p, cfg)
+		if limit <= 0 {
+			limit = 999999
+		}
+		providerLimits[p] = limit
+		providerUsed[p] = len(providerRoots[p])
+	}
+
+	jobQueues := make(map[*ProviderRunner]chan RootCandidate)
+	for _, p := range providers {
+		jobQueues[p] = make(chan RootCandidate, providerLimits[p]+1000)
+	}
+
+	var stateMu sync.Mutex
+	rootStates := make(map[string]RootState)
+	history := make(map[string]map[*ProviderRunner]bool)
+	for _, r := range roots {
+		rootStates[r.Domain] = RootPending
+		history[r.Domain] = make(map[*ProviderRunner]bool)
+	}
+
+	markCompleted := func(domain string) bool {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if rootStates[domain] == RootPending {
+			rootStates[domain] = RootCompleted
+			pipeStats.mu.Lock()
+			pipeStats.StageC.CompletedRoots++
+			pipeStats.mu.Unlock()
+			return true
+		}
+		return false
+	}
+
+	markLost := func(domain string) {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if rootStates[domain] == RootPending {
+			rootStates[domain] = RootLost
+			pipeStats.mu.Lock()
+			pipeStats.StageC.LostRoots++
+			pipeStats.mu.Unlock()
+		}
+	}
+
+	var activeTasks sync.WaitGroup
+	var workerWG sync.WaitGroup
+
+	for p, proots := range providerRoots {
+		for _, r := range proots {
+			history[r.Domain][p] = true
+			activeTasks.Add(1)
+			jobQueues[p] <- r
+		}
+	}
+
+	reassignCh := make(chan RootCandidate, len(roots)*len(providers))
+
+	for _, p := range providers {
+		p := p
+		workers := p.Config.MaxConcurrent
+		if workers <= 0 {
+			workers = 1
+		}
+
+		for i := 0; i < workers; i++ {
+			workerWG.Add(1)
+			go func() {
+				defer workerWG.Done()
+				for root := range jobQueues[p] {
+					if ctx.Err() != nil {
+						activeTasks.Done()
+						continue
+					}
+
+					res := p.Execute(ctx, root.Domain, client, pipeStats, rtCaches)
+
+					pipeStats.mu.Lock()
+					pipeStats.StageC.Executed++
+					switch res.Status {
+					case StatSuccess:
+						pipeStats.StageC.Success++
+					case StatNoData:
+						pipeStats.StageC.NoData++
+					case StatPartial:
+						pipeStats.StageC.Partial++
+					case StatFailed:
+						pipeStats.StageC.Failed++
+					case StatSkipped, StatWaitCanceled:
+						pipeStats.StageC.Skipped++
+					}
+					pipeStats.mu.Unlock()
+
+					needsReassign := (res.Status != StatSuccess)
+
+					if res.Status == StatSuccess {
+						markCompleted(root.Domain)
+					}
+
+					if ctx.Err() == nil && needsReassign {
+						activeTasks.Add(1)
+						reassignCh <- root
+					}
+
+					if len(res.Names) > 0 {
+						inheritedSrc := rootProvenance[root.Domain]
+						for _, d := range res.Names {
+							ds.AddDomainSource(d, p.SourceBit(), inheritedSrc)
+						}
+					}
+					activeTasks.Done()
+				}
+			}()
+		}
+	}
+
+	workerWG.Add(1)
+	go func() {
+		defer workerWG.Done()
+		for root := range reassignCh {
+			stateMu.Lock()
+			isCompleted := (rootStates[root.Domain] == RootCompleted)
+			stateMu.Unlock()
+
+			if isCompleted {
+				activeTasks.Done()
+				continue
+			}
+
+			stateMu.Lock()
+			tried := history[root.Domain]
+			var nextP *ProviderRunner
+
+			for _, p := range providers {
+				if !tried[p] {
+					p.mu.Lock()
+					cbOpen := !p.cbUntil.IsZero() && time.Now().Before(p.cbUntil)
+					p.mu.Unlock()
+
+					if !cbOpen && providerUsed[p] < providerLimits[p] {
+						nextP = p
+						break
+					}
+				}
+			}
+
+			if nextP != nil {
+				tried[nextP] = true
+				providerUsed[nextP]++
+				pipeStats.mu.Lock()
+				pipeStats.StageC.Reassigned++
+				pipeStats.mu.Unlock()
+
+				activeTasks.Add(1)
+				jobQueues[nextP] <- root
+			} else {
+				markLost(root.Domain)
+			}
+			stateMu.Unlock()
+			
+			activeTasks.Done()
+		}
+	}()
+
+	go func() {
+		activeTasks.Wait()
+		close(reassignCh)
+		for _, p := range providers {
+			close(jobQueues[p])
+		}
+	}()
+
+	waitCh := make(chan struct{})
+	go func() {
+		workerWG.Wait()
+		close(waitCh)
+	}()
+
+	select {
+	case <-waitCh:
+	case <-ctx.Done():
+	}
+
+	stateMu.Lock()
+	for _, r := range roots {
+		if rootStates[r.Domain] == RootPending {
+			rootStates[r.Domain] = RootCanceled
+			pipeStats.mu.Lock()
+			pipeStats.StageC.CanceledRoots++
+			pipeStats.mu.Unlock()
+		}
+	}
+	stateMu.Unlock()
+}
+
 func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *DiscoveryState) {
 	s.mu.Lock()
 	pSampled := s.IPSampled
@@ -2312,15 +2479,18 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 	pTCP := s.TCPConnected
 	pTLS := s.TLSHandshake
 	pTLSVal := s.TLSValidationFailures
+	pNoCert := s.NoPeerCertificates
 	pH2Head := s.H2HeadersOK
 
-	catMap := make(map[string]DiscoveryCategory)
+	fASN := s.ASNFiltered
+	fCountry := s.CountryFiltered
+
 	localStats := make(map[string]ProviderStats)
 	for k, v := range s.ProviderStats {
-		catMap[k] = v.Category
 		localStats[k] = *v
 	}
 	allocStats := s.Alloc
+	stageC := s.StageC
 	s.mu.Unlock()
 
 	ds.mu.RLock()
@@ -2338,11 +2508,20 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 		fmt.Printf("[!] Доменов отброшено глобальным лимитом (MaxDiscoveredDomains=%d): %d\n", MaxDiscoveredDomains, droppedGlobal)
 	}
 
-	fmt.Printf("\n[*] STAGE C: Domain OSINT Allocation Stats:\n")
-	fmt.Printf("    Total Roots:           %d\n", allocStats.TotalRoots)
-	fmt.Printf("    Primary Assignments:   %d\n", allocStats.AssignedRoots)
-	fmt.Printf("    Overlap Assignments:   %d\n", allocStats.OverlappedAssignments)
-	fmt.Printf("    Unassigned Roots:      %d\n", allocStats.UnassignedRoots)
+	fmt.Printf("\n[*] STAGE C: Domain OSINT Pipeline Stats:\n")
+	fmt.Printf("    Total Roots:           %d\n", stageC.TotalRoots)
+	fmt.Printf("    Assigned (Primary+Ov): %d\n", stageC.Assigned)
+	fmt.Printf("    Completed (Unique):    %d\n", stageC.CompletedRoots)
+	fmt.Printf("    Lost (Exhausted):      %d\n", stageC.LostRoots)
+	fmt.Printf("    Canceled (Timeout):    %d\n", stageC.CanceledRoots)
+	fmt.Printf("    --- Executions ---\n")
+	fmt.Printf("    Executed Calls:        %d\n", stageC.Executed)
+	fmt.Printf("    Success:               %d\n", stageC.Success)
+	fmt.Printf("    NoData:                %d\n", stageC.NoData)
+	fmt.Printf("    Partial:               %d\n", stageC.Partial)
+	fmt.Printf("    Failed:                %d\n", stageC.Failed)
+	fmt.Printf("    Skipped (CB/Rate):     %d\n", stageC.Skipped)
+	fmt.Printf("    Reassigned to next:    %d\n", stageC.Reassigned)
 
 	fmt.Println("\nSNI/Hostname Discovery Providers:")
 
@@ -2392,12 +2571,15 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", qTimeout, qTemp, qOther)
 	fmt.Printf("[*] Target Range IP Matches:   %d\n", qTargetMatches)
 	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", qTargetDomains)
+	fmt.Printf("[*] Отсеяно по ASN:            %d\n", fASN)
+	fmt.Printf("[*] Отсеяно по Country:        %d\n", fCountry)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", qValidPairs)
 	if droppedPairs > 0 {
 		fmt.Printf("[!] DNS-пар отброшено лимитом (LimitValidPairs=%d): %d\n", LimitValidPairs, droppedPairs)
 	}
 	fmt.Printf("[*] Успешных TCP соединений:   %d\n", pTCP)
 	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", pTLS)
+	fmt.Printf("[*] Отсутствие сертификатов:   %d\n", pNoCert)
 	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", pTLSVal)
 	fmt.Printf("[*] С откликом H2 Headers:     %d\n", pH2Head)
 	fmt.Printf("[*] Финальных IP-кластеров:    %d\n", clustered)
@@ -2591,6 +2773,9 @@ func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
 	if sampleSize > LimitMaxIPs {
 		sampleSize = LimitMaxIPs
 	}
+	if sampleSize == 0 {
+		return nil
+	}
 	rng := rand.New(rand.NewSource(seed))
 	currIdx := rng.Uint64() % totalIPs
 	var step uint64 = 1
@@ -2707,6 +2892,8 @@ func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]s
 	return ips, nil
 }
 
+var ErrDNSNXDomain = errors.New("NXDOMAIN")
+
 func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCaches *RuntimeCaches) ([]string, error) {
 	domain = CleanDomain(domain)
 	if domain == "" {
@@ -2721,7 +2908,7 @@ func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCach
 		}
 		ips, err := resolveIPv4DNSCrypt(ctx, pool, domain)
 		if errors.Is(err, ErrDNSNXDomain) {
-			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 1*time.Minute) // Short TTL for failures
+			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 1*time.Minute)
 			return nil, err
 		}
 		if err != nil {
@@ -2758,18 +2945,13 @@ type ProbeError struct {
 func (e *ProbeError) Error() string { return e.Err.Error() }
 
 func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
-	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+	conn.SetWriteDeadline(time.Now().Add(timeout))
+	n, err := conn.Write(b)
+	if err != nil {
 		return err
 	}
-	for len(b) > 0 {
-		n, err := conn.Write(b)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrUnexpectedEOF
-		}
-		b = b[n:]
+	if n != len(b) {
+		return fmt.Errorf("short write")
 	}
 	return nil
 }
@@ -2818,41 +3000,50 @@ func buildWindowUpdateFrame(streamID uint32, increment uint32) []byte {
 }
 
 func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) error {
-	var status int
+	weakCount := 0
+	blockStatus := 0
 	hasStatus := false
+
 	for _, h := range headers {
-		name := strings.ToLower(strings.TrimSpace(h.Name))
-		if name != ":status" {
-			continue
-		}
-		n, err := strconv.Atoi(strings.TrimSpace(h.Value))
-		if err != nil || n < 100 || n > 999 {
+		hName := strings.ToLower(strings.TrimSpace(h.Name))
+
+		if hName == ":status" {
+			n, err := strconv.Atoi(strings.TrimSpace(h.Value))
 			if err != nil {
 				return fmt.Errorf("invalid :status value %q: %w", h.Value, err)
 			}
-			return fmt.Errorf("invalid HTTP status: %d", n)
+			if n < 100 || n > 999 {
+				return fmt.Errorf("invalid HTTP status: %d", n)
+			}
+			blockStatus = n
+			hasStatus = true
 		}
-		status = n
-		hasStatus = true
 	}
+
 	if !hasStatus {
 		return fmt.Errorf("response HEADERS missing :status")
 	}
-	if status >= 100 && status < 200 {
+
+	isInformational := blockStatus >= 100 && blockStatus < 200
+	isFinalResponse := blockStatus >= 200
+
+	if isInformational {
 		return nil
 	}
-	if !cand.ResponseHeadersParsed {
-		cand.HTTPStatus = status
+
+	if isFinalResponse && !cand.ResponseHeadersParsed {
+		cand.HTTPStatus = blockStatus
 		cand.ResponseHeadersParsed = true
-		weakCount := 0
+
 		for _, h := range headers {
-			name := strings.ToLower(strings.TrimSpace(h.Name))
-			valueLower := strings.ToLower(h.Value)
-			switch name {
+			hName := strings.ToLower(strings.TrimSpace(h.Name))
+			hValLower := strings.ToLower(h.Value)
+
+			switch hName {
 			case "server":
 				cand.Server = h.Value
 				for _, cdn := range cdnStrong {
-					if strings.Contains(valueLower, cdn) {
+					if strings.Contains(hValLower, cdn) {
 						cand.CDNStatus = CDNConfirmed
 						cand.CDNProvider = cdn
 					}
@@ -2865,29 +3056,35 @@ func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) error {
 				cand.CDNStatus = CDNConfirmed
 				cand.CDNProvider = "cloudflare"
 			}
-			if strings.HasPrefix(name, "x-amz-cf-") || strings.HasPrefix(name, "x-sucuri-") || strings.HasPrefix(name, "x-akamai-") {
+
+			if strings.HasPrefix(hName, "x-amz-cf-") ||
+				strings.HasPrefix(hName, "x-sucuri-") ||
+				strings.HasPrefix(hName, "x-akamai-") {
 				cand.CDNStatus = CDNConfirmed
 				if cand.CDNProvider == "" {
 					cand.CDNProvider = "headers"
 				}
 			}
-			for _, weak := range cdnWeak {
-				if name == weak {
+
+			for _, cdnH := range cdnWeak {
+				if hName == cdnH {
 					weakCount++
 				}
 			}
 		}
+
 		if cand.CDNStatus == CDNStatusUnknown && weakCount > 0 {
 			cand.CDNStatus = CDNLikely
 		}
 	}
+
 	return nil
 }
 
 func parseTrailers(cand *Candidate, headers []hpack.HeaderField) error {
 	cand.ResponseTrailersSeen = true
 	for _, h := range headers {
-		if strings.HasPrefix(strings.TrimSpace(h.Name), ":") {
+		if len(h.Name) > 0 && h.Name[0] == ':' {
 			return fmt.Errorf("pseudo-header %q found in trailers", h.Name)
 		}
 	}
@@ -2915,7 +3112,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	t1 := time.Now()
 	uConn := utls.UClient(conn, &utls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: true, // Specifically skips cert verification for manual inspection below
+		InsecureSkipVerify: true,
 		NextProtos:         []string{"h2"},
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
@@ -2928,17 +3125,22 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	cand.Timings.TLS = time.Since(t1)
 	uConn.SetDeadline(time.Time{})
 
-	if uConn.ConnectionState().NegotiatedProtocol == "h2" {
+	state := uConn.ConnectionState()
+
+	if state.Version != tls.VersionTLS13 {
+		return cand, &ProbeError{
+			Stage: ProbeStageTLS,
+			Err:   fmt.Errorf("unexpected TLS version: 0x%x", state.Version),
+		}
+	}
+	cand.TLS13 = true
+
+	if state.NegotiatedProtocol == "h2" {
 		cand.ALPN = "h2"
 	} else {
 		cand.ALPN = "h2 (no ALPN)"
 	}
 
-	state := uConn.ConnectionState()
-	if state.Version != tls.VersionTLS13 {
-		return cand, &ProbeError{Stage: ProbeStageTLS, Err: fmt.Errorf("unexpected TLS version: 0x%x", state.Version)}
-	}
-	cand.TLS13 = true
 	if len(state.PeerCertificates) == 0 {
 		return cand, &ProbeError{Stage: ProbeStageTLSValidation, Err: fmt.Errorf("no peer certificates provided")}
 	}
@@ -2963,11 +3165,11 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 		opts.Intermediates.AddCert(c)
 	}
 
-	// CertChainValid here defines manual verification success
 	if _, err := cert.Verify(opts); err == nil {
 		cand.CertSNIMatch = true
 		cand.CertChainValid = true
 	} else {
+		cand.CertChainValid = false
 		cand.CertSNIMatch = (cert.VerifyHostname(sni) == nil)
 	}
 
@@ -3030,12 +3232,20 @@ ReadLoop:
 			}
 
 			switch frameType {
+			case FrameSettings, FrameGoAway:
+				if streamID != 0 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
+				}
+			case FrameHeaders, FrameData, FrameRSTStream, FrameContinuation:
+				if streamID == 0 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use non-zero stream", frameType)}
+				}
+			}
+
+			switch frameType {
 			case FrameSettings:
 				if length%6 != 0 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length")}
-				}
-				if streamID != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("SETTINGS on non-zero stream")}
 				}
 				if flags&FlagAck != 0 {
 					if length != 0 {
@@ -3102,6 +3312,7 @@ ReadLoop:
 
 			case FrameHeaders:
 				if streamID == 1 {
+					isTrailers := cand.EndStreamSeen
 					if (flags & FlagEndStream) != 0 {
 						cand.EndStreamSeen = true
 					}
@@ -3135,14 +3346,18 @@ ReadLoop:
 						if err != nil {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
-						if cand.ResponseHeadersParsed {
+
+						if !cand.ResponseHeadersParsed && !isTrailers {
+							if err := parseResponseHeaders(cand, headers); err != nil {
+								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
+							}
+						} else {
 							if err := parseTrailers(cand, headers); err != nil {
 								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 							}
-						} else if err := parseResponseHeaders(cand, headers); err != nil {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
 						headerBlocks.Reset()
+
 						if cand.ResponseHeadersParsed && !cand.H2HeadersReceived {
 							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
@@ -3150,26 +3365,34 @@ ReadLoop:
 					}
 				}
 			case FrameContinuation:
-				if streamID == activeStreamID {
-					headerBlocks.Write(payload)
-					if (flags & FlagEndHeaders) != 0 {
-						expectingContinuation = false
-						headers, err := decoder.DecodeFull(headerBlocks.Bytes())
-						if err != nil {
+				if !expectingContinuation {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("unexpected CONTINUATION frame")}
+				}
+				if streamID != activeStreamID {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("CONTINUATION stream mismatch: got %d, want %d", streamID, activeStreamID)}
+				}
+				headerBlocks.Write(payload)
+				if (flags & FlagEndHeaders) != 0 {
+					expectingContinuation = false
+					headers, err := decoder.DecodeFull(headerBlocks.Bytes())
+					if err != nil {
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
+					}
+
+					if !cand.ResponseHeadersParsed {
+						if err := parseResponseHeaders(cand, headers); err != nil {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
-						if cand.ResponseHeadersParsed {
-							if err := parseTrailers(cand, headers); err != nil {
-								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-							}
-						} else if err := parseResponseHeaders(cand, headers); err != nil {
+					} else {
+						if err := parseTrailers(cand, headers); err != nil {
 							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 						}
-						headerBlocks.Reset()
-						if cand.ResponseHeadersParsed && !cand.H2HeadersReceived {
-							cand.Timings.H2Headers = time.Since(requestSent)
-							cand.H2HeadersReceived = true
-						}
+					}
+					headerBlocks.Reset()
+
+					if cand.ResponseHeadersParsed && !cand.H2HeadersReceived {
+						cand.Timings.H2Headers = time.Since(requestSent)
+						cand.H2HeadersReceived = true
 					}
 				}
 			case FrameData:
@@ -3239,12 +3462,11 @@ ReadLoop:
 	if !cand.EndStreamSeen {
 		return cand, &ProbeError{Stage: ProbeStageComplete, Err: fmt.Errorf("response did not reach END_STREAM")}
 	}
+
 	if cand.H2SettingsReceived && cand.H2HeadersReceived && cand.HTTPStatus >= 200 && cand.EndStreamSeen {
 		cand.H2ProtocolConfirmed = true
 	}
-	if !cand.H2ProtocolConfirmed {
-		return cand, &ProbeError{Stage: ProbeStageComplete, Err: fmt.Errorf("HTTP/2 session not fully confirmed")}
-	}
+
 	return cand, nil
 }
 
@@ -3288,10 +3510,19 @@ func scoreH2Profile(c *Candidate) float64 {
 }
 
 func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bool {
+	if !cand.H2ProtocolConfirmed {
+		return false
+	}
+
 	rs := RealityScore{}
+
+	if cand.TLS13 {
+		rs.TLSQuality += 10.0
+	}
 	if cand.ALPN == "h2" {
 		rs.TLSQuality += 10.0
 	}
+
 	if cand.CertValidTime {
 		rs.Certificate += 5.0
 	}
@@ -3349,7 +3580,6 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 	scoreDirect(SourceAnubis, 1.0)
 	scoreDirect(SourceThreatMiner, 1.0)
 	scoreDirect(SourceHTDomain, 1.0)
-	scoreDirect(SourceSecurityTrails, 1.0)
 	scoreDirect(SourceChaos, 1.0)
 	scoreDirect(SourceSeed, 1.0)
 
@@ -3364,7 +3594,7 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 	if combinedSources.Has(SourceCRTSh) || combinedSources.Has(SourceCertSpotter) {
 		diversity++
 	}
-	if combinedSources.Has(SourceAlienVault) || combinedSources.Has(SourceWayback) || combinedSources.Has(SourceSecurityTrails) || combinedSources.Has(SourceChaos) || combinedSources.Has(SourceAnubis) || combinedSources.Has(SourceThreatMiner) || combinedSources.Has(SourceHTDomain) {
+	if combinedSources.Has(SourceAlienVault) || combinedSources.Has(SourceWayback) || combinedSources.Has(SourceChaos) || combinedSources.Has(SourceAnubis) || combinedSources.Has(SourceThreatMiner) || combinedSources.Has(SourceHTDomain) {
 		diversity++
 	}
 	if combinedSources.Has(SourceSeed) {
@@ -3451,9 +3681,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	if cfg.URLScanKey != "" {
 		extProviders = append(extProviders, NewRunner(&urlScanDomainProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxRoots: 100, MaxPages: 5}))
 		extProviders = append(extProviders, NewRunner(&urlScanIPProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxPages: 5}))
-	}
-	if cfg.SecTrailsKey != "" {
-		extProviders = append(extProviders, NewRunner(&securityTrailsProvider{Key: cfg.SecTrailsKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 2000, MaxRoots: 100, MaxPages: 1}))
 	}
 	if cfg.ChaosKey != "" {
 		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 2000, MaxRoots: 100, MaxPages: 1}))
@@ -3566,38 +3793,14 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		return rootsRanked[i].Domain < rootsRanked[j].Domain
 	})
 
-	providerRoots, allocStats := distributeRoots(rootsRanked, domainProviders, 20, cfg)
-	pipeStats.mu.Lock()
-	pipeStats.Alloc = allocStats
-	pipeStats.mu.Unlock()
-
 	fmt.Printf("[*] STAGE C: Domain OSINT (Distributing %d Roots)...\n", len(rootsRanked))
 	if len(domainProviders) > 0 {
-		gC, gCtxC := errgroup.WithContext(ctx)
-		for _, p := range domainProviders {
-			p := p
-			pRoots := providerRoots[p]
-			if len(pRoots) == 0 {
-				continue
-			}
-			queries := make([]string, len(pRoots))
-			for i, r := range pRoots {
-				queries[i] = r.Domain
-			}
-
-			gC.Go(func() error {
-				return runProviderJobs(gCtxC, p, queries, httpClient, pipeStats, rtCaches, func(q string, res []string) {
-					inheritedSrc := rootProvenance[q]
-					for _, d := range res {
-						ds.AddDomainSource(d, p.SourceBit(), inheritedSrc)
-					}
-				})
-			})
-		}
-		if err := gC.Wait(); err != nil || ctx.Err() != nil {
-			fmt.Println("[-] Выполнение прервано (Stage C).")
-			return nil
-		}
+		RunStageC(ctx, rootsRanked, domainProviders, cfg, httpClient, pipeStats, rtCaches, ds, rootProvenance)
+	} else {
+		pipeStats.mu.Lock()
+		pipeStats.StageC.TotalRoots = len(rootsRanked)
+		pipeStats.StageC.LostRoots = len(rootsRanked)
+		pipeStats.mu.Unlock()
 	}
 
 	var allDomains []string
@@ -3610,7 +3813,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	var validPairs []TargetPair
 	var pairSeen sync.Map
 
-	// Explicit direct mode SNI insertion
 	if cfg.Mode == ModeDirect && cfg.DirectSNI != "" {
 		sni := CleanDomain(cfg.DirectSNI)
 		if sni != "" {
@@ -3696,6 +3898,34 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				uniqueResolvedIPs.Store(resolvedIP, struct{}{})
 
 				if ipInRanges(resolvedIP, scanRanges) {
+					parsedIP := net.ParseIP(resolvedIP)
+					if parsedIP != nil {
+						var asn uint
+						var country string
+						if asnDB != nil {
+							if r, err := asnDB.ASN(parsedIP); err == nil {
+								asn = uint(r.AutonomousSystemNumber)
+							}
+						}
+						if countryDB != nil {
+							if r, err := countryDB.Country(parsedIP); err == nil {
+								country = r.Country.IsoCode
+							}
+						}
+						if cfg.TargetASN != 0 && asn != cfg.TargetASN {
+							pipeStats.mu.Lock()
+							pipeStats.ASNFiltered++
+							pipeStats.mu.Unlock()
+							continue
+						}
+						if cfg.TargetCountry != "" && !strings.EqualFold(country, cfg.TargetCountry) {
+							pipeStats.mu.Lock()
+							pipeStats.CountryFiltered++
+							pipeStats.mu.Unlock()
+							continue
+						}
+					}
+
 					uniqueTargetIPs.Store(resolvedIP, struct{}{})
 					matched = true
 
@@ -3750,6 +3980,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	})
 
 	pipeStats.mu.Lock()
+	pipeStats.DNSUniqueResolvedIPs = uniqueResolvedCount
+	pipeStats.DNSUniqueTargetIPs = uniqueTargetCount
 	pipeStats.DNSValidPairs = len(validPairs)
 	fmt.Printf("[+] Stage D Завершён. Подтверждено DNS-пар (IP+SNI): %d\n", pipeStats.DNSValidPairs)
 	pipeStats.mu.Unlock()
@@ -3757,43 +3989,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	if len(validPairs) == 0 {
 		return nil
 	}
-
-	fmt.Printf("[*] PRE-FILTER: ASN and Country filtering before probing...\n")
-	var filteredPairs []TargetPair
-	for _, p := range validPairs {
-		parsedIP := net.ParseIP(p.IP)
-		if parsedIP == nil {
-			continue
-		}
-
-		var asn uint
-		var country string
-		if asnDB != nil {
-			if r, err := asnDB.ASN(parsedIP); err == nil {
-				asn = uint(r.AutonomousSystemNumber)
-			}
-		}
-		if countryDB != nil {
-			if r, err := countryDB.Country(parsedIP); err == nil {
-				country = r.Country.IsoCode
-			}
-		}
-
-		if cfg.TargetASN != 0 && asn != cfg.TargetASN {
-			pipeStats.mu.Lock()
-			pipeStats.ASNFiltered++
-			pipeStats.mu.Unlock()
-			continue
-		}
-		if cfg.TargetCountry != "" && !strings.EqualFold(country, cfg.TargetCountry) {
-			pipeStats.mu.Lock()
-			pipeStats.CountryFiltered++
-			pipeStats.mu.Unlock()
-			continue
-		}
-		filteredPairs = append(filteredPairs, p)
-	}
-	validPairs = filteredPairs
 
 	fmt.Printf("[*] STAGE E: Active HTTP/2 Scanning & TLS Enrichment (%d targets)...\n", len(validPairs))
 	var candidates []Candidate
@@ -3820,7 +4015,11 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				pipeStats.TLSHandshake++
 			}
 			if pErr != nil && pErr.Stage == ProbeStageTLSValidation {
-				pipeStats.TLSValidationFailures++
+				if strings.Contains(pErr.Err.Error(), "no peer certificates") {
+					pipeStats.NoPeerCertificates++
+				} else {
+					pipeStats.TLSValidationFailures++
+				}
 			}
 			if cand != nil && cand.H2HeadersReceived {
 				pipeStats.H2HeadersOK++
@@ -3834,7 +4033,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				return nil
 			}
 
-			// populate pre-filtered ASN and Country into candidate struct for Final output
 			if parsedIP := net.ParseIP(cand.IP); parsedIP != nil {
 				if asnDB != nil {
 					if r, err := asnDB.ASN(parsedIP); err == nil {
@@ -3875,7 +4073,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			if cluster[i].Timings.TotalProbeLatency() != cluster[j].Timings.TotalProbeLatency() {
 				return cluster[i].Timings.TotalProbeLatency() < cluster[j].Timings.TotalProbeLatency()
 			}
-			return cluster[i].SNI < cluster[j].SNI // Deterministic map tie-break
+			return cluster[i].SNI < cluster[j].SNI
 		})
 		clusteredCandidates = append(clusteredCandidates, cluster[0])
 	}
@@ -3887,7 +4085,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		if clusteredCandidates[i].Timings.TotalProbeLatency() != clusteredCandidates[j].Timings.TotalProbeLatency() {
 			return clusteredCandidates[i].Timings.TotalProbeLatency() < clusteredCandidates[j].Timings.TotalProbeLatency()
 		}
-		return clusteredCandidates[i].SNI < clusteredCandidates[j].SNI // Deterministic global tie-break
+		return clusteredCandidates[i].SNI < clusteredCandidates[j].SNI
 	})
 
 	pipeStats.SnapshotAndPrint(pool, len(clusteredCandidates), ds)
@@ -3925,18 +4123,14 @@ func main() {
 	flag.BoolVar(&cfg.NoPassive, "no-passive", false, "Disable Passive DNS OSINT")
 	flag.BoolVar(&cfg.NoReverseIP, "no-reverse-ip", false, "Disable Reverse IP lookups")
 
-	flag.StringVar(&cfg.VTKey, "vt-key", os.Getenv("VT_API_KEY"), "VirusTotal API Key")
-	flag.StringVar(&cfg.URLScanKey, "urlscan-key", os.Getenv("URLSCAN_API_KEY"), "URLScan.io API Key")
-	flag.StringVar(&cfg.ChaosKey, "chaos-key", os.Getenv("CHAOS_API_KEY"), "ProjectDiscovery Chaos API Key")
-	flag.StringVar(&cfg.SecTrailsKey, "sectrails-key", "", "SecurityTrails API Key")
+	flag.StringVar(&cfg.VTKey, "vt-key", os.Getenv("dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5"), "VirusTotal API Key")
+	flag.StringVar(&cfg.URLScanKey, "urlscan-key", os.Getenv("01a032ae-681d-7718-821b-c6fd33aa11a7"), "URLScan.io API Key")
+	flag.StringVar(&cfg.ChaosKey, "chaos-key", os.Getenv("e3c91ed9-2f79-4147-807f-43dd150003e4"), "ProjectDiscovery Chaos API Key")
 
 	flag.Parse()
 
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
-	}
-	if cfg.TCPTimeoutMs <= 0 || cfg.TLSTimeoutMs <= 0 || cfg.H2ReadTimeoutMs <= 0 || cfg.H2WriteTimeoutMs <= 0 {
-		log.Fatal("[-] timeout flags must be > 0")
 	}
 	cfg.Mode = Mode(modeStr)
 	cfg.CIDRs = flag.Args()
@@ -4106,10 +4300,10 @@ func main() {
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
 	fmt.Printf("Подробности лучшего кандидата:\n")
-	fmt.Printf("TLS: %.0f/10 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | LATENCY: TCP %dms, TLS %dms, H2 %dms\n",
+	fmt.Printf("TLS: %.0f/20 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | LATENCY: TCP %dms, TLS %dms, H2 %dms\n",
 		best.RealityScore.TLSQuality, best.RealityScore.Certificate, best.RealityScore.H2Profile, best.RealityScore.ServerProfile, best.RealityScore.HTTPBehavior, best.RealityScore.DiscoveryScore,
 		best.Timings.TCP.Milliseconds(), best.Timings.TLS.Milliseconds(), best.Timings.H2Headers.Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
-	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/90 (HTTP: %d, Total Probe Latency: %d ms)\n",
+	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n",
 		best.RealityScore.Total, best.DomainPenalty, best.Score, best.HTTPStatus, best.Timings.TotalProbeLatency().Milliseconds())
 }
