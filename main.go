@@ -1064,6 +1064,24 @@ func classifyDomainQuality(sni string) string {
 	return "Normal"
 }
 
+var userAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+}
+
+func setBrowserHeaders(req *http.Request) {
+	ua := userAgents[rand.Intn(len(userAgents))]
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+}
+
 // ================= SNI PROVIDERS =================
 
 type ProviderHTTPError struct {
@@ -1317,7 +1335,6 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			}
 
 			httpStatus := providerHTTPStatus(err)
-			// Мгновенный FAST-FAIL (обрыв попыток) если провайдер мёртв или заблокировал нас
 			if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden || httpStatus >= 500 {
 				break
 			}
@@ -1394,11 +1411,10 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			if !errors.Is(err, context.Canceled) {
 				r.mu.Lock()
 				r.cbFailures++
-				
-				// Мгновенное срабатывание Circuit Breaker для WAF-блокировок и мёртвых API
-				isHardCB := httpStatus == http.StatusTooManyRequests || 
-				            httpStatus == http.StatusForbidden || 
-				            httpStatus >= 500
+
+				isHardCB := httpStatus == http.StatusTooManyRequests ||
+					httpStatus == http.StatusForbidden ||
+					httpStatus >= 500
 
 				if r.cbFailures >= providerCBThreshold || isHardCB {
 					cooldown := providerCBCooldown
@@ -1452,7 +1468,7 @@ func (p *shodanInternetDBProvider) Fetch(ctx context.Context, query string, clie
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1484,7 +1500,7 @@ func (p *anubisProvider) Fetch(ctx context.Context, query string, client *http.C
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1511,7 +1527,7 @@ func (p *threatMinerProvider) Fetch(ctx context.Context, query string, client *h
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1540,7 +1556,7 @@ func (p *hackerTargetHostSearchProvider) Fetch(ctx context.Context, query string
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1576,7 +1592,7 @@ func (p *crtShProvider) Fetch(ctx context.Context, query string, client *http.Cl
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1621,7 +1637,7 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 		if err != nil {
 			return result, err
 		}
-		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+		setBrowserHeaders(req)
 		resp, err := client.Do(req)
 		if err != nil {
 			return result, err
@@ -1678,7 +1694,7 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 		if err != nil {
 			return result, err
 		}
-		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+		setBrowserHeaders(req)
 		resp, err := client.Do(req)
 		if err != nil {
 			return result, err
@@ -1742,7 +1758,7 @@ func (p *waybackProvider) Fetch(ctx context.Context, query string, client *http.
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1778,7 +1794,7 @@ func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
+	setBrowserHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1820,8 +1836,8 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 		if err != nil {
 			return subs, err
 		}
+		setBrowserHeaders(req)
 		req.Header.Add("x-apikey", p.Key)
-		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
 		resp, err := client.Do(req)
 		if err != nil {
 			return subs, err
@@ -1882,8 +1898,8 @@ func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Cli
 		if err != nil {
 			return subs, err
 		}
+		setBrowserHeaders(req)
 		req.Header.Add("x-apikey", p.Key)
-		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
 		resp, err := client.Do(req)
 		if err != nil {
 			return subs, err
@@ -1953,8 +1969,8 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 		if err != nil {
 			return domains, err
 		}
+		setBrowserHeaders(req)
 		req.Header.Set("api-key", key)
-		req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -2040,8 +2056,8 @@ func (p *chaosProvider) Fetch(ctx context.Context, query string, client *http.Cl
 	if err != nil {
 		return nil, err
 	}
+	setBrowserHeaders(req)
 	req.Header.Add("Authorization", p.Key)
-	req.Header.Set("User-Agent", "asn-sni-osint/1.0 (+authorized-security-research)")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -2288,10 +2304,7 @@ func RunStageC(
 
 	for _, p := range providers {
 		limit := effectiveRootLimit(p, cfg)
-		if limit <= 0 {
-			limit = len(roots)
-		}
-		if limit > len(roots) {
+		if limit <= 0 || limit > len(roots) {
 			limit = len(roots)
 		}
 		providerLimits[p] = limit
@@ -2318,7 +2331,7 @@ func RunStageC(
 
 	totalCapacity := 0
 	for _, p := range providers {
-		totalCapacity += providerLimits[p] * 2 // x2 квота для ретраев 
+		totalCapacity += providerLimits[p] * 2
 	}
 	if totalCapacity < 1 {
 		totalCapacity = 1
@@ -2465,7 +2478,6 @@ SchedulerLoop:
 					continue
 				}
 
-				// Квота на ретрай = 100% от первичной квоты
 				if providerUsed[candidate] < providerLimits[candidate]*2 {
 					nextP = candidate
 					break
@@ -3696,7 +3708,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	var extProviders []*ProviderRunner
 	if !cfg.NoCT {
-		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 12 * time.Second, MaxNames: 1000, MaxRoots: 30, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 12 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 2 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
