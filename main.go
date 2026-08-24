@@ -1236,6 +1236,7 @@ func isTransientProviderError(err error) bool {
 	if errors.As(err, &httpErr) {
 		switch httpErr.StatusCode {
 		case http.StatusTooManyRequests,
+			http.StatusForbidden, 
 			http.StatusInternalServerError,
 			http.StatusBadGateway,
 			http.StatusServiceUnavailable,
@@ -1315,8 +1316,8 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			}
 
 			httpStatus := providerHTTPStatus(err)
-			if httpStatus == http.StatusTooManyRequests {
-				break
+			if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
+				break 
 			}
 
 			if !isTransientProviderError(err) || attempt == providerMaxAttempts {
@@ -1391,9 +1392,9 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			if isTransientProviderError(err) && !errors.Is(err, context.Canceled) {
 				r.mu.Lock()
 				r.cbFailures++
-				if r.cbFailures >= providerCBThreshold || httpStatus == http.StatusTooManyRequests {
+				if r.cbFailures >= providerCBThreshold || httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
 					cooldown := providerCBCooldown
-					if httpStatus == http.StatusTooManyRequests {
+					if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
 						cooldown = provider429CBCooldown
 					}
 					r.cbUntil = time.Now().Add(cooldown)
@@ -2286,31 +2287,22 @@ func RunStageC(
 
 	for _, p := range providers {
 		limit := effectiveRootLimit(p, cfg)
-
-		if limit <= 0 {
+		if limit <= 0 || limit > len(roots) {
 			limit = len(roots)
 		}
-
-		if limit > len(roots) {
-			limit = len(roots)
-		}
-
 		providerLimits[p] = limit
 		providerUsed[p] = len(providerRoots[p])
 	}
 
 	jobQueues := make(map[*ProviderRunner]chan RootCandidate, len(providers))
-
 	for _, p := range providers {
 		queueSize := providerLimits[p]
 		if queueSize < 1 {
 			queueSize = 1
 		}
-
 		if queueSize > len(roots) {
 			queueSize = len(roots)
 		}
-
 		jobQueues[p] = make(chan RootCandidate, queueSize)
 	}
 
@@ -2324,18 +2316,15 @@ func RunStageC(
 	for _, p := range providers {
 		totalCapacity += providerLimits[p]
 	}
-
 	if totalCapacity < 1 {
 		totalCapacity = 1
 	}
 
-	resultsCh := make(chan stageResult, totalCapacity)
-
+	resultsCh := make(chan stageResult, totalCapacity*2)
 	var workerWG sync.WaitGroup
 
 	for _, p := range providers {
 		p := p
-
 		workers := p.Config.MaxConcurrent
 		if workers <= 0 {
 			workers = 1
@@ -2343,10 +2332,8 @@ func RunStageC(
 
 		for i := 0; i < workers; i++ {
 			workerWG.Add(1)
-
 			go func() {
 				defer workerWG.Done()
-
 				for root := range jobQueues[p] {
 					res := p.Execute(
 						ctx,
@@ -2375,7 +2362,6 @@ func RunStageC(
 	}
 
 	inFlight := 0
-
 	for _, p := range providers {
 		for _, root := range providerRoots[p] {
 			history[root.Domain][p] = true
@@ -2388,9 +2374,7 @@ func RunStageC(
 		if rootStates[domain] != RootPending {
 			return
 		}
-
 		rootStates[domain] = RootCompleted
-
 		pipeStats.mu.Lock()
 		pipeStats.StageC.CompletedRoots++
 		pipeStats.mu.Unlock()
@@ -2400,9 +2384,7 @@ func RunStageC(
 		if rootStates[domain] != RootPending {
 			return
 		}
-
 		rootStates[domain] = RootLost
-
 		pipeStats.mu.Lock()
 		pipeStats.StageC.LostRoots++
 		pipeStats.StageC.Lost++
@@ -2413,9 +2395,7 @@ func RunStageC(
 		if rootStates[domain] != RootPending {
 			return
 		}
-
 		rootStates[domain] = RootCanceled
-
 		pipeStats.mu.Lock()
 		pipeStats.StageC.CanceledRoots++
 		pipeStats.mu.Unlock()
@@ -2423,7 +2403,6 @@ func RunStageC(
 
 SchedulerLoop:
 	for inFlight > 0 {
-
 		select {
 		case <-ctx.Done():
 			for _, root := range roots {
@@ -2431,7 +2410,6 @@ SchedulerLoop:
 					markCanceled(root.Domain)
 				}
 			}
-
 			break SchedulerLoop
 
 		case item := <-resultsCh:
@@ -2442,37 +2420,25 @@ SchedulerLoop:
 			res := item.result
 
 			pipeStats.mu.Lock()
-
 			pipeStats.StageC.Executed++
-
 			switch res.Status {
 			case StatSuccess:
 				pipeStats.StageC.Success++
-
 			case StatNoData:
 				pipeStats.StageC.NoData++
-
 			case StatPartial:
 				pipeStats.StageC.Partial++
-
 			case StatFailed:
 				pipeStats.StageC.Failed++
-
 			case StatSkipped, StatWaitCanceled:
 				pipeStats.StageC.Skipped++
 			}
-
 			pipeStats.mu.Unlock()
 
 			if len(res.Names) > 0 {
 				inheritedSrc := rootProvenance[root.Domain]
-
 				for _, d := range res.Names {
-					ds.AddDomainSource(
-						d,
-						p.SourceBit(),
-						inheritedSrc,
-					)
+					ds.AddDomainSource(d, p.SourceBit(), inheritedSrc)
 				}
 			}
 
@@ -2495,20 +2461,17 @@ SchedulerLoop:
 				}
 
 				candidate.mu.Lock()
-				cbOpen := !candidate.cbUntil.IsZero() &&
-					time.Now().Before(candidate.cbUntil)
+				cbOpen := !candidate.cbUntil.IsZero() && time.Now().Before(candidate.cbUntil)
 				candidate.mu.Unlock()
 
 				if cbOpen {
 					continue
 				}
 
-				if providerUsed[candidate] >= providerLimits[candidate] {
-					continue
+				if providerUsed[candidate] < providerLimits[candidate]*2 {
+					nextP = candidate
+					break
 				}
-
-				nextP = candidate
-				break
 			}
 
 			if nextP == nil {
@@ -2531,7 +2494,6 @@ SchedulerLoop:
 	for _, p := range providers {
 		close(jobQueues[p])
 	}
-
 	workerWG.Wait()
 }
 
@@ -3736,18 +3698,18 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	var extProviders []*ProviderRunner
 	if !cfg.NoCT {
-		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 12 * time.Second, MaxNames: 1000, MaxRoots: 30, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 4, MaxNames: 1000, MaxRoots: 50, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 12 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 2 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
-		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 3, MaxNames: 10000, MaxRoots: 100, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 3, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 3, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 2 * time.Second, MaxNames: 1000, MaxRoots: 30, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 3 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 2 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 3 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
 	}
 	if !cfg.NoReverseIP {
-		extProviders = append(extProviders, NewRunner(&hackerTargetProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 2 * time.Second, MaxNames: 1000, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&hackerTargetProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&shodanInternetDBProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 10, MinInterval: 50 * time.Millisecond, MaxNames: 1000, MaxPages: 1}))
 	}
 	if cfg.VTKey != "" {
