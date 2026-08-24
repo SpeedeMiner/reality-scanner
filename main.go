@@ -27,6 +27,9 @@ import (
 	"syscall"
 	"time"
 
+	dnscrypt "github.com/ameshkov/dnscrypt/v2"
+	"github.com/ameshkov/dnsstamps"
+	mdns "github.com/miekg/dns"
 	"github.com/oschwald/geoip2-golang"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
@@ -58,6 +61,7 @@ const (
 	FlagAck        = 0x01
 
 	maxDiscoveryRoots = 30
+	dnsFastPoolSize   = 16
 )
 
 var (
@@ -68,7 +72,7 @@ var (
 
 	domainRe    = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
 	numRe       = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
-	uuidLabelRe = regexp.MustCompile(`(?i)^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$`)
+	stampRe     = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
 )
 
 type Config struct {
@@ -175,6 +179,7 @@ type Candidate struct {
 	ASN               uint
 	Country           string
 	CDNProvider       string
+	CDNConfidence     int
 	CDNStatus         CDNStatus
 	Score             float64
 	DomainPenalty     float64
@@ -305,17 +310,375 @@ var (
 	dnsGroup  singleflight.Group
 )
 
-// ================= CUSTOM DNS RESOLVER =================
+// ================= DNSCRYPT POOL =================
 
-var publicDNS = []string{"1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"}
-var dnsCounter atomic.Uint64
-var dnsResolver = &net.Resolver{
-	PreferGo: true,
-	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-		d := net.Dialer{Timeout: 2 * time.Second}
-		i := dnsCounter.Add(1) % uint64(len(publicDNS))
-		return d.DialContext(ctx, "udp", publicDNS[i])
-	},
+const dnsPoolCacheFile = "dnscrypt_pool.json"
+const requiredDNSProps = dnsstamps.ServerInformalPropertyNoLog | dnsstamps.ServerInformalPropertyNoFilter
+
+var resolverListURLsV3 = []string{
+	"https://download.dnscrypt.info/resolvers-list/v3/public-resolvers.md",
+	"https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md",
+	"https://cdn.jsdelivr.net/gh/DNSCrypt/dnscrypt-resolvers@master/v3/public-resolvers.md",
+}
+var resolverListURLsV2 = []string{
+	"https://download.dnscrypt.info/resolvers-list/v2/public-resolvers.md",
+}
+
+var ErrDNSNXDomain = errors.New("dns nxdomain")
+
+type DNSResolver struct {
+	Stamp              string
+	Info               *dnscrypt.ResolverInfo
+	RTT                time.Duration
+	Success            atomic.Uint64
+	Failures           atomic.Uint64
+	ConsecutiveFailure atomic.Uint64
+	mu                 sync.Mutex
+	DisabledTo         time.Time
+}
+
+func (r *DNSResolver) getInfo() *dnscrypt.ResolverInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Info
+}
+
+func (r *DNSResolver) refresh() error {
+	client := &dnscrypt.Client{Net: "udp", Timeout: 3 * time.Second}
+	info, err := client.Dial(r.Stamp)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.Info = info
+	r.DisabledTo = time.Time{}
+	r.mu.Unlock()
+	r.ConsecutiveFailure.Store(0)
+	return nil
+}
+
+type DNSPool struct {
+	mu         sync.RWMutex
+	resolvers  []*DNSResolver
+	Discovered atomic.Uint64
+	Checked    atomic.Uint64
+	Healthy    atomic.Uint64
+	Queries    atomic.Uint64
+	Successes  atomic.Uint64
+	Failures   atomic.Uint64
+	Retries    atomic.Uint64
+}
+
+type StampCache struct {
+	Timestamp time.Time `json:"timestamp"`
+	Stamps    []string  `json:"stamps"`
+}
+
+func parseResolverList(body string) []string {
+	lines := strings.Split(body, "\n")
+	seen := make(map[string]struct{})
+	var stamps []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !stampRe.MatchString(line) {
+			continue
+		}
+		stamp, err := dnsstamps.NewServerStampFromString(line)
+		if err != nil || stamp.Proto != dnsstamps.StampProtoTypeDNSCrypt || stamp.Props&requiredDNSProps != requiredDNSProps {
+			continue
+		}
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		stamps = append(stamps, line)
+	}
+	return stamps
+}
+
+func downloadResolverList(ctx context.Context, urlStr string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, urlStr)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	if err != nil {
+		return nil, err
+	}
+	return parseResolverList(string(body)), nil
+}
+
+func loadResolverStamps(ctx context.Context) ([]string, error) {
+	if data, err := os.ReadFile(dnsPoolCacheFile); err == nil {
+		var cache StampCache
+		if err := json.Unmarshal(data, &cache); err == nil {
+			if time.Since(cache.Timestamp) < 24*time.Hour && len(cache.Stamps) > 0 {
+				fmt.Printf("[DNS] Загружено %d stamps из локального кэша\n", len(cache.Stamps))
+				return cache.Stamps, nil
+			}
+		}
+	}
+
+	var all []string
+	for _, urlStr := range resolverListURLsV3 {
+		stamps, err := downloadResolverList(ctx, urlStr)
+		if err != nil {
+			fmt.Printf("[DNS] V3 source failed: %s: %v\n", urlStr, err)
+			continue
+		}
+		all = append(all, stamps...)
+	}
+
+	if len(all) < 50 {
+		for _, urlStr := range resolverListURLsV2 {
+			stamps, err := downloadResolverList(ctx, urlStr)
+			if err == nil {
+				all = append(all, stamps...)
+			}
+		}
+	}
+
+	all = uniqueStrings(all)
+	if len(all) == 0 {
+		return nil, fmt.Errorf("no DNSCrypt resolvers found")
+	}
+
+	cacheData, _ := json.Marshal(StampCache{Timestamp: time.Now(), Stamps: all})
+	os.WriteFile(dnsPoolCacheFile, cacheData, 0644)
+	return all, nil
+}
+
+func checkDNSResolver(ctx context.Context, stamp string) (*DNSResolver, error) {
+	client := &dnscrypt.Client{Net: "udp", Timeout: 3 * time.Second}
+	start := time.Now()
+	info, err := client.Dial(stamp)
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	dialRTT := time.Since(start)
+
+	tests := []struct {
+		Name string
+		Type uint16
+	}{
+		{"example.com.", mdns.TypeA},
+		{"cloudflare.com.", mdns.TypeA},
+		{"iana.org.", mdns.TypeA},
+	}
+
+	var totalRTT time.Duration
+	for _, t := range tests {
+		req := new(mdns.Msg)
+		req.SetQuestion(t.Name, t.Type)
+		req.RecursionDesired = true
+		qStart := time.Now()
+		resp, err := client.Exchange(req, info)
+		if err != nil {
+			return nil, fmt.Errorf("exchange %s: %w", t.Name, err)
+		}
+		totalRTT += time.Since(qStart)
+		if resp == nil || resp.Rcode != mdns.RcodeSuccess {
+			return nil, fmt.Errorf("bad response for %s", t.Name)
+		}
+	}
+
+	return &DNSResolver{Stamp: stamp, Info: info, RTT: dialRTT + totalRTT/3}, nil
+}
+
+func buildDNSPool(ctx context.Context, stamps []string) *DNSPool {
+	pool := &DNSPool{}
+	pool.Discovered.Store(uint64(len(stamps)))
+
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(64)
+
+	for _, stamp := range stamps {
+		stamp := stamp
+		g.Go(func() error {
+			r, err := checkDNSResolver(gctx, stamp)
+			pool.Checked.Add(1)
+
+			if err == nil {
+				pool.Healthy.Add(1)
+				mu.Lock()
+				pool.resolvers = append(pool.resolvers, r)
+				mu.Unlock()
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	pool.sortByRTT()
+	return pool
+}
+
+func (p *DNSPool) sortByRTT() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sort.Slice(p.resolvers, func(i, j int) bool {
+		return p.resolvers[i].RTT < p.resolvers[j].RTT
+	})
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (p *DNSPool) pickWeighted() *DNSResolver {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var available []*DNSResolver
+	now := time.Now()
+	for _, r := range p.resolvers {
+		r.mu.Lock()
+		disabled := now.Before(r.DisabledTo)
+		r.mu.Unlock()
+		if !disabled {
+			available = append(available, r)
+		}
+	}
+
+	if len(available) == 0 {
+		return nil
+	}
+
+	n := len(available)
+	if n > dnsFastPoolSize {
+		n = dnsFastPoolSize
+	}
+
+	var weights []int
+	total := 0
+
+	for i := 0; i < n; i++ {
+		r := available[i]
+		r.mu.Lock()
+		rtt := r.RTT.Milliseconds()
+		r.mu.Unlock()
+
+		weight := 1000 / int(max64(10, rtt))
+		if weight < 1 {
+			weight = 1
+		}
+		weights = append(weights, weight)
+		total += weight
+	}
+
+	if total == 0 {
+		return available[0]
+	}
+
+	x := rand.Intn(total)
+	for i, w := range weights {
+		if x < w {
+			return available[i]
+		}
+		x -= w
+	}
+	return available[0]
+}
+
+func (p *DNSPool) onFailure(r *DNSResolver) {
+	r.mu.Lock()
+	r.DisabledTo = time.Now().Add(5 * time.Minute)
+	r.mu.Unlock()
+}
+
+func (p *DNSPool) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, *DNSResolver, time.Duration, error) {
+	p.Queries.Add(1)
+	var lastErr error
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, 0, err
+		}
+		if attempt > 0 {
+			p.Retries.Add(1)
+		}
+		resolver := p.pickWeighted()
+		if resolver == nil {
+			return nil, nil, 0, fmt.Errorf("DNSCrypt pool is empty")
+		}
+
+		client := &dnscrypt.Client{Net: "udp", Timeout: 2500 * time.Millisecond}
+		info := resolver.getInfo()
+
+		start := time.Now()
+		resp, err := client.Exchange(req, info)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			resolver.Failures.Add(1)
+			failures := resolver.ConsecutiveFailure.Add(1)
+
+			if failures == 1 {
+				if refreshErr := resolver.refresh(); refreshErr == nil {
+					info = resolver.getInfo()
+					start = time.Now()
+					resp, err = client.Exchange(req, info)
+					elapsed = time.Since(start)
+				}
+			}
+
+			if err != nil {
+				if failures >= 3 {
+					p.onFailure(resolver)
+				}
+				lastErr = err
+				continue
+			}
+			resolver.ConsecutiveFailure.Store(0)
+		}
+
+		switch resp.Rcode {
+		case mdns.RcodeSuccess, mdns.RcodeNameError:
+			resolver.Success.Add(1)
+			resolver.ConsecutiveFailure.Store(0)
+
+			resolver.mu.Lock()
+			if resolver.RTT == 0 {
+				resolver.RTT = elapsed
+			} else {
+				resolver.RTT = (resolver.RTT*7 + elapsed) / 8
+			}
+			resolver.mu.Unlock()
+
+			p.Successes.Add(1)
+			return resp, resolver, elapsed, nil
+
+		case mdns.RcodeServerFailure:
+			lastErr = fmt.Errorf("SERVFAIL")
+			resolver.Failures.Add(1)
+			continue
+		case mdns.RcodeRefused:
+			lastErr = fmt.Errorf("REFUSED")
+			resolver.Failures.Add(1)
+			continue
+		default:
+			lastErr = fmt.Errorf("rcode=%s", mdns.RcodeToString[resp.Rcode])
+			resolver.Failures.Add(1)
+			continue
+		}
+	}
+	p.Failures.Add(1)
+	return nil, nil, 0, lastErr
 }
 
 // ================= UTILS =================
@@ -352,13 +715,13 @@ func GetRootDomain(domain string) string {
 	return root
 }
 
-func uniqueDomains(domains []string) []string {
+func uniqueStrings(values []string) []string {
 	seen := make(map[string]bool)
 	var result []string
-	for _, d := range domains {
-		if !seen[d] {
-			seen[d] = true
-			result = append(result, d)
+	for _, v := range values {
+		if !seen[v] {
+			seen[v] = true
+			result = append(result, v)
 		}
 	}
 	return result
@@ -533,7 +896,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			return nil, err
 		}
 
-		cleanRes := uniqueDomains(res)
+		cleanRes := uniqueStrings(res)
 		if r.Config.MaxNames > 0 && len(cleanRes) > r.Config.MaxNames {
 			cleanRes = cleanRes[:r.Config.MaxNames]
 		}
@@ -984,7 +1347,86 @@ func ipInRanges(ipStr string, ranges []ipRange) bool {
 	return false
 }
 
-func resolveIPv4Cached(ctx context.Context, domain string) ([]string, error) {
+func reverseIPv4(ip string) (string, error) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return "", fmt.Errorf("invalid IP")
+	}
+	parsed = parsed.To4()
+	if parsed == nil {
+		return "", fmt.Errorf("not IPv4")
+	}
+	return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", parsed[3], parsed[2], parsed[1], parsed[0]), nil
+}
+
+func resolvePTRDNSCrypt(ctx context.Context, pool *DNSPool, ip string) ([]string, error) {
+	rev, err := reverseIPv4(ip)
+	if err != nil {
+		return nil, err
+	}
+
+	req := new(mdns.Msg)
+	req.SetQuestion(rev, mdns.TypePTR)
+	req.RecursionDesired = true
+
+	resp, _, _, err := pool.exchange(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Rcode == mdns.RcodeNameError {
+		return nil, ErrDNSNXDomain
+	}
+
+	if resp.Rcode != mdns.RcodeSuccess {
+		return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
+	}
+
+	var names []string
+	for _, ans := range resp.Answer {
+		if ptr, ok := ans.(*mdns.PTR); ok {
+			if d := CleanDomain(ptr.Ptr); d != "" {
+				names = append(names, d)
+			}
+		}
+	}
+	return names, nil
+}
+
+func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]string, error) {
+	req := new(mdns.Msg)
+	req.SetQuestion(mdns.Fqdn(domain), mdns.TypeA)
+	req.RecursionDesired = true
+
+	resp, _, _, err := pool.exchange(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Rcode == mdns.RcodeNameError {
+		pool.Successes.Add(1)
+		return nil, ErrDNSNXDomain
+	}
+	if resp.Rcode != mdns.RcodeSuccess {
+		return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
+	}
+
+	seen := make(map[string]struct{})
+	var ips []string
+	for _, answer := range resp.Answer {
+		if a, ok := answer.(*mdns.A); ok {
+			ip := a.A.String()
+			if _, exists := seen[ip]; !exists {
+				seen[ip] = struct{}{}
+				ips = append(ips, ip)
+			}
+		}
+	}
+	pool.Successes.Add(1)
+	return ips, nil
+}
+
+func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string) ([]string, error) {
 	domain = CleanDomain(domain)
 	if domain == "" {
 		return nil, fmt.Errorf("invalid domain")
@@ -993,29 +1435,14 @@ func resolveIPv4Cached(ctx context.Context, domain string) ([]string, error) {
 		if cached, ok := dnsCache.Get(domain); ok {
 			return cached, nil
 		}
-		dnsCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
-		defer cancel()
 
-		ips, err := dnsResolver.LookupIP(dnsCtx, "ip4", domain)
+		ips, err := resolveIPv4DNSCrypt(ctx, pool, domain)
 		if err != nil {
 			return nil, err
 		}
 
-		seen := make(map[string]struct{})
-		var res []string
-		for _, ip := range ips {
-			ip4 := ip.To4()
-			if ip4 == nil {
-				continue
-			}
-			s := ip4.String()
-			if _, ok := seen[s]; !ok {
-				seen[s] = struct{}{}
-				res = append(res, s)
-			}
-		}
-		dnsCache.Put(domain, res)
-		return res, nil
+		dnsCache.Put(domain, ips)
+		return ips, nil
 	})
 	if err != nil {
 		return nil, err
@@ -1084,11 +1511,11 @@ func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte
 func buildClientSettingsFrame() []byte {
 	payload := make([]byte, 30)
 	binary.BigEndian.PutUint16(payload[0:2], 1)       // HEADER_TABLE_SIZE
-	binary.BigEndian.PutUint32(payload[2:6], 65536)   
+	binary.BigEndian.PutUint32(payload[2:6], 65536)
 	binary.BigEndian.PutUint16(payload[6:8], 2)       // ENABLE_PUSH
-	binary.BigEndian.PutUint32(payload[8:12], 0)      
+	binary.BigEndian.PutUint32(payload[8:12], 0)
 	binary.BigEndian.PutUint16(payload[12:14], 3)     // MAX_CONCURRENT_STREAMS
-	binary.BigEndian.PutUint32(payload[14:18], 1000)  
+	binary.BigEndian.PutUint32(payload[14:18], 1000)
 	binary.BigEndian.PutUint16(payload[18:20], 4)     // INITIAL_WINDOW_SIZE
 	binary.BigEndian.PutUint32(payload[20:24], 6291456)
 	binary.BigEndian.PutUint16(payload[24:26], 6)     // MAX_HEADER_LIST_SIZE
@@ -1156,7 +1583,6 @@ func ProbeH2(ctx context.Context, ip, sni string, sources DomainSource, cfg Conf
 
 	now := time.Now()
 	cand.CertValidTime = now.After(cert.NotBefore) && now.Before(cert.NotAfter)
-	cand.CertSNIMatch = (cert.VerifyHostname(sni) == nil)
 
 	opts := x509.VerifyOptions{
 		DNSName:       sni,
@@ -1166,8 +1592,12 @@ func ProbeH2(ctx context.Context, ip, sni string, sources DomainSource, cfg Conf
 	for _, c := range state.PeerCertificates[1:] {
 		opts.Intermediates.AddCert(c)
 	}
+
 	if _, err := cert.Verify(opts); err == nil {
+		cand.CertSNIMatch = true
 		cand.CertChainValid = true
+	} else {
+		cand.CertSNIMatch = (cert.VerifyHostname(sni) == nil)
 	}
 
 	wTo := time.Duration(cfg.H2WriteTimeoutMs) * time.Millisecond
@@ -1507,7 +1937,7 @@ func scoreH2Profile(c *Candidate) float64 {
 	}
 
 	prof := c.InitialPeerSettings
-	if prof.HasMaxConcurrentStreams && prof.MaxConcurrentStreams > 0 && prof.MaxConcurrentStreams <= 1000 {
+	if prof.HasMaxConcurrentStreams && prof.MaxConcurrentStreams >= 100 {
 		score += 2.0
 	}
 
@@ -1527,10 +1957,6 @@ func scoreH2Profile(c *Candidate) float64 {
 		}
 	}
 
-	if c.SettingsChanges > 0 {
-		score += 2.0
-	}
-
 	if c.H2DataFrames > 0 {
 		score += 2.0
 	}
@@ -1538,7 +1964,7 @@ func scoreH2Profile(c *Candidate) float64 {
 		score += 1.0
 	}
 	if c.EndStreamSeen {
-		score += 2.0
+		score += 1.0
 	}
 
 	return math.Min(score, 20.0)
@@ -1614,15 +2040,18 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 		rs.HTTPBehavior = 7
 	default:
 		if cand.HTTPStatus >= 400 && cand.HTTPStatus < 500 {
-			rs.HTTPBehavior = 3
+			rs.HTTPBehavior = 5
 		} else if cand.HTTPStatus >= 500 {
 			rs.HTTPBehavior = -5
 		}
 	}
 
-	hasDirect := cand.Sources.Has(SourcePTR) || cand.Sources.Has(SourceHackerTarget)
-	hasCert := cand.Sources.Has(SourceCRTSh) || cand.Sources.Has(SourceCertSpotter)
-	hasPassive := cand.Sources.Has(SourceAlienVault) || cand.Sources.Has(SourceWayback)
+	sourceCount := 0
+	for _, src := range []DomainSource{SourcePTR, SourceCRTSh, SourceCertSpotter, SourceAlienVault, SourceWayback, SourceHackerTarget, SourceSeed} {
+		if cand.Sources.Has(src) {
+			sourceCount++
+		}
+	}
 
 	discovery := 0.0
 	if cand.Sources.Has(SourcePTR) {
@@ -1648,13 +2077,13 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	}
 
 	diversity := 0
-	if hasDirect {
+	if cand.Sources.Has(SourcePTR) || cand.Sources.Has(SourceHackerTarget) {
 		diversity++
 	}
-	if hasCert {
+	if cand.Sources.Has(SourceCRTSh) || cand.Sources.Has(SourceCertSpotter) {
 		diversity++
 	}
-	if hasPassive {
+	if cand.Sources.Has(SourceAlienVault) || cand.Sources.Has(SourceWayback) {
 		diversity++
 	}
 	if cand.Sources.Has(SourceSeed) {
@@ -1702,7 +2131,7 @@ func validateAndEnrich(cand *Candidate, asnDB, countryDB *geoip2.Reader, cfg Con
 	return cand.Score >= 0
 }
 
-func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange, asnDB, countryDB *geoip2.Reader) []Candidate {
+func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange, pool *DNSPool, asnDB, countryDB *geoip2.Reader) []Candidate {
 	var mu sync.Mutex
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
@@ -1761,20 +2190,14 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		ip := ip
 		g1a.Go(func() error {
 			if !cfg.NoPTR {
-				names, err := dnsResolver.LookupAddr(gCtx1a, ip)
-				if err == nil {
-					found := false
+				names, err := resolvePTRDNSCrypt(gCtx1a, pool, ip)
+				if err == nil && len(names) > 0 {
 					for _, n := range names {
-						if d := CleanDomain(n); d != "" {
-							addPairSource(ip, d, SourcePTR)
-							found = true
-						}
+						addPairSource(ip, n, SourcePTR)
 					}
-					if found {
-						stats.mu.Lock()
-						stats.IPWithPTR++
-						stats.mu.Unlock()
-					}
+					stats.mu.Lock()
+					stats.IPWithPTR++
+					stats.mu.Unlock()
 				}
 			}
 
@@ -1914,33 +2337,36 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			stats.DNSQueries++
 			stats.mu.Unlock()
 
-			ips, err := resolveIPv4Cached(gCtx1c, dom)
+			ips, err := resolveIPv4Cached(gCtx1c, pool, dom)
 
 			stats.mu.Lock()
 			if err != nil {
-				stats.DNSFailed++
-				var dnsErr *net.DNSError
-				if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-					stats.DNSTimeout++
-				} else if errors.As(err, &dnsErr) {
-					if dnsErr.IsNotFound {
-						stats.DNSNXDomain++
-					} else if dnsErr.Timeout() {
+				if errors.Is(err, ErrDNSNXDomain) {
+					stats.DNSSuccess++
+					stats.DNSNXDomain++
+				} else {
+					stats.DNSFailed++
+					var dnsErr *net.DNSError
+					if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
 						stats.DNSTimeout++
-					} else if dnsErr.Temporary() {
-						stats.DNSTemporary++
+					} else if errors.As(err, &dnsErr) {
+						if dnsErr.Timeout() {
+							stats.DNSTimeout++
+						} else if dnsErr.Temporary() {
+							stats.DNSTemporary++
+						} else {
+							stats.DNSOtherErr++
+						}
 					} else {
 						stats.DNSOtherErr++
 					}
-				} else {
-					stats.DNSOtherErr++
 				}
 				stats.mu.Unlock()
 				return nil
 			}
 
 			if len(ips) == 0 {
-				stats.DNSFailed++
+				stats.DNSSuccess++
 				stats.DNSNoIPv4++
 				stats.mu.Unlock()
 				return nil
@@ -1970,9 +2396,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 							SNI:     dom,
 							Sources: finalMask,
 						})
-						if len(validPairs) <= 50 {
-							fmt.Printf("  [+] DNS Match: %s -> %s\n", dom, resolvedIP)
-						}
 						mu.Unlock()
 					}
 				}
@@ -2053,11 +2476,27 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 	_ = g2.Wait()
 
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].Score != candidates[j].Score {
-			return candidates[i].Score > candidates[j].Score
+	ipClusters := make(map[string][]Candidate)
+	for _, c := range candidates {
+		ipClusters[c.IP] = append(ipClusters[c.IP], c)
+	}
+
+	var clusteredCandidates []Candidate
+	for _, cluster := range ipClusters {
+		sort.Slice(cluster, func(i, j int) bool {
+			if cluster[i].Score != cluster[j].Score {
+				return cluster[i].Score > cluster[j].Score
+			}
+			return cluster[i].Timings.TotalProbeLatency() < cluster[j].Timings.TotalProbeLatency()
+		})
+		clusteredCandidates = append(clusteredCandidates, cluster[0])
+	}
+
+	sort.Slice(clusteredCandidates, func(i, j int) bool {
+		if clusteredCandidates[i].Score != clusteredCandidates[j].Score {
+			return clusteredCandidates[i].Score > clusteredCandidates[j].Score
 		}
-		return candidates[i].Timings.TotalProbeLatency() < candidates[j].Timings.TotalProbeLatency()
+		return clusteredCandidates[i].Timings.TotalProbeLatency() < clusteredCandidates[j].Timings.TotalProbeLatency()
 	})
 
 	stats.mu.Lock()
@@ -2105,10 +2544,12 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		}
 	}
 
-	fmt.Printf("\n[*] DNS Lookups:               %d (Успех: %d, Ошибок: %d)\n", stats.DNSQueries, stats.DNSSuccess, stats.DNSFailed)
-	fmt.Printf("    Детали DNS ошибок:         NXDOMAIN: %d, Timeout: %d, Temporary: %d, NoIPv4: %d, Other: %d\n",
-		stats.DNSNXDomain, stats.DNSTimeout, stats.DNSTemporary, stats.DNSNoIPv4, stats.DNSOtherErr)
-	fmt.Printf("[*] DNS Resolved IPs (Всего):  %d\n", stats.DNSResolvedIPs)
+	fmt.Println("\n[DNSCrypt Pool Telemetry]")
+	fmt.Printf("  DNS Queries:                 %d (Успех: %d, Ошибок: %d, Ретраи: %d)\n", pool.Queries.Load(), pool.Successes.Load(), pool.Failures.Load(), pool.Retries.Load())
+	
+	fmt.Printf("\n[*] Общие DNS Lookups:         %d (Успех: %d, Ошибок: %d)\n", stats.DNSQueries, stats.DNSSuccess, stats.DNSFailed)
+	fmt.Printf("    Детали DNS успехов:        Resolved IPs (Total): %d, NXDOMAIN: %d, NoIPv4: %d\n", stats.DNSResolvedIPs, stats.DNSNXDomain, stats.DNSNoIPv4)
+	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", stats.DNSTimeout, stats.DNSTemporary, stats.DNSOtherErr)
 	fmt.Printf("[*] DNS Unique IPs:            %d\n", uniqueResolvedCount)
 	fmt.Printf("[*] DNS Unique Target IPs:     %d\n", uniqueTargetCount)
 	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", stats.DNSTargetDomains)
@@ -2117,10 +2558,10 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", stats.TLSHandshake)
 	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", stats.TLSValidation)
 	fmt.Printf("[*] С откликом H2 Headers:     %d\n", stats.H2HeadersOK)
-	fmt.Printf("[*] Финальных кандидатов:      %d\n", len(candidates))
+	fmt.Printf("[*] Финальных IP-кластеров:    %d\n", len(clusteredCandidates))
 	stats.mu.Unlock()
 
-	return candidates
+	return clusteredCandidates
 }
 
 // ================= MAIN =================
@@ -2201,6 +2642,26 @@ func main() {
 		log.Fatal("[-] Failed to open GeoIP DB")
 	}
 
+	dnsCtx, dnsCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer dnsCancel()
+	fmt.Println("[DNS] Загрузка публичного DNSCrypt pool...")
+	stamps, err := loadResolverStamps(dnsCtx)
+	if err != nil {
+		log.Fatalf("[-] DNSCrypt list: %v", err)
+	}
+	fmt.Printf("[DNS] Получено %d уникальных resolver stamps\n", len(stamps))
+	
+	dnsPool := buildDNSPool(dnsCtx, stamps)
+	dnsPool.sortByRTT()
+	dnsPool.mu.RLock()
+	poolSize := len(dnsPool.resolvers)
+	dnsPool.mu.RUnlock()
+	
+	if poolSize < 5 {
+		log.Fatalf("[-] Слишком мало рабочих DNSCrypt resolver'ов: %d", poolSize)
+	}
+	fmt.Printf("[+] Рабочий DNSCrypt pool: %d resolver'ов\n", poolSize)
+
 	var vpsQueryIP, localPrefix string
 
 	if cfg.Mode == ModeAuto {
@@ -2269,13 +2730,13 @@ func main() {
 		fmt.Printf("[*] Страна сервера:          %s (MaxMind GeoIP)\n", cfg.TargetCountry)
 		fmt.Printf("[*] Подготовлено %d IP адресов для OSINT-сэмплинга. Запуск...\n", len(sampledIPs))
 
-		results = RunPipeline(ctx, cfg, sampledIPs, dnsRanges, asnDB, countryDB)
+		results = RunPipeline(ctx, cfg, sampledIPs, dnsRanges, dnsPool, asnDB, countryDB)
 
 	} else if cfg.Mode == ModeDirect {
 		merged := MergeCIDRs(cfg.CIDRs)
 		sampledIPs := SampleIPs(merged, cfg.MaxIPs, cfg.Seed)
 		fmt.Printf("[*] Direct Mode: Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
-		results = RunPipeline(ctx, cfg, sampledIPs, merged, asnDB, countryDB)
+		results = RunPipeline(ctx, cfg, sampledIPs, merged, dnsPool, asnDB, countryDB)
 	}
 
 	if len(results) == 0 {
@@ -2284,17 +2745,17 @@ func main() {
 	}
 
 	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей: %d\n\n", len(results))
-	fmt.Printf("%-32.32s | %-15.15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %-7s\n",
-		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "PROBE")
+	fmt.Printf("%-32.32s | %-15.15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
+		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "TCP", "TLS", "H2")
 	fmt.Println(strings.Repeat("-", 126))
 
 	for _, r := range results {
 		rs := r.RealityScore
-		rttStr := fmt.Sprintf("%d ms", r.Timings.TotalProbeLatency().Milliseconds())
 		scoreStr := fmt.Sprintf("%.1f", r.Score)
 
-		fmt.Printf("%-32.32s | %-15.15s | %-5s | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f    | %-6d | %s\n",
-			r.SNI, r.IP, scoreStr, rs.TLSQuality, rs.Certificate, rs.H2Profile, rs.ServerProfile, rs.HTTPBehavior, rs.DiscoveryScore, r.HTTPStatus, rttStr)
+		fmt.Printf("%-32.32s | %-15.15s | %-5s | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f    | %-6d | %3d %3d %3d\n",
+			r.SNI, r.IP, scoreStr, rs.TLSQuality, rs.Certificate, rs.H2Profile, rs.ServerProfile, rs.HTTPBehavior, rs.DiscoveryScore, r.HTTPStatus,
+			r.Timings.TCP.Milliseconds(), r.Timings.TLS.Milliseconds(), r.Timings.H2Headers.Milliseconds())
 	}
 
 	best := results[0]
@@ -2304,9 +2765,10 @@ func main() {
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
 	fmt.Printf("Подробности лучшего кандидата:\n")
-	fmt.Printf("TLS: %.0f/20 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | PROBE: %.0f/10\n",
-		best.RealityScore.TLSQuality, best.RealityScore.Certificate, best.RealityScore.H2Profile, best.RealityScore.ServerProfile, best.RealityScore.HTTPBehavior, best.RealityScore.DiscoveryScore, best.RealityScore.Latency)
+	fmt.Printf("TLS: %.0f/10 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | LATENCY: TCP %dms, TLS %dms, H2 %dms\n",
+		best.RealityScore.TLSQuality, best.RealityScore.Certificate, best.RealityScore.H2Profile, best.RealityScore.ServerProfile, best.RealityScore.HTTPBehavior, best.RealityScore.DiscoveryScore,
+		best.Timings.TCP.Milliseconds(), best.Timings.TLS.Milliseconds(), best.Timings.H2Headers.Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
-	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n",
+	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/90 (HTTP: %d, Total Probe Latency: %d ms)\n",
 		best.RealityScore.Total, best.DomainPenalty, best.Score, best.HTTPStatus, best.Timings.TotalProbeLatency().Milliseconds())
 }
