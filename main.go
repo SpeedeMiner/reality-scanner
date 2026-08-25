@@ -67,11 +67,13 @@ const (
 	MaxDiscoveredDomains = 50000
 	LimitValidPairs      = 10000
 
-	// FAST-FAIL: Никаких повторных попыток. 2 ошибки = провайдер выключен.
-	providerCBThreshold   = 2
-	providerCBCooldown    = 2 * time.Minute
-	provider429CBCooldown = 5 * time.Minute
-	providerMaxRetryAfter = 60 * time.Second
+	providerMaxAttempts    = 3
+	providerCBThreshold    = 10
+	providerCBCooldown     = 2 * time.Minute
+	provider429CBCooldown  = 5 * time.Minute
+	providerBackoffInitial = 1 * time.Second
+	providerBackoffSecond  = 3 * time.Second
+	providerMaxRetryAfter  = 60 * time.Second
 )
 
 var (
@@ -85,6 +87,10 @@ var (
 	stampRe  = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
 
 	ErrProviderNoData = errors.New("provider returned no data")
+
+	// Детерминированный генератор для User-Agent
+	uaRng *rand.Rand
+	uaMu  sync.Mutex
 )
 
 type Config struct {
@@ -386,6 +392,7 @@ type StageCStats struct {
 	CompletedRoots int
 	LostRoots      int
 	CanceledRoots  int
+	DeferredRoots  int
 	Lost           int
 }
 
@@ -1069,7 +1076,9 @@ var userAgents = []string{
 }
 
 func setBrowserHeaders(req *http.Request) {
-	ua := userAgents[rand.Intn(len(userAgents))]
+	uaMu.Lock()
+	ua := userAgents[uaRng.Intn(len(userAgents))]
+	uaMu.Unlock()
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
@@ -1195,6 +1204,12 @@ func (r *ProviderRunner) StatsKey() string {
 	}
 }
 
+func isProviderBlocked(p *ProviderRunner) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.cbUntil.IsZero() && time.Now().Before(p.cbUntil)
+}
+
 func (r *ProviderRunner) waitRate(ctx context.Context) error {
 	if r.Config.MinInterval <= 0 {
 		return nil
@@ -1285,12 +1300,10 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 	}
 
 	v, _, _ := rtCaches.ProvGroup.Do(cacheKey, func() (interface{}, error) {
-		r.mu.Lock()
-		cbOpen := !r.cbUntil.IsZero() && time.Now().Before(r.cbUntil)
-		cbUntil := r.cbUntil
-		r.mu.Unlock()
-
-		if cbOpen {
+		if isProviderBlocked(r) {
+			r.mu.Lock()
+			cbUntil := r.cbUntil
+			r.mu.Unlock()
 			pipeStats.recordProviderStat(statName, r.Category(), StatSkipped, false, 0, 0, 0, 0, 0, 0, fmt.Sprintf("circuit-open until %s", cbUntil.Format(time.RFC3339)), 0)
 			return ExecResult{nil, StatSkipped}, nil
 		}
@@ -1366,7 +1379,6 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				r.mu.Lock()
 				r.cbFailures++
 
-				// Мгновенный Circuit Breaker для WAF-блокировок и мёртвых API
 				isHardCB := httpStatus == http.StatusTooManyRequests ||
 					httpStatus == http.StatusForbidden ||
 					httpStatus >= 500
@@ -2085,7 +2097,7 @@ func containsRoot(list []RootCandidate, root string) bool {
 	return false
 }
 
-func distributeRoots(roots []RootCandidate, providers []*ProviderRunner, overlapPercent int, cfg Config) (map[*ProviderRunner][]RootCandidate, TotalAllocationStats) {
+func distributeRoots(roots []RootCandidate, providers []*ProviderRunner, overlapPercent int, cfg Config, isBlocked func(*ProviderRunner) bool) (map[*ProviderRunner][]RootCandidate, TotalAllocationStats) {
 	stats := TotalAllocationStats{
 		TotalRoots:         len(roots),
 		PrimaryAssignments: make(map[string]int),
@@ -2104,7 +2116,11 @@ func distributeRoots(roots []RootCandidate, providers []*ProviderRunner, overlap
 		if limit <= 0 {
 			limit = len(roots)
 		}
-		capacity[p] = limit
+		if isBlocked(p) {
+			capacity[p] = 0 
+		} else {
+			capacity[p] = limit
+		}
 	}
 
 	rootIdx := 0
@@ -2220,6 +2236,7 @@ const (
 	RootCompleted
 	RootLost
 	RootCanceled
+	RootDeferred
 )
 
 func RunStageC(
@@ -2240,8 +2257,7 @@ func RunStageC(
 	if len(providers) == 0 {
 		pipeStats.mu.Lock()
 		pipeStats.StageC.TotalRoots = len(roots)
-		pipeStats.StageC.LostRoots = len(roots)
-		pipeStats.StageC.Lost = len(roots)
+		pipeStats.StageC.DeferredRoots = len(roots)
 		pipeStats.mu.Unlock()
 		return
 	}
@@ -2251,14 +2267,12 @@ func RunStageC(
 		providers,
 		20,
 		cfg,
+		isProviderBlocked,
 	)
 
 	pipeStats.mu.Lock()
 	pipeStats.Alloc = allocStats
 	pipeStats.StageC.TotalRoots = len(roots)
-	pipeStats.StageC.Assigned =
-		allocStats.AssignedRoots +
-			allocStats.OverlappedAssignments
 	pipeStats.mu.Unlock()
 
 	providerLimits := make(map[*ProviderRunner]int, len(providers))
@@ -2266,26 +2280,16 @@ func RunStageC(
 
 	for _, p := range providers {
 		limit := effectiveRootLimit(p, cfg)
-		if limit <= 0 {
-			limit = len(roots)
-		}
-		if limit > len(roots) {
+		if limit <= 0 || limit > len(roots) {
 			limit = len(roots)
 		}
 		providerLimits[p] = limit
-		providerUsed[p] = len(providerRoots[p])
+		providerUsed[p] = 0 
 	}
 
 	jobQueues := make(map[*ProviderRunner]chan RootCandidate, len(providers))
 	for _, p := range providers {
-		queueSize := providerLimits[p]
-		if queueSize < 1 {
-			queueSize = 1
-		}
-		if queueSize > len(roots) {
-			queueSize = len(roots)
-		}
-		jobQueues[p] = make(chan RootCandidate, queueSize)
+		jobQueues[p] = make(chan RootCandidate, len(roots))
 	}
 
 	type stageResult struct {
@@ -2294,15 +2298,7 @@ func RunStageC(
 		result   ExecResult
 	}
 
-	totalCapacity := 0
-	for _, p := range providers {
-		totalCapacity += providerLimits[p] * 2 // x2 квота для ретраев
-	}
-	if totalCapacity < 1 {
-		totalCapacity = 1
-	}
-
-	resultsCh := make(chan stageResult, totalCapacity)
+	resultsCh := make(chan stageResult, len(roots)*len(providers))
 	var workerWG sync.WaitGroup
 
 	for _, p := range providers {
@@ -2330,19 +2326,12 @@ func RunStageC(
 
 	rootStates := make(map[string]RootState, len(roots))
 	history := make(map[string]map[*ProviderRunner]bool, len(roots))
+	scheduled := make(map[string]map[*ProviderRunner]bool, len(roots))
 
 	for _, root := range roots {
 		rootStates[root.Domain] = RootPending
 		history[root.Domain] = make(map[*ProviderRunner]bool)
-	}
-
-	inFlight := 0
-	for _, p := range providers {
-		for _, root := range providerRoots[p] {
-			history[root.Domain][p] = true
-			jobQueues[p] <- root
-			inFlight++
-		}
+		scheduled[root.Domain] = make(map[*ProviderRunner]bool)
 	}
 
 	markCompleted := func(domain string) {
@@ -2376,6 +2365,106 @@ func RunStageC(
 		pipeStats.mu.Unlock()
 	}
 
+	markDeferred := func(domain string) {
+		if rootStates[domain] != RootPending {
+			return
+		}
+		rootStates[domain] = RootDeferred
+		pipeStats.mu.Lock()
+		pipeStats.StageC.DeferredRoots++
+		pipeStats.mu.Unlock()
+	}
+
+	enqueueRoot := func(root RootCandidate, preferred *ProviderRunner) bool {
+		candidates := make([]*ProviderRunner, 0, len(providers))
+		if preferred != nil {
+			candidates = append(candidates, preferred)
+		}
+		for _, p := range providers {
+			if p != preferred {
+				candidates = append(candidates, p)
+			}
+		}
+
+		for _, p := range candidates {
+			if scheduled[root.Domain][p] {
+				continue
+			}
+			if isProviderBlocked(p) {
+				continue
+			}
+			if providerUsed[p] >= providerLimits[p]*2 {
+				continue
+			}
+
+			scheduled[root.Domain][p] = true
+			providerUsed[p]++
+			jobQueues[p] <- root
+			return true
+		}
+		return false
+	}
+
+	inFlight := 0
+
+	// 7. Initial assignments
+	for _, p := range providers {
+		for _, root := range providerRoots[p] {
+			if rootStates[root.Domain] != RootPending {
+				continue
+			}
+			if scheduled[root.Domain][p] {
+				continue
+			}
+			if enqueueRoot(root, p) {
+				inFlight++
+			}
+		}
+	}
+
+	// 7.1. Guarantee that every root gets at least one available provider
+	for _, root := range roots {
+		if rootStates[root.Domain] != RootPending {
+			continue
+		}
+		if len(scheduled[root.Domain]) == 0 {
+			if !enqueueRoot(root, nil) {
+				markDeferred(root.Domain)
+			} else {
+				inFlight++
+			}
+		}
+	}
+
+	assignedCount := 0
+	for _, root := range roots {
+		if len(scheduled[root.Domain]) > 0 {
+			assignedCount++
+		}
+	}
+	pipeStats.mu.Lock()
+	pipeStats.StageC.Assigned = assignedCount
+	pipeStats.mu.Unlock()
+
+	findNextProvider := func(domain string) (*ProviderRunner, bool) {
+		var openFound bool
+
+		for _, candidate := range providers {
+			if scheduled[domain][candidate] {
+				continue
+			}
+			if providerUsed[candidate] >= providerLimits[candidate]*2 {
+				continue
+			}
+			if isProviderBlocked(candidate) {
+				openFound = true
+				continue
+			}
+			return candidate, false
+		}
+		return nil, openFound
+	}
+
 SchedulerLoop:
 	for inFlight > 0 {
 		select {
@@ -2395,7 +2484,10 @@ SchedulerLoop:
 			res := item.result
 
 			pipeStats.mu.Lock()
-			pipeStats.StageC.Executed++
+			if res.Status != StatSkipped && res.Status != StatWaitCanceled {
+				pipeStats.StageC.Executed++
+			}
+
 			switch res.Status {
 			case StatSuccess:
 				pipeStats.StageC.Success++
@@ -2418,7 +2510,20 @@ SchedulerLoop:
 			}
 
 			if rootStates[root.Domain] != RootPending {
+				if res.Status == StatSkipped || res.Status == StatWaitCanceled {
+					providerUsed[p]--
+				}
 				continue
+			}
+
+			if res.Status == StatSkipped || res.Status == StatWaitCanceled {
+				providerUsed[p]--
+				if res.Status == StatWaitCanceled && ctx.Err() != nil {
+					markCanceled(root.Domain)
+					continue
+				}
+			} else {
+				history[root.Domain][p] = true
 			}
 
 			switch res.Status {
@@ -2427,35 +2532,18 @@ SchedulerLoop:
 				continue
 			}
 
-			var nextP *ProviderRunner
-			tried := history[root.Domain]
-
-			for _, candidate := range providers {
-				if tried[candidate] {
-					continue
-				}
-
-				candidate.mu.Lock()
-				cbOpen := !candidate.cbUntil.IsZero() && time.Now().Before(candidate.cbUntil)
-				candidate.mu.Unlock()
-
-				if cbOpen {
-					continue
-				}
-
-				// Квота на ретрай = 100% от первичной квоты
-				if providerUsed[candidate] < providerLimits[candidate]*2 {
-					nextP = candidate
-					break
-				}
-			}
+			nextP, blockedByCB := findNextProvider(root.Domain)
 
 			if nextP == nil {
-				markLost(root.Domain)
+				if blockedByCB {
+					markDeferred(root.Domain)
+				} else {
+					markLost(root.Domain)
+				}
 				continue
 			}
 
-			history[root.Domain][nextP] = true
+			scheduled[root.Domain][nextP] = true
 			providerUsed[nextP]++
 
 			pipeStats.mu.Lock()
@@ -2526,6 +2614,7 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 	fmt.Printf("    Total Roots:           %d\n", stageC.TotalRoots)
 	fmt.Printf("    Assigned (Primary+Ov): %d\n", stageC.Assigned)
 	fmt.Printf("    Completed (Unique):    %d\n", stageC.CompletedRoots)
+	fmt.Printf("    Deferred (CB Open):    %d\n", stageC.DeferredRoots)
 	fmt.Printf("    Lost (Exhausted):      %d\n", stageC.LostRoots)
 	fmt.Printf("    Canceled (Timeout):    %d\n", stageC.CanceledRoots)
 	fmt.Printf("    --- Executions ---\n")
@@ -3675,12 +3764,12 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	var extProviders []*ProviderRunner
 	if !cfg.NoCT {
 		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
 		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
 	}
@@ -4103,6 +4192,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 // ================= MAIN =================
 
 func main() {
+	var err error
+	uaRng = rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	cfg := Config{}
 	var modeStr, domainsStr string
 
@@ -4136,6 +4228,12 @@ func main() {
 
 	flag.Parse()
 
+	if cfg.Seed != 0 {
+		uaMu.Lock()
+		uaRng = rand.New(rand.NewSource(cfg.Seed))
+		uaMu.Unlock()
+	}
+
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
@@ -4168,26 +4266,23 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := ensureDB(cfg.ASNPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"); err != nil {
+	if err = ensureDB(cfg.ASNPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"); err != nil {
 		log.Fatalf("[-] Ошибка загрузки базы ASN (%s): %v", cfg.ASNPath, err)
 	}
-	if err := ensureDB(cfg.GeoIPPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"); err != nil {
+	if err = ensureDB(cfg.GeoIPPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"); err != nil {
 		log.Fatalf("[-] Ошибка загрузки базы Country (%s): %v", cfg.GeoIPPath, err)
 	}
 
 	var asnDB, countryDB *geoip2.Reader
-	if db, err := geoip2.Open(cfg.ASNPath); err == nil {
-		asnDB = db
-		defer db.Close()
-	} else {
+	if asnDB, err = geoip2.Open(cfg.ASNPath); err != nil {
 		log.Fatal("[-] Failed to open ASN DB")
 	}
-	if db, err := geoip2.Open(cfg.GeoIPPath); err == nil {
-		countryDB = db
-		defer db.Close()
-	} else {
+	defer asnDB.Close()
+
+	if countryDB, err = geoip2.Open(cfg.GeoIPPath); err != nil {
 		log.Fatal("[-] Failed to open GeoIP DB")
 	}
+	defer countryDB.Close()
 
 	dnsCtx, dnsCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer dnsCancel()
