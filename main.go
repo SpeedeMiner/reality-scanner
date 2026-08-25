@@ -529,6 +529,7 @@ type DNSResolverStat struct {
 	Failures int
 	Timeouts int
 	IPv4s    int
+	RTTMs    float64
 }
 
 type RuntimeCaches struct {
@@ -559,6 +560,45 @@ func (r *RuntimeCaches) dnsResolverStat(resolver string) *DNSResolverStat {
 		r.DNSResolverStats[resolver] = stat
 	}
 	return stat
+}
+
+func (r *RuntimeCaches) adaptiveDNSOrder(resolvers []string) []string {
+	order := append([]string(nil), resolvers...)
+	r.DNSStatsMu.Lock()
+	type scored struct {
+		resolver string
+		score    float64
+	}
+	scoredList := make([]scored, 0, len(order))
+	for i, resolver := range order {
+		stat := r.DNSResolverStats[resolver]
+		if stat == nil || stat.Attempts < 4 {
+			// Keep newer/unprobed resolvers in the fallback pool, but after measured healthy ones.
+			scoredList = append(scoredList, scored{resolver: resolver, score: 1000 + float64(i)})
+			continue
+		}
+		failRate := float64(stat.Failures) / float64(stat.Attempts)
+		timeoutRate := float64(stat.Timeouts) / float64(stat.Attempts)
+		answerRate := float64(stat.Answers) / float64(stat.Attempts)
+		rttPenalty := 0.0
+		if stat.RTTMs > 0 {
+			rttPenalty = stat.RTTMs / 25.0
+		}
+		// Lower is better. Preserve availability: this only reorders; it never disables a resolver.
+		score := failRate*500 + timeoutRate*400 - answerRate*150 + rttPenalty
+		scoredList = append(scoredList, scored{resolver: resolver, score: score})
+	}
+	r.DNSStatsMu.Unlock()
+	sort.SliceStable(scoredList, func(i, j int) bool {
+		if scoredList[i].score != scoredList[j].score {
+			return scoredList[i].score < scoredList[j].score
+		}
+		return scoredList[i].resolver < scoredList[j].resolver
+	})
+	for i := range scoredList {
+		order[i] = scoredList[i].resolver
+	}
+	return order
 }
 
 type DNSCacheEntry struct {
@@ -1003,19 +1043,22 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	}
 
 	var lastErr error
-	start := randomDNSID()
-	attempted := 0
-	for i := 0; i < len(resolvers); i++ {
-		idx := (int(start) + i) % len(resolvers)
-		resolver := resolvers[idx]
-		attempted++
+	ordered := rtCaches.adaptiveDNSOrder(resolvers)
+	for _, resolver := range ordered {
 		stat := rtCaches.dnsResolverStat(resolver)
 		rtCaches.DNSStatsMu.Lock()
 		stat.Attempts++
 		rtCaches.DNSStatsMu.Unlock()
 
+		started := time.Now()
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, timeout)
+		elapsedMs := float64(time.Since(started).Microseconds()) / 1000.0
 		rtCaches.DNSStatsMu.Lock()
+		if stat.RTTMs == 0 {
+			stat.RTTMs = elapsedMs
+		} else {
+			stat.RTTMs = stat.RTTMs*0.8 + elapsedMs*0.2
+		}
 		if err == nil {
 			stat.Answers++
 			stat.IPv4s += len(ips)
@@ -1040,9 +1083,6 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 			return nil, ctx.Err()
 		}
 	}
-	if attempted == 0 {
-		return nil, fmt.Errorf("all DNS resolvers temporarily circuit-open")
-	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all DNS resolvers failed")
 	}
@@ -1054,23 +1094,33 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	if err != nil {
 		return nil, err
 	}
+	if len(resolvers) == 0 {
+		return nil, fmt.Errorf("DNS resolver pool is empty")
+	}
+	ordered := rtCaches.adaptiveDNSOrder(resolvers)
 	var lastErr error
-	start := randomDNSID()
-	for i := 0; i < len(resolvers); i++ {
-		idx := (int(start) + i) % len(resolvers)
-		resolver := resolvers[idx]
+	nxCount := 0
+	for _, resolver := range ordered {
 		stat := rtCaches.dnsResolverStat(resolver)
+		started := time.Now()
 		rtCaches.DNSStatsMu.Lock()
 		stat.Attempts++
 		rtCaches.DNSStatsMu.Unlock()
 
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, timeout)
+		elapsedMs := float64(time.Since(started).Microseconds()) / 1000.0
 		rtCaches.DNSStatsMu.Lock()
-		if err == nil {
-			stat.Answers++
-		} else if errors.Is(err, ErrDNSNXDomain) {
-			stat.NXDomain++
+		if stat.RTTMs == 0 {
+			stat.RTTMs = elapsedMs
 		} else {
+			stat.RTTMs = stat.RTTMs*0.8 + elapsedMs*0.2
+		}
+		switch {
+		case err == nil:
+			stat.Answers++
+		case errors.Is(err, ErrDNSNXDomain):
+			stat.NXDomain++
+		default:
 			stat.Failures++
 			if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
 				stat.Timeouts++
@@ -1078,16 +1128,22 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		}
 		rtCaches.DNSStatsMu.Unlock()
 
-		if err == nil {
+		if err == nil && len(names) > 0 {
 			return names, nil
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
-			return nil, ErrDNSNXDomain
+			nxCount++
+			continue
 		}
-		lastErr = err
+		if err != nil {
+			lastErr = err
+		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+	}
+	if nxCount == len(ordered) {
+		return nil, ErrDNSNXDomain
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all DNS resolvers failed")
