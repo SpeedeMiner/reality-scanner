@@ -67,13 +67,13 @@ const (
 	MaxDiscoveredDomains = 50000
 	LimitValidPairs      = 10000
 
-	// FAST-FAIL НАСТРОЙКИ (Оптимизировано для быстрой отбраковки мёртвых источников)
-	providerMaxAttempts    = 2 // Снижено с 3 до 2
-	providerCBThreshold    = 2 // Снижено с 8 до 2 (2 полностью упавших корня = отключение источника)
+	// Оптимальные и стабильные настройки ретраев для OSINT
+	providerMaxAttempts    = 3
+	providerCBThreshold    = 10 // Только 10 подряд упавших задач отключают провайдера
 	providerCBCooldown     = 2 * time.Minute
 	provider429CBCooldown  = 5 * time.Minute
-	providerBackoffInitial = 750 * time.Millisecond
-	providerBackoffSecond  = 2 * time.Second
+	providerBackoffInitial = 1 * time.Second
+	providerBackoffSecond  = 3 * time.Second
 	providerMaxRetryAfter  = 60 * time.Second
 )
 
@@ -1334,11 +1334,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				break
 			}
 
-			httpStatus := providerHTTPStatus(err)
-			if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden || httpStatus >= 500 {
-				break
-			}
-
+			// Больше не обрываем ретраи при 502/429/403. Даем провайдеру шанс восстановиться.
 			if !isTransientProviderError(err) || attempt == providerMaxAttempts {
 				break
 			}
@@ -1412,11 +1408,8 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				r.mu.Lock()
 				r.cbFailures++
 
-				isHardCB := httpStatus == http.StatusTooManyRequests ||
-					httpStatus == http.StatusForbidden ||
-					httpStatus >= 500
-
-				if r.cbFailures >= providerCBThreshold || isHardCB {
+				// Используем только счетчик падений для Circuit Breaker
+				if r.cbFailures >= providerCBThreshold {
 					cooldown := providerCBCooldown
 					if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
 						cooldown = provider429CBCooldown
@@ -2291,12 +2284,19 @@ func RunStageC(
 		return
 	}
 
-	providerRoots, allocStats := distributeRoots(roots, providers, 20, cfg)
+	providerRoots, allocStats := distributeRoots(
+		roots,
+		providers,
+		20,
+		cfg,
+	)
 
 	pipeStats.mu.Lock()
 	pipeStats.Alloc = allocStats
 	pipeStats.StageC.TotalRoots = len(roots)
-	pipeStats.StageC.Assigned = allocStats.AssignedRoots + allocStats.OverlappedAssignments
+	pipeStats.StageC.Assigned =
+		allocStats.AssignedRoots +
+			allocStats.OverlappedAssignments
 	pipeStats.mu.Unlock()
 
 	providerLimits := make(map[*ProviderRunner]int, len(providers))
@@ -3708,14 +3708,14 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	var extProviders []*ProviderRunner
 	if !cfg.NoCT {
-		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 12 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 2 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
-		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 3 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 2 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 3 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 3 * time.Second, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 3 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
 	}
 	if !cfg.NoReverseIP {
