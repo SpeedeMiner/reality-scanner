@@ -1279,41 +1279,6 @@ func providerHTTPStatus(err error) int {
 	return 0
 }
 
-func isTransientProviderError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-		return true
-	}
-	var httpErr *ProviderHTTPError
-	if errors.As(err, &httpErr) {
-		switch httpErr.StatusCode {
-		case http.StatusTooManyRequests,
-			http.StatusForbidden,
-			http.StatusInternalServerError,
-			http.StatusBadGateway,
-			http.StatusServiceUnavailable,
-			http.StatusGatewayTimeout:
-			return true
-		}
-	}
-	msg := strings.ToLower(err.Error())
-	for _, s := range []string{
-		"connection reset",
-		"connection refused",
-		"broken pipe",
-		"unexpected eof",
-		"temporary",
-		"tls handshake timeout",
-	} {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-	return false
-}
-
 func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http.Client, pipeStats *PipelineStats, rtCaches *RuntimeCaches) ExecResult {
 	if err := ctx.Err(); err != nil {
 		return ExecResult{Names: nil, Status: StatWaitCanceled}
@@ -1393,19 +1358,10 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				r.cbFailures = 0
 				r.cbUntil = time.Time{}
 				r.mu.Unlock()
-
 				pipeStats.recordProviderStat(statName, r.Category(), StatNoData, false, 0, 0, 0, 0, 0, httpStatus, err.Error(), 0)
 				rtCaches.ProvCache.Put(cacheKey, []string{}, StatNoData, 2*time.Minute)
 				return ExecResult{[]string{}, StatNoData}, nil
 			}
-
-			if len(cleanRes) > 0 {
-				pipeStats.recordProviderStat(statName, r.Category(), StatPartial, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), 0)
-				rtCaches.ProvCache.Put(cacheKey, cleanRes, StatPartial, 2*time.Minute)
-				return ExecResult{cleanRes, StatPartial}, nil
-			}
-
-			pipeStats.recordProviderStat(statName, r.Category(), StatFailed, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), 0)
 
 			if !errors.Is(err, context.Canceled) {
 				cooldown, hardBlock := providerCooldown(err)
@@ -1424,6 +1380,14 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				r.cbFailures = 0
 				r.mu.Unlock()
 			}
+
+			if len(cleanRes) > 0 {
+				pipeStats.recordProviderStat(statName, r.Category(), StatPartial, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), 0)
+				rtCaches.ProvCache.Put(cacheKey, cleanRes, StatPartial, 2*time.Minute)
+				return ExecResult{cleanRes, StatPartial}, nil
+			}
+
+			pipeStats.recordProviderStat(statName, r.Category(), StatFailed, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), 0)
 			return ExecResult{nil, StatFailed}, nil
 		}
 
@@ -2323,7 +2287,11 @@ func RunStageC(
 
 	jobQueues := make(map[*ProviderRunner]chan RootJob, len(providers))
 	for _, p := range providers {
-		jobQueues[p] = make(chan RootJob, len(roots))
+		queueSize := providerLimits[p] * 2
+		if queueSize < 1 {
+			queueSize = 1
+		}
+		jobQueues[p] = make(chan RootJob, queueSize)
 	}
 
 	type stageResult struct {
@@ -2356,7 +2324,7 @@ func RunStageC(
 				defer workerWG.Done()
 				for job := range jobQueues[p] {
 					res := p.Execute(job.Ctx, job.Root.Domain, client, pipeStats, rtCaches)
-					
+
 					select {
 					case resultsCh <- stageResult{
 						provider: p,
@@ -2483,7 +2451,6 @@ func RunStageC(
 
 	inFlight := 0
 
-	// 7. Initial assignments
 	for _, p := range providers {
 		for _, root := range providerRoots[p] {
 			if rootStates[root.Domain] != RootPending {
@@ -2498,7 +2465,6 @@ func RunStageC(
 		}
 	}
 
-	// 7.1. Guarantee that every root gets at least one available provider
 	for _, root := range roots {
 		if rootStates[root.Domain] != RootPending {
 			continue
@@ -2514,9 +2480,7 @@ func RunStageC(
 
 	assignedCount := 0
 	for _, root := range roots {
-		if len(scheduled[root.Domain]) > 0 {
-			assignedCount++
-		}
+		assignedCount += len(scheduled[root.Domain])
 	}
 	pipeStats.mu.Lock()
 	pipeStats.StageC.Assigned = assignedCount
@@ -4307,9 +4271,9 @@ func main() {
 	flag.BoolVar(&cfg.NoPassive, "no-passive", false, "Disable Passive DNS OSINT")
 	flag.BoolVar(&cfg.NoReverseIP, "no-reverse-ip", false, "Disable Reverse IP lookups")
 
-	flag.StringVar(&cfg.VTKey, "vt-key", os.Getenv("dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5"), "VirusTotal API Key")
-	flag.StringVar(&cfg.URLScanKey, "urlscan-key", os.Getenv("01a032ae-681d-7718-821b-c6fd33aa11a7"), "URLScan.io API Key")
-	flag.StringVar(&cfg.ChaosKey, "chaos-key", os.Getenv("e3c91ed9-2f79-4147-807f-43dd150003e4"), "ProjectDiscovery Chaos API Key")
+	flag.StringVar(&cfg.VTKey, "vt-key", "dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5", "VirusTotal API Key")
+	flag.StringVar(&cfg.URLScanKey, "urlscan-key", "01a032ae-681d-7718-821b-c6fd33aa11a7", "URLScan.io API Key")
+	flag.StringVar(&cfg.ChaosKey, "chaos-key", "e3c91ed9-2f79-4147-807f-43dd150003e4", "ProjectDiscovery Chaos API Key")
 
 	flag.Parse()
 
