@@ -24,17 +24,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	dnscrypt "github.com/ameshkov/dnscrypt/v2"
-	"github.com/ameshkov/dnsstamps"
-	mdns "github.com/miekg/dns"
-	"github.com/oschwald/geoip2-golang"
+	"golang.org/x/net/publicsuffix"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
-	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
@@ -61,18 +56,16 @@ const (
 	FlagPriority   = 0x20
 	FlagAck        = 0x01
 
-	dnsFastPoolSize = 32
-
 	LimitMaxIPs          = 262144
 	MaxDiscoveredDomains = 50000
 	LimitValidPairs      = 10000
+	MaxHostsPer24        = 254
+	MaxSampled24         = 4
 
 	providerMaxAttempts    = 3
 	providerCBThreshold    = 10
 	providerCBCooldown     = 2 * time.Minute
 	provider429CBCooldown  = 5 * time.Minute
-	providerBackoffInitial = 1 * time.Second
-	providerBackoffSecond  = 3 * time.Second
 	providerMaxRetryAfter  = 60 * time.Second
 )
 
@@ -84,8 +77,8 @@ var (
 
 	domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
 	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
-	stampRe  = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
 
+	ErrDNSNXDomain    = errors.New("NXDOMAIN")
 	ErrProviderNoData = errors.New("provider returned no data")
 
 	uaRng *rand.Rand
@@ -95,6 +88,7 @@ var (
 type Config struct {
 	Mode             Mode
 	Workers          int
+	DNSWorkers       int
 	MaxIPs           int
 	IPOSINTLimit     int
 	DomainOSINTLimit int
@@ -103,19 +97,17 @@ type Config struct {
 	H2ReadTimeoutMs  int
 	H2WriteTimeoutMs int
 	Seed             int64
-	TargetASN        uint
+	TargetASN        string
 	TargetCountry    string
 	TargetIP         string
 	DirectSNI        string
-	ScanEntireASN    bool
 	CIDRs            []string
 	Domains          []string
-	GeoIPPath        string
-	ASNPath          string
 	NoPTR            bool
 	NoCT             bool
 	NoPassive        bool
 	NoReverseIP      bool
+	NoActiveTLS      bool
 
 	VTKey      string
 	URLScanKey string
@@ -129,6 +121,7 @@ type DomainSource uint32
 const (
 	SourceSeed DomainSource = 1 << iota
 	SourcePTR
+	SourceDirectTLS
 	SourceCRTSh
 	SourceCertSpotter
 	SourceAlienVault
@@ -161,36 +154,16 @@ type RootCandidate struct {
 
 func rankRootSources(s DomainSource) int {
 	score := 0
-	if s.Has(SourcePTR) {
-		score += 10
-	}
-	if s.Has(SourceHackerTarget) {
-		score += 8
-	}
-	if s.Has(SourceShodan) {
-		score += 8
-	}
-	if s.Has(SourceVirusTotalIP) || s.Has(SourceVirusTotalDomain) {
-		score += 6
-	}
-	if s.Has(SourceChaos) {
-		score += 5
-	}
-	if s.Has(SourceCRTSh) || s.Has(SourceCertSpotter) {
-		score += 4
-	}
-	if s.Has(SourceAlienVault) || s.Has(SourceURLScan) {
-		score += 3
-	}
-	if s.Has(SourceAnubis) || s.Has(SourceThreatMiner) || s.Has(SourceHTDomain) {
-		score += 3
-	}
-	if s.Has(SourceWayback) {
-		score += 2
-	}
-	if s.Has(SourceSeed) {
-		score += 5
-	}
+	if s.Has(SourcePTR) { score += 10 }
+	if s.Has(SourceHackerTarget) { score += 8 }
+	if s.Has(SourceShodan) { score += 8 }
+	if s.Has(SourceVirusTotalIP) || s.Has(SourceVirusTotalDomain) { score += 6 }
+	if s.Has(SourceChaos) { score += 5 }
+	if s.Has(SourceCRTSh) || s.Has(SourceCertSpotter) { score += 4 }
+	if s.Has(SourceAlienVault) || s.Has(SourceURLScan) { score += 3 }
+	if s.Has(SourceAnubis) || s.Has(SourceThreatMiner) || s.Has(SourceHTDomain) { score += 3 }
+	if s.Has(SourceWayback) { score += 2 }
+	if s.Has(SourceSeed) { score += 5 }
 	return score
 }
 
@@ -310,8 +283,6 @@ type Candidate struct {
 	Server                string
 	ContentType           string
 	Timings               Timings
-	ASN                   uint
-	Country               string
 	CDNProvider           string
 	CDNStatus             CDNStatus
 	Score                 float64
@@ -337,6 +308,10 @@ type Candidate struct {
 	InitialPeerSettings   PeerSettingsProfile
 	LatestPeerSettings    PeerSettingsProfile
 	H2DataFrames          int
+
+	HPACKErrors   bool
+	MissingStatus bool
+	ReadTimeout   bool
 }
 
 type TargetPair struct {
@@ -395,33 +370,85 @@ type StageCStats struct {
 	Lost           int
 }
 
+type TotalAllocationStats struct {
+	TotalRoots            int
+	AssignedRoots         int
+	OverlappedAssignments int
+	UnassignedRoots       int
+	PrimaryAssignments    map[string]int
+	OverlapAssignments    map[string]int
+}
+
 type PipelineStats struct {
 	mu                    sync.Mutex
 	IPSampled             int
-	IPWithPTR             int
+	ActiveProbes          int
+	UniqueDomains         int
+
+	// DNS
 	DNSQueries            int
 	DNSSuccess            int
 	DNSFailed             int
 	DNSNXDomain           int
 	DNSTimeout            int
 	DNSTemporary          int
-	DNSNoIPv4             int
 	DNSOtherErr           int
+	DNSNoIPv4             int
 	DNSResolvedIPs        int
 	DNSUniqueResolvedIPs  int
 	DNSUniqueTargetIPs    int
 	DNSTargetRangeMatches int
 	DNSTargetDomains      int
 	DNSValidPairs         int
-	TCPConnected          int
+
+	// PTR
+	PTRQueriesSent int
+	PTRFound       int
+	PTRErrors      int
+
+	// TCP
+	TCPConnected int
+	TCPTimeouts  int
+	TCPRefused   int
+	TCPOtherErrs int
+
+	// TLS
 	TLSHandshake          int
-	NoPeerCertificates    int
+	TLSTimeouts           int
 	TLSValidationFailures int
-	H2HeadersOK           int
-	EndStreamOK           int
-	ASNFiltered           int
-	CountryFiltered       int
-	CDNDropped            int
+	NoPeerCertificates    int
+	TLSHandshakeFailure   int
+	TLSUnrecognizedName   int
+	TLSConnectionReset    int
+	TLSEOF                int
+	TLSOtherErrs          int
+
+	// H2
+	H2NoALPN          int
+	H2ProtocolOK      int
+	H2TimeoutNoFrames int
+	H2ConnectionReset int
+	H2BrokenPipe      int
+	H2BadRequest      int
+	H2GoAway          int
+	H2EOF             int
+	H2TLSAlerts       int
+	H2OtherErrs       int
+
+	H2HeadersOK   int
+	H2Timeouts    int
+	H2HPACKErrors int
+
+	H2StatusOK      int
+	H2InvalidStatus int
+	EndStreamOK     int
+
+	// Final
+	ScoreRejected      int
+	CandidatesAccepted int
+
+	IPWithPTR       int
+	IPWithDirectTLS int
 
 	Alloc         TotalAllocationStats
 	StageC        StageCStats
@@ -482,6 +509,96 @@ func (s *PipelineStats) recordProviderStat(name string, cat DiscoveryCategory, r
 	}
 }
 
+func (s *PipelineStats) SnapshotAndPrint(clustered int, ds *DiscoveryState) {
+	s.mu.Lock()
+	allocStats := s.Alloc
+	stageC := s.StageC
+	localStats := make(map[string]ProviderStats)
+	for k, v := range s.ProviderStats {
+		localStats[k] = *v
+	}
+	s.mu.Unlock()
+
+	fmt.Println("\n===================================================================================================================")
+	fmt.Println("                                   ТЕЛЕМЕТРИЯ СКАНИРОВАНИЯ (PIPELINE STATS)")
+	fmt.Println("===================================================================================================================")
+	fmt.Printf("[*] IP отобрано для пула:      %d\n", s.IPSampled)
+	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", s.PTRFound)
+	fmt.Printf("[*] IP с сертификатами (TLS):  %d\n", s.IPWithDirectTLS)
+	fmt.Printf("[*] Найдено уник. доменов:     %d\n\n", s.UniqueDomains)
+
+	fmt.Printf("[*] STAGE C: Domain OSINT Pipeline Stats:\n")
+	fmt.Printf("    Total Roots:           %d\n", stageC.TotalRoots)
+	fmt.Printf("    Assigned (Primary+Ov): %d\n", stageC.Assigned)
+	fmt.Printf("    Completed (Unique):    %d\n", stageC.CompletedRoots)
+	fmt.Printf("    Deferred (CB Open):    %d\n", stageC.DeferredRoots)
+	fmt.Printf("    Lost (Exhausted):      %d\n", stageC.LostRoots)
+	fmt.Printf("    Canceled (Timeout):    %d\n", stageC.CanceledRoots)
+	fmt.Printf("    --- Executions ---\n")
+	fmt.Printf("    Executed Calls:        %d\n", stageC.Executed)
+	fmt.Printf("    Success:               %d\n", stageC.Success)
+	fmt.Printf("    NoData:                %d\n", stageC.NoData)
+	fmt.Printf("    Partial:               %d\n", stageC.Partial)
+	fmt.Printf("    Failed:                %d\n", stageC.Failed)
+	fmt.Printf("    Skipped (CB/Rate):     %d\n", stageC.Skipped)
+	fmt.Printf("    Reassigned to next:    %d\n", stageC.Reassigned)
+
+	fmt.Println("\nSNI/Hostname Discovery Providers:")
+	categories := map[DiscoveryCategory][]string{}
+	for name, ps := range localStats {
+		cat := ps.Category
+		if cat == "" {
+			cat = DiscoveryCategory("Unknown")
+		}
+		categories[cat] = append(categories[cat], name)
+	}
+	catNames := make([]string, 0, len(categories))
+	for c := range categories {
+		catNames = append(catNames, string(c))
+	}
+	sort.Strings(catNames)
+
+	for _, catStr := range catNames {
+		cat := DiscoveryCategory(catStr)
+		names := categories[cat]
+		fmt.Printf("  [%s]\n", cat)
+		sort.Strings(names)
+		for _, name := range names {
+			p := localStats[name]
+			primAlloc := allocStats.PrimaryAssignments[name]
+			ovAlloc := allocStats.OverlapAssignments[name]
+			fmt.Printf("    %-20s : Roots: %d (prim:%d ov:%d) | Попыток: %d (Успех: %d, NoData: %d, Част: %d, Ошиб: %d, Cancel: %d) -> Raw: %d (Уник: %d, Невалид: %d, Лимит: %d, Accept: %d)",
+				name, primAlloc+ovAlloc, primAlloc, ovAlloc, p.Attempts, p.Success, p.NoData, p.Partial, p.Failed, p.WaitCanceled, p.RawNames, p.UniqueNames, p.InvalidNames, p.LimitedNames, p.AcceptedNames)
+			if p.LastStatus != 0 {
+				fmt.Printf(" | HTTP=%d", p.LastStatus)
+			}
+			if p.LastError != "" {
+				fmt.Printf(" | err=%s", p.LastError)
+			}
+			fmt.Println()
+		}
+	}
+
+	fmt.Printf("\n[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", s.DNSQueries, s.DNSSuccess, s.DNSFailed)
+	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", s.DNSResolvedIPs, s.DNSNXDomain, s.DNSNoIPv4)
+	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", s.DNSTimeout, s.DNSTemporary, s.DNSOtherErr)
+	fmt.Printf("    Детали PTR запросов:       Sent: %d, Found: %d, Err: %d\n", s.PTRQueriesSent, s.PTRFound, s.PTRErrors)
+	fmt.Printf("[*] Target Range IP Matches:   %d\n", s.DNSTargetRangeMatches)
+	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n\n", s.DNSValidPairs)
+
+	fmt.Printf("[*] Анализ Stage E (Строгая Воронка):\n")
+	fmt.Printf("    1. Целей на входе (DNS):       %d\n", s.DNSValidPairs)
+	fmt.Printf("    2. Успешный TCP коннект:       %d (Потери: Timeouts=%d, Refused=%d, Other=%d)\n", s.TCPConnected, s.TCPTimeouts, s.TCPRefused, s.TCPOtherErrs)
+	fmt.Printf("    3. Успешный TLS хэндшейк:      %d (Потери: Timeouts=%d, HandshakeFail=%d, UnrecName=%d, ConnReset=%d, EOF=%d, NoCert=%d, CertFail=%d, Other=%d)\n", s.TLSHandshake, s.TLSTimeouts, s.TLSHandshakeFailure, s.TLSUnrecognizedName, s.TLSConnectionReset, s.TLSEOF, s.NoPeerCertificates, s.TLSValidationFailures, s.TLSOtherErrs)
+	fmt.Printf("    4. Подтверждён H2 протокол:    %d (Потери: TimeoutNoFrames=%d, ConnReset=%d, BrokenPipe=%d, BadRequest/HTTP1=%d, GoAway=%d, EOF=%d, TLSAlerts=%d, Other=%d)\n", s.H2ProtocolOK, s.H2TimeoutNoFrames, s.H2ConnectionReset, s.H2BrokenPipe, s.H2BadRequest, s.H2GoAway, s.H2EOF, s.H2TLSAlerts, s.H2OtherErrs)
+	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", s.H2HeadersOK, s.H2Timeouts, s.H2HPACKErrors)
+	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", s.H2StatusOK, s.H2InvalidStatus)
+	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d)\n", s.CandidatesAccepted, s.ScoreRejected)
+
+	fmt.Printf("\n    *  Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
+	fmt.Printf("    *  Уникальных IP-кластеров:    %d\n", clustered)
+}
+
 type RuntimeCaches struct {
 	ProvCache *SafeCache
 	ProvGroup *singleflight.Group
@@ -496,51 +613,6 @@ func NewRuntimeCaches() *RuntimeCaches {
 		DNSCache:  NewSafeDNSCache(),
 		DNSGroup:  &singleflight.Group{},
 	}
-}
-
-type DNSCacheEntry struct {
-	IPs      []string
-	NXDomain bool
-	Expires  time.Time
-}
-
-type SafeDNSCache struct {
-	mu   sync.RWMutex
-	data map[string]*DNSCacheEntry
-}
-
-func NewSafeDNSCache() *SafeDNSCache {
-	return &SafeDNSCache{data: make(map[string]*DNSCacheEntry)}
-}
-func (c *SafeDNSCache) Get(key string) (*DNSCacheEntry, bool) {
-	c.mu.RLock()
-	v, ok := c.data[key]
-	c.mu.RUnlock()
-	if !ok {
-		return nil, false
-	}
-	if time.Now().After(v.Expires) {
-		c.mu.Lock()
-		if v2, ok2 := c.data[key]; ok2 && time.Now().After(v2.Expires) {
-			delete(c.data, key)
-		}
-		c.mu.Unlock()
-		return nil, false
-	}
-	var ips []string
-	if v.IPs != nil {
-		ips = append([]string(nil), v.IPs...)
-	}
-	return &DNSCacheEntry{IPs: ips, NXDomain: v.NXDomain}, true
-}
-func (c *SafeDNSCache) Put(key string, entry *DNSCacheEntry, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var ips []string
-	if entry.IPs != nil {
-		ips = append([]string(nil), entry.IPs...)
-	}
-	c.data[key] = &DNSCacheEntry{IPs: ips, NXDomain: entry.NXDomain, Expires: time.Now().Add(ttl)}
 }
 
 type CacheItem struct {
@@ -586,421 +658,244 @@ func (c *SafeCache) Put(key string, vals []string, status StatResult, ttl time.D
 	}
 }
 
-// ================= DNSCRYPT POOL =================
-const dnsPoolCacheFile = "dnscrypt_pool.json"
-const requiredDNSProps = dnsstamps.ServerInformalPropertyNoLog | dnsstamps.ServerInformalPropertyNoFilter
-
-var resolverListURLsV3 = []string{
-	"https://download.dnscrypt.info/resolvers-list/v3/public-resolvers.md",
-	"https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md",
-	"https://cdn.jsdelivr.net/gh/DNSCrypt/dnscrypt-resolvers@master/v3/public-resolvers.md",
-}
-var resolverListURLsV2 = []string{
-	"https://download.dnscrypt.info/resolvers-list/v2/public-resolvers.md",
+type DNSCacheEntry struct {
+	IPs      []string
+	NXDomain bool
+	Expires  time.Time
 }
 
-type DNSResolver struct {
-	Stamp              string
-	Info               *dnscrypt.ResolverInfo
-	RTT                time.Duration
-	Success            atomic.Uint64
-	Failures           atomic.Uint64
-	ConsecutiveFailure atomic.Uint64
-	mu                 sync.Mutex
-	DisabledTo         time.Time
+type SafeDNSCache struct {
+	mu   sync.RWMutex
+	data map[string]*DNSCacheEntry
 }
 
-func (r *DNSResolver) getInfo() *dnscrypt.ResolverInfo {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.Info
+func NewSafeDNSCache() *SafeDNSCache {
+	return &SafeDNSCache{data: make(map[string]*DNSCacheEntry)}
 }
 
-func (r *DNSResolver) refresh() error {
-	client := &dnscrypt.Client{Net: "udp", Timeout: 3 * time.Second}
-	info, err := client.Dial(r.Stamp)
-	if err != nil {
-		return err
+func (c *SafeDNSCache) Get(key string) (*DNSCacheEntry, bool) {
+	c.mu.RLock()
+	v, ok := c.data[key]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
 	}
-	r.mu.Lock()
-	r.Info = info
-	r.mu.Unlock()
-	return nil
-}
-
-type DNSPool struct {
-	mu             sync.RWMutex
-	resolvers      []*DNSResolver
-	Discovered     atomic.Uint64
-	Checked        atomic.Uint64
-	Healthy        atomic.Uint64
-	LogicalQueries atomic.Uint64
-	Queries        atomic.Uint64
-	Successes      atomic.Uint64
-	Failures       atomic.Uint64
-	Retries        atomic.Uint64
-	rngMu          sync.Mutex
-	rng            *rand.Rand
-}
-
-type StampCache struct {
-	Timestamp time.Time `json:"timestamp"`
-	Stamps    []string  `json:"stamps"`
-}
-
-func parseResolverList(body string) []string {
-	lines := strings.Split(body, "\n")
-	seen := make(map[string]struct{})
-	var stamps []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !stampRe.MatchString(line) {
-			continue
+	if time.Now().After(v.Expires) {
+		c.mu.Lock()
+		if v2, ok2 := c.data[key]; ok2 && time.Now().After(v2.Expires) {
+			delete(c.data, key)
 		}
-		stamp, err := dnsstamps.NewServerStampFromString(line)
-		if err != nil || stamp.Proto != dnsstamps.StampProtoTypeDNSCrypt || stamp.Props&requiredDNSProps != requiredDNSProps {
-			continue
-		}
-		if _, ok := seen[line]; ok {
-			continue
-		}
-		seen[line] = struct{}{}
-		stamps = append(stamps, line)
+		c.mu.Unlock()
+		return nil, false
 	}
-	return stamps
+	var ips []string
+	if v.IPs != nil {
+		ips = append([]string(nil), v.IPs...)
+	}
+	return &DNSCacheEntry{IPs: ips, NXDomain: v.NXDomain}, true
 }
 
-func downloadResolverList(ctx context.Context, urlStr string) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
-	if err != nil {
-		return nil, err
+func (c *SafeDNSCache) Put(key string, entry *DNSCacheEntry, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var ips []string
+	if entry.IPs != nil {
+		ips = append([]string(nil), entry.IPs...)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	c.data[key] = &DNSCacheEntry{IPs: ips, NXDomain: entry.NXDomain, Expires: time.Now().Add(ttl)}
+}
+
+// ================= API HELPERS (RIPE & IP-API) =================
+
+func getPublicIP(targetIP string) (string, error) {
+	if targetIP != "" {
+		ip := net.ParseIP(targetIP)
+		if ip != nil && ip.To4() != nil {
+			return ip.To4().String(), nil
+		}
+		return "", fmt.Errorf("invalid target IPv4 format: %s", targetIP)
+	}
+	urls := []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"}
+	client := &http.Client{Timeout: 4 * time.Second}
+	for _, u := range urls {
+		resp, err := client.Get(u)
+		if err == nil {
+			defer resp.Body.Close()
+			ipBytes, _ := io.ReadAll(resp.Body)
+			ipStr := strings.TrimSpace(string(ipBytes))
+			ip := net.ParseIP(ipStr)
+			if ip != nil && ip.To4() != nil {
+				return ip.To4().String(), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("could not determine public IPv4. Please provide it manually via -vps-ip")
+}
+
+func getCountry(ip string) string {
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode", ip))
 	if err != nil {
-		return nil, err
+		return ""
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, urlStr)
+	if resp.StatusCode == 200 {
+		var result struct {
+			CountryCode string `json:"countryCode"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			return strings.ToUpper(result.CountryCode)
+		}
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
-	if err != nil {
-		return nil, err
-	}
-	return parseResolverList(string(body)), nil
+	return "UNKNOWN"
 }
 
-func loadResolverStamps(ctx context.Context) ([]string, error) {
-	if data, err := os.ReadFile(dnsPoolCacheFile); err == nil {
-		var cache StampCache
-		if err := json.Unmarshal(data, &cache); err == nil {
-			if time.Since(cache.Timestamp) < 12*time.Hour && len(cache.Stamps) > 0 {
-				fmt.Printf("[DNS] Загружено %d stamps из локального кэша\n", len(cache.Stamps))
-				return cache.Stamps, nil
-			}
-		}
-	}
-	var all []string
-	for _, urlStr := range resolverListURLsV3 {
-		stamps, err := downloadResolverList(ctx, urlStr)
-		if err != nil {
-			continue
-		}
-		all = append(all, stamps...)
-	}
-	if len(all) < 50 {
-		for _, urlStr := range resolverListURLsV2 {
-			stamps, err := downloadResolverList(ctx, urlStr)
-			if err == nil {
-				all = append(all, stamps...)
-			}
-		}
-	}
-	all = uniqueStrings(all)
-	if len(all) == 0 {
-		return nil, fmt.Errorf("no DNSCrypt resolvers found")
-	}
-	cacheData, err := json.Marshal(StampCache{Timestamp: time.Now(), Stamps: all})
+func getASNAndPrefix(ip string) (string, string) {
+	var asn, prefix string
+	client := &http.Client{Timeout: 6 * time.Second}
+
+	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
 	if err == nil {
-		_ = os.WriteFile(dnsPoolCacheFile, cacheData, 0644)
-	}
-	return all, nil
-}
-
-func checkDNSResolver(ctx context.Context, stamp string) (*DNSResolver, error) {
-	client := &dnscrypt.Client{Net: "udp", Timeout: 3 * time.Second}
-	info, err := client.Dial(stamp)
-	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
-	}
-	tests := []struct {
-		Name      string
-		Type      uint16
-		WantRcode int
-	}{
-		{"example.com.", mdns.TypeA, mdns.RcodeSuccess},
-		{"cloudflare.com.", mdns.TypeA, mdns.RcodeSuccess},
-		{"this-name-should-not-exist.invalid.", mdns.TypeA, mdns.RcodeNameError},
-	}
-	var totalRTT time.Duration
-	for _, t := range tests {
-		req := new(mdns.Msg)
-		req.SetQuestion(t.Name, t.Type)
-		req.RecursionDesired = true
-		qStart := time.Now()
-		resp, err := client.Exchange(req, info)
-		if err != nil {
-			return nil, fmt.Errorf("exchange %s: %w", t.Name, err)
+		var result struct {
+			Data struct {
+				ASNs   []interface{} `json:"asns"`
+				Prefix string        `json:"prefix"`
+			} `json:"data"`
 		}
-		totalRTT += time.Since(qStart)
-		if resp == nil || resp.Rcode != t.WantRcode {
-			return nil, fmt.Errorf("bad response for %s", t.Name)
-		}
-	}
-	return &DNSResolver{Stamp: stamp, Info: info, RTT: totalRTT / 3}, nil
-}
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 
-func buildDNSPool(ctx context.Context, stamps []string) *DNSPool {
-	pool := &DNSPool{rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
-	pool.Discovered.Store(uint64(len(stamps)))
-
-	var mu sync.Mutex
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(64)
-
-	for _, stamp := range stamps {
-		stamp := stamp
-		g.Go(func() error {
-			r, err := checkDNSResolver(gctx, stamp)
-			pool.Checked.Add(1)
-
-			if err == nil {
-				pool.Healthy.Add(1)
-				mu.Lock()
-				pool.resolvers = append(pool.resolvers, r)
-				mu.Unlock()
+		if len(result.Data.ASNs) > 0 {
+			asn = fmt.Sprintf("%v", result.Data.ASNs[0])
+			if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
+				asn = "AS" + asn
 			}
-			return nil
-		})
-	}
-	_ = g.Wait()
-	pool.sortByRTT()
-	return pool
-}
-
-func (p *DNSPool) sortByRTT() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	sort.Slice(p.resolvers, func(i, j int) bool {
-		return p.resolvers[i].RTT < p.resolvers[j].RTT
-	})
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func (p *DNSPool) pickWeighted() *DNSResolver {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	var available []*DNSResolver
-	now := time.Now()
-	for _, r := range p.resolvers {
-		r.mu.Lock()
-		disabled := now.Before(r.DisabledTo)
-		r.mu.Unlock()
-		if !disabled {
-			available = append(available, r)
 		}
+		prefix = result.Data.Prefix
 	}
 
-	if len(available) == 0 {
-		return nil
-	}
-	n := len(available)
-	if n > dnsFastPoolSize {
-		n = dnsFastPoolSize
-	}
+	if asn == "" {
+		resp2, err2 := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=as", ip))
+		if err2 == nil {
+			var res2 struct {
+				AS string `json:"as"`
+			}
+			json.NewDecoder(resp2.Body).Decode(&res2)
+			resp2.Body.Close()
 
-	var weights []int
-	totalWeight := 0
-
-	for i := 0; i < n; i++ {
-		r := available[i]
-		r.mu.Lock()
-		rtt := r.RTT.Milliseconds()
-		r.mu.Unlock()
-
-		success := r.Success.Load()
-		failures := r.Failures.Load()
-		totalReqs := success + failures
-		if totalReqs == 0 {
-			totalReqs = 1
-		}
-		failureRate := float64(failures) / float64(totalReqs)
-
-		weight := 1000 / int(max64(10, rtt))
-		if weight < 1 {
-			weight = 1
-		}
-		if failureRate > 0.30 {
-			weight /= 4
-		} else if failureRate > 0.10 {
-			weight /= 2
-		}
-		if weight < 1 {
-			weight = 1
-		}
-
-		weights = append(weights, weight)
-		totalWeight += weight
-	}
-
-	if totalWeight == 0 {
-		return available[0]
-	}
-
-	p.rngMu.Lock()
-	x := p.rng.Intn(totalWeight)
-	p.rngMu.Unlock()
-
-	for i, w := range weights {
-		if x < w {
-			return available[i]
-		}
-		x -= w
-	}
-	return available[0]
-}
-
-func (p *DNSPool) onFailure(r *DNSResolver) {
-	r.mu.Lock()
-	r.DisabledTo = time.Now().Add(5 * time.Minute)
-	r.mu.Unlock()
-}
-
-func (p *DNSPool) resolverFailure(r *DNSResolver) uint64 {
-	r.Failures.Add(1)
-	n := r.ConsecutiveFailure.Add(1)
-	if n >= 3 {
-		p.onFailure(r)
-	}
-	return n
-}
-
-func (p *DNSPool) exchange(ctx context.Context, req *mdns.Msg) (*mdns.Msg, *DNSResolver, time.Duration, error) {
-	p.LogicalQueries.Add(1)
-	var lastErr error
-
-	for attempt := 0; attempt < 3; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, 0, err
-		}
-		p.Queries.Add(1)
-		if attempt > 0 {
-			p.Retries.Add(1)
-		}
-
-		resolver := p.pickWeighted()
-		if resolver == nil {
-			return nil, nil, 0, fmt.Errorf("DNSCrypt pool is empty")
-		}
-
-		client := &dnscrypt.Client{Net: "udp", Timeout: 2500 * time.Millisecond}
-		info := resolver.getInfo()
-
-		type exRes struct {
-			resp *mdns.Msg
-			err  error
-		}
-		ch := make(chan exRes, 1)
-
-		start := time.Now()
-		go func() {
-			resp, err := client.Exchange(req, info)
-			ch <- exRes{resp, err}
-		}()
-
-		var resp *mdns.Msg
-		var err error
-		select {
-		case <-ctx.Done():
-			return nil, nil, 0, ctx.Err()
-		case res := <-ch:
-			resp, err = res.resp, res.err
-		}
-		elapsed := time.Since(start)
-
-		if err != nil {
-			failures := p.resolverFailure(resolver)
-			if failures == 2 {
-				if refreshErr := resolver.refresh(); refreshErr == nil {
-					info = resolver.getInfo()
-					start = time.Now()
-
-					ch2 := make(chan exRes, 1)
-					go func() {
-						r, e := client.Exchange(req, info)
-						ch2 <- exRes{r, e}
-					}()
-
-					select {
-					case <-ctx.Done():
-						return nil, nil, 0, ctx.Err()
-					case res := <-ch2:
-						resp, err = res.resp, res.err
-					}
-					elapsed = time.Since(start)
-
-					if err == nil {
-						resolver.ConsecutiveFailure.Store(0)
-					} else {
-						p.resolverFailure(resolver)
+			if res2.AS != "" {
+				parts := strings.Split(res2.AS, " ")
+				if len(parts) > 0 {
+					asn = strings.ToUpper(parts[0])
+					if !strings.HasPrefix(asn, "AS") {
+						asn = "AS" + asn
 					}
 				}
 			}
-
-			if err != nil {
-				lastErr = err
-				continue
-			}
-		}
-
-		switch resp.Rcode {
-		case mdns.RcodeSuccess, mdns.RcodeNameError:
-			resolver.Success.Add(1)
-			resolver.ConsecutiveFailure.Store(0)
-			resolver.mu.Lock()
-			if resolver.RTT == 0 {
-				resolver.RTT = elapsed
-			} else {
-				resolver.RTT = (resolver.RTT*7 + elapsed) / 8
-			}
-			resolver.mu.Unlock()
-			p.Successes.Add(1)
-			return resp, resolver, elapsed, nil
-		case mdns.RcodeServerFailure:
-			lastErr = fmt.Errorf("SERVFAIL")
-			p.resolverFailure(resolver)
-			continue
-		case mdns.RcodeRefused:
-			lastErr = fmt.Errorf("REFUSED")
-			p.resolverFailure(resolver)
-			continue
-		default:
-			lastErr = fmt.Errorf("rcode=%s", mdns.RcodeToString[resp.Rcode])
-			p.resolverFailure(resolver)
-			continue
 		}
 	}
-	p.Failures.Add(1)
-	return nil, nil, 0, lastErr
+
+	if asn == "" {
+		asn = "UNKNOWN_ASN"
+	}
+
+	if prefix == "" {
+		parsedIP := net.ParseIP(ip)
+		if parsedIP != nil {
+			parsedIP = parsedIP.To4()
+			if parsedIP != nil {
+				prefix = fmt.Sprintf("%d.%d.%d.0/24", parsedIP[0], parsedIP[1], parsedIP[2])
+			}
+		}
+	}
+
+	return asn, prefix
+}
+
+func getPrefixes(asn string) []string {
+	if asn == "UNKNOWN_ASN" {
+		return nil
+	}
+
+	client := &http.Client{Timeout: 6 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=%s", asn))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Data struct {
+			Prefixes []struct {
+				Prefix string `json:"prefix"`
+			} `json:"prefixes"`
+		} `json:"data"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	var prefixes []string
+	for _, p := range result.Data.Prefixes {
+		if !strings.Contains(p.Prefix, ":") {
+			prefixes = append(prefixes, p.Prefix)
+		}
+	}
+	return prefixes
+}
+
+func filterPrefixesByCountry(prefixes []string, targetCountry string) []string {
+	if targetCountry == "" || len(prefixes) == 0 || targetCountry == "UNKNOWN" {
+		return prefixes
+	}
+	targetCountry = strings.ToUpper(targetCountry)
+
+	type QueryItem struct {
+		Query string `json:"query"`
+	}
+
+	queryToPrefix := make(map[string]string)
+	var allQueries []QueryItem
+
+	for _, p := range prefixes {
+		ip, _, err := net.ParseCIDR(p)
+		if err == nil {
+			qIP := ip.String()
+			queryToPrefix[qIP] = p
+			allQueries = append(allQueries, QueryItem{Query: qIP})
+		}
+	}
+
+	var matched []string
+	batchSize := 100
+
+	for i := 0; i < len(allQueries); i += batchSize {
+		end := i + batchSize
+		if end > len(allQueries) {
+			end = len(allQueries)
+		}
+		batch := allQueries[i:end]
+
+		reqBody, _ := json.Marshal(batch)
+		resp, err := http.Post("http://ip-api.com/batch?fields=query,countryCode,status", "application/json", bytes.NewBuffer(reqBody))
+		if err != nil {
+			continue
+		}
+
+		var resData []struct {
+			Query       string `json:"query"`
+			CountryCode string `json:"countryCode"`
+			Status      string `json:"status"`
+		}
+		json.NewDecoder(resp.Body).Decode(&resData)
+		resp.Body.Close()
+
+		for _, item := range resData {
+			if item.Status == "success" && strings.ToUpper(item.CountryCode) == targetCountry {
+				if pref, ok := queryToPrefix[item.Query]; ok {
+					matched = append(matched, pref)
+				}
+			}
+		}
+	}
+	return matched
 }
 
 // ================= UTILS =================
@@ -1013,10 +908,16 @@ func gcd(a, b uint64) uint64 {
 }
 
 func CleanDomain(d string) string {
-	d = strings.ToLower(strings.TrimSpace(d))
-	d = strings.TrimPrefix(d, "*.")
-	d = strings.TrimSuffix(d, ".")
-	if d == "localhost" || strings.HasPrefix(d, "localhost.") {
+	d = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(d, "*.")))
+	parts := strings.Split(d, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	tld := parts[len(parts)-1]
+	if bannedTLDs[tld] {
+		return ""
+	}
+	if strings.ContainsAny(d, " \t\r\n/\\:*?\"'<>|#%&={}~`!@$^()+[]") {
 		return ""
 	}
 	if !domainRe.MatchString(d) {
@@ -2038,8 +1939,6 @@ func (p *chaosProvider) Fetch(ctx context.Context, query string, client *http.Cl
 	return subs, nil
 }
 
-// ================= PIPELINE SCHEDULING & SAMPLING =================
-
 func sampleForProvider(sampled []string, limit int, seed int64, providerIndex int) []string {
 	n := len(sampled)
 	if limit <= 0 || limit >= n {
@@ -2061,15 +1960,6 @@ func sampleForProvider(sampled []string, limit int, seed int64, providerIndex in
 		out[i] = sampled[indices[i]]
 	}
 	return out
-}
-
-type TotalAllocationStats struct {
-	TotalRoots            int
-	AssignedRoots         int
-	OverlappedAssignments int
-	UnassignedRoots       int
-	PrimaryAssignments    map[string]int
-	OverlapAssignments    map[string]int
 }
 
 func effectiveRootLimit(p *ProviderRunner, cfg Config) int {
@@ -2359,11 +2249,7 @@ func RunStageC(
 			return
 		}
 		rootStates[domain] = RootCompleted
-
-		if cancel, ok := rootCancel[domain]; ok {
-			cancel()
-		}
-
+		if cancel, ok := rootCancel[domain]; ok { cancel() }
 		pipeStats.mu.Lock()
 		pipeStats.StageC.CompletedRoots++
 		pipeStats.mu.Unlock()
@@ -2374,11 +2260,7 @@ func RunStageC(
 			return
 		}
 		rootStates[domain] = RootLost
-
-		if cancel, ok := rootCancel[domain]; ok {
-			cancel()
-		}
-
+		if cancel, ok := rootCancel[domain]; ok { cancel() }
 		pipeStats.mu.Lock()
 		pipeStats.StageC.LostRoots++
 		pipeStats.StageC.Lost++
@@ -2390,11 +2272,7 @@ func RunStageC(
 			return
 		}
 		rootStates[domain] = RootCanceled
-
-		if cancel, ok := rootCancel[domain]; ok {
-			cancel()
-		}
-
+		if cancel, ok := rootCancel[domain]; ok { cancel() }
 		pipeStats.mu.Lock()
 		pipeStats.StageC.CanceledRoots++
 		pipeStats.mu.Unlock()
@@ -2405,11 +2283,7 @@ func RunStageC(
 			return
 		}
 		rootStates[domain] = RootDeferred
-
-		if cancel, ok := rootCancel[domain]; ok {
-			cancel()
-		}
-
+		if cancel, ok := rootCancel[domain]; ok { cancel() }
 		pipeStats.mu.Lock()
 		pipeStats.StageC.DeferredRoots++
 		pipeStats.mu.Unlock()
@@ -2427,15 +2301,9 @@ func RunStageC(
 		}
 
 		for _, p := range candidates {
-			if scheduled[root.Domain][p] {
-				continue
-			}
-			if isProviderBlocked(p) {
-				continue
-			}
-			if providerUsed[p] >= providerLimits[p]*2 {
-				continue
-			}
+			if scheduled[root.Domain][p] { continue }
+			if isProviderBlocked(p) { continue }
+			if providerUsed[p] >= providerLimits[p]*2 { continue }
 
 			scheduled[root.Domain][p] = true
 			providerUsed[p]++
@@ -2453,12 +2321,8 @@ func RunStageC(
 
 	for _, p := range providers {
 		for _, root := range providerRoots[p] {
-			if rootStates[root.Domain] != RootPending {
-				continue
-			}
-			if scheduled[root.Domain][p] {
-				continue
-			}
+			if rootStates[root.Domain] != RootPending { continue }
+			if scheduled[root.Domain][p] { continue }
 			if enqueueRoot(root, p) {
 				inFlight++
 			}
@@ -2466,9 +2330,7 @@ func RunStageC(
 	}
 
 	for _, root := range roots {
-		if rootStates[root.Domain] != RootPending {
-			continue
-		}
+		if rootStates[root.Domain] != RootPending { continue }
 		if len(scheduled[root.Domain]) == 0 {
 			if !enqueueRoot(root, nil) {
 				markDeferred(root.Domain)
@@ -2488,14 +2350,9 @@ func RunStageC(
 
 	findNextProvider := func(domain string) (*ProviderRunner, bool) {
 		var openFound bool
-
 		for _, candidate := range providers {
-			if scheduled[domain][candidate] {
-				continue
-			}
-			if providerUsed[candidate] >= providerLimits[candidate]*2 {
-				continue
-			}
+			if scheduled[domain][candidate] { continue }
+			if providerUsed[candidate] >= providerLimits[candidate]*2 { continue }
 			if isProviderBlocked(candidate) {
 				openFound = true
 				continue
@@ -2527,18 +2384,12 @@ SchedulerLoop:
 			if res.Status != StatSkipped && res.Status != StatWaitCanceled {
 				pipeStats.StageC.Executed++
 			}
-
 			switch res.Status {
-			case StatSuccess:
-				pipeStats.StageC.Success++
-			case StatNoData:
-				pipeStats.StageC.NoData++
-			case StatPartial:
-				pipeStats.StageC.Partial++
-			case StatFailed:
-				pipeStats.StageC.Failed++
-			case StatSkipped, StatWaitCanceled:
-				pipeStats.StageC.Skipped++
+			case StatSuccess: pipeStats.StageC.Success++
+			case StatNoData: pipeStats.StageC.NoData++
+			case StatPartial: pipeStats.StageC.Partial++
+			case StatFailed: pipeStats.StageC.Failed++
+			case StatSkipped, StatWaitCanceled: pipeStats.StageC.Skipped++
 			}
 			pipeStats.mu.Unlock()
 
@@ -2599,9 +2450,7 @@ SchedulerLoop:
 	}
 
 	for _, root := range roots {
-		if cancel, ok := rootCancel[root.Domain]; ok {
-			cancel()
-		}
+		if cancel, ok := rootCancel[root.Domain]; ok { cancel() }
 	}
 
 	for _, p := range providers {
@@ -2610,7 +2459,7 @@ SchedulerLoop:
 	workerWG.Wait()
 }
 
-func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *DiscoveryState) {
+func (s *PipelineStats) SnapshotAndPrint(ds *DiscoveryState) {
 	s.mu.Lock()
 	pSampled := s.IPSampled
 	pWithPTR := s.IPWithPTR
@@ -2633,15 +2482,40 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 	pNoCert := s.NoPeerCertificates
 	pH2Head := s.H2HeadersOK
 
-	fASN := s.ASNFiltered
-	fCountry := s.CountryFiltered
-
 	localStats := make(map[string]ProviderStats)
 	for k, v := range s.ProviderStats {
 		localStats[k] = *v
 	}
 	allocStats := s.Alloc
 	stageC := s.StageC
+	
+	// Print local variables mapped from pipeline metrics (H2/TCP tracking variables)
+	tcpTimeouts := s.TCPTimeouts
+	tcpRefused := s.TCPRefused
+	tcpOther := s.TCPOtherErrs
+	tlsTimeouts := s.TLSTimeouts
+	tlsHandshakeFail := s.TLSHandshakeFailure
+	tlsUnrecName := s.TLSUnrecognizedName
+	tlsConnReset := s.TLSConnectionReset
+	tlsEOF := s.TLSEOF
+	tlsOther := s.TLSOtherErrs
+	h2NoALPN := s.H2NoALPN
+	h2ProtoOK := s.H2ProtocolOK
+	h2TimeNoFrames := s.H2TimeoutNoFrames
+	h2ConnReset := s.H2ConnectionReset
+	h2BrokenPipe := s.H2BrokenPipe
+	h2BadReq := s.H2BadRequest
+	h2GoAway := s.H2GoAway
+	h2EOF := s.H2EOF
+	h2TLSAlerts := s.H2TLSAlerts
+	h2Other := s.H2OtherErrs
+	h2TimeNoHeaders := s.H2Timeouts
+	h2HpackErr := s.H2HPACKErrors
+	h2StatusOk := s.H2StatusOK
+	h2InvalidStatus := s.H2InvalidStatus
+	candAccepted := s.CandidatesAccepted
+	scoreRejected := s.ScoreRejected
+
 	s.mu.Unlock()
 
 	ds.mu.RLock()
@@ -2654,7 +2528,6 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("[*] IP отобрано для пула:      %d\n", pSampled)
 	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", pWithPTR)
-
 	if droppedGlobal > 0 {
 		fmt.Printf("[!] Доменов отброшено глобальным лимитом (MaxDiscoveredDomains=%d): %d\n", MaxDiscoveredDomains, droppedGlobal)
 	}
@@ -2714,142 +2587,258 @@ func (s *PipelineStats) SnapshotAndPrint(pool *DNSPool, clustered int, ds *Disco
 		}
 	}
 
-	fmt.Println("\n[DNSCrypt Pool Telemetry]")
-	fmt.Printf("  Logical Queries:             %d\n", pool.LogicalQueries.Load())
-	fmt.Printf("  Resolver Exchanges:          %d (Успех: %d, Ошибок: %d, Ретраи: %d)\n", pool.Queries.Load(), pool.Successes.Load(), pool.Failures.Load(), pool.Retries.Load())
-
 	fmt.Printf("\n[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", qDNS, qDNSSuc, qDNSFail)
 	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", qResolved, qNX, qNoV4)
 	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", qTimeout, qTemp, qOther)
 	fmt.Printf("[*] Target Range IP Matches:   %d\n", qTargetMatches)
 	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", qTargetDomains)
-	fmt.Printf("[*] Отсеяно по ASN:            %d\n", fASN)
-	fmt.Printf("[*] Отсеяно по Country:        %d\n", fCountry)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", qValidPairs)
 	if droppedPairs > 0 {
 		fmt.Printf("[!] DNS-пар отброшено лимитом (LimitValidPairs=%d): %d\n", LimitValidPairs, droppedPairs)
 	}
-	fmt.Printf("[*] Успешных TCP соединений:   %d\n", pTCP)
-	fmt.Printf("[*] Успешных TLS хэндшейков:   %d\n", pTLS)
-	fmt.Printf("[*] Отсутствие сертификатов:   %d\n", pNoCert)
-	fmt.Printf("[*] Ошибок валидации TLS:      %d\n", pTLSVal)
-	fmt.Printf("[*] С откликом H2 Headers:     %d\n", pH2Head)
-	fmt.Printf("[*] Финальных IP-кластеров:    %d\n", clustered)
+
+	fmt.Printf("\n[*] Анализ Stage E (Строгая Воронка):\n")
+	fmt.Printf("    1. Целей на входе (DNS):       %d\n", qValidPairs)
+	fmt.Printf("    2. Успешный TCP коннект:       %d (Потери: Timeouts=%d, Refused=%d, Other=%d)\n", pTCP, tcpTimeouts, tcpRefused, tcpOther)
+	fmt.Printf("    3. Успешный TLS хэндшейк:      %d (Потери: Timeouts=%d, HandshakeFail=%d, UnrecName=%d, ConnReset=%d, EOF=%d, NoCert=%d, CertFail=%d, Other=%d)\n", pTLS, tlsTimeouts, tlsHandshakeFail, tlsUnrecName, tlsConnReset, tlsEOF, pNoCert, pTLSVal, tlsOther)
+	fmt.Printf("    4. Подтверждён H2 протокол:    %d (Потери: TimeoutNoFrames=%d, ConnReset=%d, BrokenPipe=%d, BadRequest/HTTP1=%d, GoAway=%d, EOF=%d, TLSAlerts=%d, Other=%d)\n", h2ProtoOK, h2TimeNoFrames, h2ConnReset, h2BrokenPipe, h2BadReq, h2GoAway, h2EOF, h2TLSAlerts, h2Other)
+	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", pH2Head, h2TimeNoHeaders, h2HpackErr)
+	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", h2StatusOk, h2InvalidStatus)
+	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d)\n", candAccepted, scoreRejected)
+	
+	fmt.Printf("\n    *  Инфо: H2 целей без ALPN 'h2': %d\n", h2NoALPN)
 }
 
-// ================= DB & IP HELPERS =================
-func ensureDB(path, dbURL string) error {
-	if fi, err := os.Stat(path); err == nil && fi.Size() > 1024*1024 {
-		if db, err := geoip2.Open(path); err == nil {
-			db.Close()
-			return nil
+func resolveHostCached(ctx context.Context, domain string, rtCaches *RuntimeCaches) ([]string, error) {
+	domain = CleanDomain(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("invalid domain")
+	}
+	v, err, _ := rtCaches.DNSGroup.Do(domain, func() (interface{}, error) {
+		if cached, ok := rtCaches.DNSCache.Get(domain); ok {
+			if cached.NXDomain {
+				return nil, ErrDNSNXDomain
+			}
+			return cached.IPs, nil
 		}
-	}
-	tempFile := path + ".tmp"
-	out, err := os.Create(tempFile)
+		
+		ips, err := net.LookupHost(domain)
+		if err != nil {
+			var dnsErr *net.DNSError
+			if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+				rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 10*time.Second)
+				return nil, ErrDNSNXDomain
+			}
+			return nil, err
+		}
+		
+		var validIPs []string
+		for _, ip := range ips {
+			if net.ParseIP(ip).To4() != nil {
+				validIPs = append(validIPs, ip)
+			}
+		}
+
+		rtCaches.DNSCache.Put(domain, &DNSCacheEntry{IPs: validIPs}, 10*time.Second)
+		return validIPs, nil
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(dbURL)
-	if err != nil {
-		out.Close()
-		os.Remove(tempFile)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		out.Close()
-		os.Remove(tempFile)
-		return fmt.Errorf("bad HTTP status: %d", resp.StatusCode)
-	}
-	if _, err = io.Copy(out, resp.Body); err != nil {
-		out.Close()
-		os.Remove(tempFile)
-		return err
-	}
-	out.Close()
-	testDB, err := geoip2.Open(tempFile)
-	if err != nil {
-		os.Remove(tempFile)
-		return fmt.Errorf("invalid MaxMind database: %v", err)
-	}
-	testDB.Close()
-	return os.Rename(tempFile, path)
+	return v.([]string), nil
 }
 
-func readPublicIPv4(resp *http.Response) (string, error) {
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	ipStr := strings.TrimSpace(string(body))
-	ip := net.ParseIP(ipStr)
-	if ip == nil || ip.To4() == nil {
-		return "", fmt.Errorf("invalid IPv4: %s", ipStr)
-	}
-	return ip.To4().String(), nil
-}
+// ================= API HELPERS (RIPE) =================
 
 func getPublicIP(targetIP string) (string, error) {
 	if targetIP != "" {
 		ip := net.ParseIP(targetIP)
-		if ip == nil || ip.To4() == nil {
-			return "", fmt.Errorf("invalid target IPv4: %s", targetIP)
+		if ip != nil && ip.To4() != nil {
+			return ip.To4().String(), nil
 		}
-		return ip.To4().String(), nil
+		return "", fmt.Errorf("invalid target IPv4 format: %s", targetIP)
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	if resp, err := client.Get("https://api.ipify.org"); err == nil {
-		if ip, err := readPublicIPv4(resp); err == nil {
-			return ip, nil
-		}
-	}
-	if resp, err := client.Get("http://ip-api.com/line/?fields=query"); err == nil {
-		if ip, err := readPublicIPv4(resp); err == nil {
-			return ip, nil
-		}
-	}
-	return "", fmt.Errorf("failed to fetch valid public IPv4")
-}
-
-type RipeStatResponse struct {
-	Data struct {
-		Prefixes []struct {
-			Prefix string `json:"prefix"`
-		} `json:"prefixes"`
-	} `json:"data"`
-}
-
-func fetchASNCIDRs(asn uint) ([]string, error) {
-	urlStr := fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS%d", asn)
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(urlStr)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("RIPEstat HTTP %d", resp.StatusCode)
-	}
-	var stat RipeStatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&stat); err != nil {
-		return nil, err
-	}
-	var cidrs []string
-	for _, p := range stat.Data.Prefixes {
-		if !strings.Contains(p.Prefix, ":") {
-			if _, _, err := net.ParseCIDR(p.Prefix); err == nil {
-				cidrs = append(cidrs, p.Prefix)
+	urls := []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"}
+	client := &http.Client{Timeout: 4 * time.Second}
+	for _, u := range urls {
+		resp, err := client.Get(u)
+		if err == nil {
+			defer resp.Body.Close()
+			ipBytes, _ := io.ReadAll(resp.Body)
+			ipStr := strings.TrimSpace(string(ipBytes))
+			ip := net.ParseIP(ipStr)
+			if ip != nil && ip.To4() != nil {
+				return ip.To4().String(), nil
 			}
 		}
 	}
-	return cidrs, nil
+	return "", fmt.Errorf("could not determine public IPv4. Please provide it manually via -vps-ip")
+}
+
+func getCountry(ip string) string {
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode", ip))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		var result struct {
+			CountryCode string `json:"countryCode"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			return strings.ToUpper(result.CountryCode)
+		}
+	}
+	return "UNKNOWN"
+}
+
+func getASNAndPrefix(ip string) (string, string) {
+	var asn, prefix string
+	client := &http.Client{Timeout: 6 * time.Second}
+
+	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
+	if err == nil {
+		var result struct {
+			Data struct {
+				ASNs   []interface{} `json:"asns"`
+				Prefix string        `json:"prefix"`
+			} `json:"data"`
+		}
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+
+		if len(result.Data.ASNs) > 0 {
+			asn = fmt.Sprintf("%v", result.Data.ASNs[0])
+			if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
+				asn = "AS" + asn
+			}
+		}
+		prefix = result.Data.Prefix
+	}
+
+	if asn == "" {
+		resp2, err2 := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=as", ip))
+		if err2 == nil {
+			var res2 struct {
+				AS string `json:"as"`
+			}
+			json.NewDecoder(resp2.Body).Decode(&res2)
+			resp2.Body.Close()
+
+			if res2.AS != "" {
+				parts := strings.Split(res2.AS, " ")
+				if len(parts) > 0 {
+					asn = strings.ToUpper(parts[0])
+					if !strings.HasPrefix(asn, "AS") {
+						asn = "AS" + asn
+					}
+				}
+			}
+		}
+	}
+
+	if asn == "" {
+		asn = "UNKNOWN_ASN"
+	}
+
+	if prefix == "" {
+		parsedIP := net.ParseIP(ip)
+		if parsedIP != nil {
+			parsedIP = parsedIP.To4()
+			if parsedIP != nil {
+				prefix = fmt.Sprintf("%d.%d.%d.0/24", parsedIP[0], parsedIP[1], parsedIP[2])
+			}
+		}
+	}
+
+	return asn, prefix
+}
+
+func getPrefixes(asn string) []string {
+	if asn == "UNKNOWN_ASN" {
+		return nil
+	}
+
+	client := &http.Client{Timeout: 6 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=%s", asn))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Data struct {
+			Prefixes []struct {
+				Prefix string `json:"prefix"`
+			} `json:"prefixes"`
+		} `json:"data"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	var prefixes []string
+	for _, p := range result.Data.Prefixes {
+		if !strings.Contains(p.Prefix, ":") {
+			prefixes = append(prefixes, p.Prefix)
+		}
+	}
+	return prefixes
+}
+
+func filterPrefixesByCountry(prefixes []string, targetCountry string) []string {
+	if targetCountry == "" || len(prefixes) == 0 || targetCountry == "UNKNOWN" {
+		return prefixes
+	}
+	targetCountry = strings.ToUpper(targetCountry)
+
+	type QueryItem struct {
+		Query string `json:"query"`
+	}
+
+	queryToPrefix := make(map[string]string)
+	var allQueries []QueryItem
+
+	for _, p := range prefixes {
+		ip, _, err := net.ParseCIDR(p)
+		if err == nil {
+			qIP := ip.String()
+			queryToPrefix[qIP] = p
+			allQueries = append(allQueries, QueryItem{Query: qIP})
+		}
+	}
+
+	var matched []string
+	batchSize := 100
+
+	for i := 0; i < len(allQueries); i += batchSize {
+		end := i + batchSize
+		if end > len(allQueries) {
+			end = len(allQueries)
+		}
+		batch := allQueries[i:end]
+
+		reqBody, _ := json.Marshal(batch)
+		resp, err := http.Post("http://ip-api.com/batch?fields=query,countryCode,status", "application/json", bytes.NewBuffer(reqBody))
+		if err != nil {
+			continue
+		}
+
+		var resData []struct {
+			Query       string `json:"query"`
+			CountryCode string `json:"countryCode"`
+			Status      string `json:"status"`
+		}
+		json.NewDecoder(resp.Body).Decode(&resData)
+		resp.Body.Close()
+
+		for _, item := range resData {
+			if item.Status == "success" && strings.ToUpper(item.CountryCode) == targetCountry {
+				if pref, ok := queryToPrefix[item.Query]; ok {
+					matched = append(matched, pref)
+				}
+			}
+		}
+	}
+	return matched
 }
 
 // ================= CIDR & SAMPLING =================
@@ -2897,64 +2886,51 @@ func MergeCIDRs(cidrs []string) []ipRange {
 	return merged
 }
 
-func SampleIPs(blocks []ipRange, maxIPs int, seed int64) []string {
-	var totalIPs uint64
-	for _, b := range blocks {
-		totalIPs += (b.end - b.start + 1)
-	}
-	if totalIPs == 0 {
-		return nil
-	}
-	var sampleSize uint64
-	switch {
-	case maxIPs < -1:
-		return nil
-	case maxIPs == -1:
-		sampleSize = totalIPs
-	case maxIPs == 0:
-		sampleSize = 1024
-		if sampleSize > totalIPs {
-			sampleSize = totalIPs
-		}
-	default:
-		sampleSize = uint64(maxIPs)
-		if sampleSize > totalIPs {
-			sampleSize = totalIPs
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
 		}
 	}
-	if sampleSize > LimitMaxIPs {
-		sampleSize = LimitMaxIPs
-	}
-	if sampleSize == 0 {
-		return nil
-	}
-	rng := rand.New(rand.NewSource(seed))
-	currIdx := rng.Uint64() % totalIPs
-	var step uint64 = 1
-	if totalIPs > 1 {
-		for {
-			step = (rng.Uint64() % (totalIPs - 1)) + 1
-			if gcd(step, totalIPs) == 1 {
-				break
+}
+
+func generateIPs(cidrs []string, maxIPs int) []string {
+	var ips []string
+	seen := make(map[string]bool)
+
+	for _, pStr := range cidrs {
+		if maxIPs > 0 && len(ips) >= maxIPs {
+			break
+		}
+		ip, ipnet, err := net.ParseCIDR(pStr)
+		if err != nil {
+			continue
+		}
+
+		ones, _ := ipnet.Mask.Size()
+		limit := MaxHostsPer24
+		if ones < 24 {
+			limit = MaxHostsPer24 * MaxSampled24
+		}
+
+		count := 0
+		for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
+			ipStr := ip.String()
+			if !seen[ipStr] && !strings.HasSuffix(ipStr, ".0") && !strings.HasSuffix(ipStr, ".255") {
+				seen[ipStr] = true
+				ips = append(ips, ipStr)
+				count++
+				if maxIPs > 0 && len(ips) >= maxIPs {
+					return ips
+				}
+				if count >= limit {
+					break
+				}
 			}
 		}
 	}
-	var result []string
-	for i := uint64(0); i < sampleSize; i++ {
-		offset := currIdx
-		for _, b := range blocks {
-			count := b.end - b.start + 1
-			if offset < count {
-				ip := make(net.IP, 4)
-				binary.BigEndian.PutUint32(ip, uint32(b.start+offset))
-				result = append(result, ip.String())
-				break
-			}
-			offset -= count
-		}
-		currIdx = (currIdx + step) % totalIPs
-	}
-	return result
+	return ips
 }
 
 func ipInRanges(ipStr string, ranges []ipRange) bool {
@@ -2975,108 +2951,7 @@ func ipInRanges(ipStr string, ranges []ipRange) bool {
 	return false
 }
 
-func reverseIPv4(ip string) (string, error) {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return "", fmt.Errorf("invalid IP")
-	}
-	parsed = parsed.To4()
-	if parsed == nil {
-		return "", fmt.Errorf("not IPv4")
-	}
-	return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", parsed[3], parsed[2], parsed[1], parsed[0]), nil
-}
-
-func resolvePTRDNSCrypt(ctx context.Context, pool *DNSPool, ip string) ([]string, error) {
-	rev, err := reverseIPv4(ip)
-	if err != nil {
-		return nil, err
-	}
-	req := new(mdns.Msg)
-	req.SetQuestion(rev, mdns.TypePTR)
-	req.RecursionDesired = true
-	resp, _, _, err := pool.exchange(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.Rcode == mdns.RcodeNameError {
-		return nil, ErrDNSNXDomain
-	}
-	if resp.Rcode != mdns.RcodeSuccess {
-		return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
-	}
-	var names []string
-	for _, ans := range resp.Answer {
-		if ptr, ok := ans.(*mdns.PTR); ok {
-			if d := CleanDomain(ptr.Ptr); d != "" {
-				names = append(names, d)
-			}
-		}
-	}
-	return names, nil
-}
-
-func resolveIPv4DNSCrypt(ctx context.Context, pool *DNSPool, domain string) ([]string, error) {
-	req := new(mdns.Msg)
-	req.SetQuestion(mdns.Fqdn(domain), mdns.TypeA)
-	req.RecursionDesired = true
-	resp, _, _, err := pool.exchange(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.Rcode == mdns.RcodeNameError {
-		return nil, ErrDNSNXDomain
-	}
-	if resp.Rcode != mdns.RcodeSuccess {
-		return nil, fmt.Errorf("DNS response code: %s", mdns.RcodeToString[resp.Rcode])
-	}
-	seen := make(map[string]struct{})
-	var ips []string
-	for _, answer := range resp.Answer {
-		if a, ok := answer.(*mdns.A); ok {
-			ip := a.A.String()
-			if _, exists := seen[ip]; !exists {
-				seen[ip] = struct{}{}
-				ips = append(ips, ip)
-			}
-		}
-	}
-	return ips, nil
-}
-
-var ErrDNSNXDomain = errors.New("NXDOMAIN")
-
-func resolveIPv4Cached(ctx context.Context, pool *DNSPool, domain string, rtCaches *RuntimeCaches) ([]string, error) {
-	domain = CleanDomain(domain)
-	if domain == "" {
-		return nil, fmt.Errorf("invalid domain")
-	}
-	v, err, _ := rtCaches.DNSGroup.Do(domain, func() (interface{}, error) {
-		if cached, ok := rtCaches.DNSCache.Get(domain); ok {
-			if cached.NXDomain {
-				return nil, ErrDNSNXDomain
-			}
-			return cached.IPs, nil
-		}
-		ips, err := resolveIPv4DNSCrypt(ctx, pool, domain)
-		if errors.Is(err, ErrDNSNXDomain) {
-			rtCaches.DNSCache.Put(domain, &DNSCacheEntry{NXDomain: true}, 1*time.Minute)
-			return nil, err
-		}
-		if err != nil {
-			return nil, err
-		}
-		rtCaches.DNSCache.Put(domain, &DNSCacheEntry{IPs: ips}, 5*time.Minute)
-		return ips, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return v.([]string), nil
-}
-
 // ================= HTTP/2 PROBE =================
-const clientAdvertisedMaxFrameSize = 16384
 
 type ProbeStage int
 
@@ -3109,16 +2984,15 @@ func writeH2(conn net.Conn, b []byte, timeout time.Duration) error {
 }
 
 func buildH2HeadersEncoder(sni string) []byte {
-	var buf bytes.Buffer
-	encoder := hpack.NewEncoder(&buf)
-	encoder.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
-	encoder.WriteField(hpack.HeaderField{Name: ":authority", Value: sni})
-	encoder.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
-	encoder.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
-	encoder.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"})
-	encoder.WriteField(hpack.HeaderField{Name: "accept", Value: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
-	encoder.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "gzip, deflate, br"})
-	return buf.Bytes()
+	var payload []byte
+	payload = append(payload, 0x82, 0x87, 0x84)
+	sniBytes := []byte(sni)
+	payload = append(payload, 0x01, byte(len(sniBytes)))
+	payload = append(payload, sniBytes...)
+	ua := []byte("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	payload = append(payload, 0x0F, 0x2B, byte(len(ua)))
+	payload = append(payload, ua...)
+	return payload
 }
 
 func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte {
@@ -3130,126 +3004,85 @@ func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte
 	return append(header, payload...)
 }
 
-func buildClientSettingsFrame() []byte {
-	payload := make([]byte, 30)
-	binary.BigEndian.PutUint16(payload[0:2], 1)
-	binary.BigEndian.PutUint32(payload[2:6], 65536)
-	binary.BigEndian.PutUint16(payload[6:8], 2)
-	binary.BigEndian.PutUint32(payload[8:12], 0)
-	binary.BigEndian.PutUint16(payload[12:14], 3)
-	binary.BigEndian.PutUint32(payload[14:18], 1000)
-	binary.BigEndian.PutUint16(payload[18:20], 4)
-	binary.BigEndian.PutUint32(payload[20:24], 6291456)
-	binary.BigEndian.PutUint16(payload[24:26], 6)
-	binary.BigEndian.PutUint32(payload[26:30], 262144)
-	return buildH2Frame(FrameSettings, 0, 0, payload)
-}
-
 func buildWindowUpdateFrame(streamID uint32, increment uint32) []byte {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, increment&0x7FFFFFFF)
 	return buildH2Frame(FrameWindowUpdate, 0, streamID, payload)
 }
 
-func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) error {
+func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) {
 	weakCount := 0
-	blockStatus := 0
 	hasStatus := false
 
 	for _, h := range headers {
 		hName := strings.ToLower(strings.TrimSpace(h.Name))
 
 		if hName == ":status" {
-			n, err := strconv.Atoi(strings.TrimSpace(h.Value))
-			if err != nil {
-				return fmt.Errorf("invalid :status value %q: %w", h.Value, err)
+			if n, err := strconv.Atoi(strings.TrimSpace(h.Value)); err == nil && n > 0 {
+				cand.HTTPStatus = n
 			}
-			if n < 100 || n > 999 {
-				return fmt.Errorf("invalid HTTP status: %d", n)
-			}
-			blockStatus = n
 			hasStatus = true
+			continue
+		}
+
+		hValLower := strings.ToLower(h.Value)
+		switch hName {
+		case "server":
+			cand.Server = h.Value
+			for _, cdn := range cdnStrong {
+				if strings.Contains(hValLower, cdn) {
+					cand.CDNStatus = CDNConfirmed
+					cand.CDNProvider = cdn
+				}
+			}
+		case "content-type":
+			cand.ContentType = h.Value
+		case "location":
+			cand.Location = h.Value
+		case "cf-ray":
+			cand.CDNStatus = CDNConfirmed
+			cand.CDNProvider = "cloudflare"
+		}
+
+		if strings.HasPrefix(hName, "x-amz-cf-") ||
+			strings.HasPrefix(hName, "x-sucuri-") ||
+			strings.HasPrefix(hName, "x-akamai-") {
+			cand.CDNStatus = CDNConfirmed
+			if cand.CDNProvider == "" {
+				cand.CDNProvider = "headers"
+			}
+		}
+
+		for _, cdnH := range cdnWeak {
+			if hName == cdnH {
+				weakCount++
+			}
 		}
 	}
 
 	if !hasStatus {
-		return fmt.Errorf("response HEADERS missing :status")
+		cand.MissingStatus = true
 	}
 
-	isInformational := blockStatus >= 100 && blockStatus < 200
-	isFinalResponse := blockStatus >= 200
-
-	if isInformational {
-		return nil
+	if cand.CDNStatus == CDNStatusUnknown && weakCount > 0 {
+		cand.CDNStatus = CDNLikely
 	}
 
-	if isFinalResponse && !cand.ResponseHeadersParsed {
-		cand.HTTPStatus = blockStatus
-		cand.ResponseHeadersParsed = true
-
-		for _, h := range headers {
-			hName := strings.ToLower(strings.TrimSpace(h.Name))
-			hValLower := strings.ToLower(h.Value)
-
-			switch hName {
-			case "server":
-				cand.Server = h.Value
-				for _, cdn := range cdnStrong {
-					if strings.Contains(hValLower, cdn) {
-						cand.CDNStatus = CDNConfirmed
-						cand.CDNProvider = cdn
-					}
-				}
-			case "content-type":
-				cand.ContentType = h.Value
-			case "location":
-				cand.Location = h.Value
-			case "cf-ray":
-				cand.CDNStatus = CDNConfirmed
-				cand.CDNProvider = "cloudflare"
-			}
-
-			if strings.HasPrefix(hName, "x-amz-cf-") ||
-				strings.HasPrefix(hName, "x-sucuri-") ||
-				strings.HasPrefix(hName, "x-akamai-") {
-				cand.CDNStatus = CDNConfirmed
-				if cand.CDNProvider == "" {
-					cand.CDNProvider = "headers"
-				}
-			}
-
-			for _, cdnH := range cdnWeak {
-				if hName == cdnH {
-					weakCount++
-				}
-			}
-		}
-
-		if cand.CDNStatus == CDNStatusUnknown && weakCount > 0 {
-			cand.CDNStatus = CDNLikely
-		}
-	}
-
-	return nil
+	cand.ResponseHeadersParsed = true
 }
 
-func parseTrailers(cand *Candidate, headers []hpack.HeaderField) error {
+func parseTrailers(cand *Candidate, headers []hpack.HeaderField) {
 	cand.ResponseTrailersSeen = true
-	for _, h := range headers {
-		if len(h.Name) > 0 && h.Name[0] == ':' {
-			return fmt.Errorf("pseudo-header %q found in trailers", h.Name)
-		}
-	}
-	return nil
 }
 
-func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Candidate, *ProbeError) {
+func ProbeH2(ctx context.Context, ip, sni string, ev DomainSource, cfg Config) (*Candidate, *ProbeError) {
 	cand := &Candidate{
 		IP:            ip,
 		SNI:           sni,
 		Evidence:      ev,
 		DomainQuality: classifyDomainQuality(sni),
 		CDNStatus:     CDNStatusUnknown,
+		HTTPStatus:    0,
 	}
 
 	t0 := time.Now()
@@ -3265,7 +3098,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	uConn := utls.UClient(conn, &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"h2"},
+		NextProtos:         []string{"h2", "http/1.1"},
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
 	}, utls.HelloChrome_Auto)
@@ -3330,7 +3163,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	if err := writeH2(uConn, []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), wTo); err != nil {
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
-	if err := writeH2(uConn, buildClientSettingsFrame(), wTo); err != nil {
+	if err := writeH2(uConn, buildH2Frame(FrameSettings, 0, 0, nil), wTo); err != nil {
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 	}
 	if err := writeH2(uConn, buildH2Frame(FrameHeaders, FlagEndHeaders|FlagEndStream, 1, buildH2HeadersEncoder(sni)), wTo); err != nil {
@@ -3340,8 +3173,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	requestSent := time.Now()
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
 
-	const maxInboundFrameSize = uint32(clientAdvertisedMaxFrameSize)
-	buf := make([]byte, 32768)
+	buf := make([]byte, 8192)
 	recvBuf := bytes.Buffer{}
 	headerBlocks := bytes.Buffer{}
 	decoder := hpack.NewDecoder(4096, nil)
@@ -3353,7 +3185,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 ReadLoop:
 	for {
 		if ctx.Err() != nil {
-			return cand, &ProbeError{Stage: ProbeStageH2, Err: ctx.Err()}
+			break ReadLoop
 		}
 		n, err := uConn.Read(buf)
 		if n > 0 {
@@ -3363,8 +3195,8 @@ ReadLoop:
 		for recvBuf.Len() >= 9 {
 			data := recvBuf.Bytes()
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
-			if length > maxInboundFrameSize {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("inbound frame exceeds limit: %d", length)}
+			if length > 16384 {
+				break ReadLoop
 			}
 			if uint32(recvBuf.Len()) < 9+length {
 				break
@@ -3379,67 +3211,44 @@ ReadLoop:
 			payload := data[9 : 9+length]
 			recvBuf.Next(int(9 + length))
 
-			if expectingContinuation && frameType != FrameContinuation {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("expected CONTINUATION frame")}
+			if frameType == FrameSettings || frameType == FrameHeaders || frameType == FrameData || frameType == FrameWindowUpdate || frameType == FrameGoAway {
+				cand.H2ProtocolConfirmed = true
 			}
 
-			switch frameType {
-			case FrameSettings, FrameGoAway:
-				if streamID != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
-				}
-			case FrameHeaders, FrameData, FrameRSTStream, FrameContinuation:
-				if streamID == 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use non-zero stream", frameType)}
-				}
+			if expectingContinuation && frameType != FrameContinuation {
+				continue
 			}
 
 			switch frameType {
 			case FrameSettings:
 				if length%6 != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length")}
+					continue
 				}
 				if flags&FlagAck != 0 {
-					if length != 0 {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("SETTINGS ACK with non-zero payload")}
-					}
 					cand.H2SettingsAckReceived = true
 					cand.SettingsAckCount++
 					break
 				}
 				cand.SettingsFramesCount++
-				seenSettings := make(map[uint16]bool)
 				var prof PeerSettingsProfile
 				if cand.H2SettingsReceived {
 					prof = cand.LatestPeerSettings
 				}
-				for i := 0; i < int(length); i += 6 {
+				for i := 0; i+6 <= int(length); i += 6 {
 					id := binary.BigEndian.Uint16(payload[i : i+2])
 					val := binary.BigEndian.Uint32(payload[i+2 : i+6])
-					if seenSettings[id] {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("duplicate SETTINGS identifier")}
-					}
-					seenSettings[id] = true
 					switch id {
 					case 1:
 						prof.HeaderTableSize = val
 						prof.HasHeaderTableSize = true
 						decoder.SetMaxDynamicTableSize(val)
-					case 2:
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("server sent SETTINGS_ENABLE_PUSH")}
 					case 3:
 						prof.MaxConcurrentStreams = val
 						prof.HasMaxConcurrentStreams = true
 					case 4:
-						if val > 0x7fffffff {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid INITIAL_WINDOW_SIZE")}
-						}
 						prof.InitialWindowSize = val
 						prof.HasInitialWindowSize = true
 					case 5:
-						if val < 16384 || val > 16777215 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid MAX_FRAME_SIZE")}
-						}
 						prof.MaxFrameSize = val
 						prof.HasMaxFrameSize = true
 					case 6:
@@ -3457,9 +3266,7 @@ ReadLoop:
 					}
 					cand.LatestPeerSettings = prof
 				}
-				if err := writeH2(uConn, buildH2Frame(FrameSettings, FlagAck, 0, nil), wTo); err != nil {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-				}
+				_ = writeH2(uConn, buildH2Frame(FrameSettings, FlagAck, 0, nil), wTo)
 				cand.H2SettingsAckSent = true
 
 			case FrameHeaders:
@@ -3470,21 +3277,15 @@ ReadLoop:
 					}
 					actualPayload := payload
 					padLen := 0
-					if flags&FlagPadded != 0 {
-						if len(actualPayload) < 1 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED flag set but payload too short")}
-						}
+					if flags&FlagPadded != 0 && len(actualPayload) > 0 {
 						padLen = int(actualPayload[0])
 						actualPayload = actualPayload[1:]
 					}
-					if flags&FlagPriority != 0 {
-						if len(actualPayload) < 5 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PRIORITY flag set but payload too short")}
-						}
+					if flags&FlagPriority != 0 && len(actualPayload) >= 5 {
 						actualPayload = actualPayload[5:]
 					}
 					if padLen > len(actualPayload) {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("padding exceeds payload")}
+						padLen = len(actualPayload)
 					}
 					actualPayload = actualPayload[:len(actualPayload)-padLen]
 
@@ -3494,58 +3295,47 @@ ReadLoop:
 						activeStreamID = streamID
 					} else {
 						expectingContinuation = false
-						headers, err := decoder.DecodeFull(headerBlocks.Bytes())
-						if err != nil {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
+						headers, errDecode := decoder.DecodeFull(headerBlocks.Bytes())
+						if errDecode != nil {
+							cand.HPACKErrors = true
 						}
 
 						if !cand.ResponseHeadersParsed && !isTrailers {
-							if err := parseResponseHeaders(cand, headers); err != nil {
-								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-							}
-						} else {
-							if err := parseTrailers(cand, headers); err != nil {
-								return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-							}
-						}
-						headerBlocks.Reset()
+							parseResponseHeaders(cand, headers)
+							headerBlocks.Reset()
 
-						if cand.ResponseHeadersParsed && !cand.H2HeadersReceived {
 							cand.Timings.H2Headers = time.Since(requestSent)
 							cand.H2HeadersReceived = true
+							break ReadLoop
+						} else if isTrailers {
+							parseTrailers(cand, headers)
 						}
+						headerBlocks.Reset()
 					}
 				}
 			case FrameContinuation:
-				if !expectingContinuation {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("unexpected CONTINUATION frame")}
-				}
-				if streamID != activeStreamID {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("CONTINUATION stream mismatch: got %d, want %d", streamID, activeStreamID)}
+				if !expectingContinuation || streamID != activeStreamID {
+					continue
 				}
 				headerBlocks.Write(payload)
 				if (flags & FlagEndHeaders) != 0 {
 					expectingContinuation = false
-					headers, err := decoder.DecodeFull(headerBlocks.Bytes())
-					if err != nil {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
+					headers, errDecode := decoder.DecodeFull(headerBlocks.Bytes())
+					if errDecode != nil {
+						cand.HPACKErrors = true
 					}
 
 					if !cand.ResponseHeadersParsed {
-						if err := parseResponseHeaders(cand, headers); err != nil {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-						}
-					} else {
-						if err := parseTrailers(cand, headers); err != nil {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-						}
-					}
-					headerBlocks.Reset()
+						parseResponseHeaders(cand, headers)
+						headerBlocks.Reset()
 
-					if cand.ResponseHeadersParsed && !cand.H2HeadersReceived {
 						cand.Timings.H2Headers = time.Since(requestSent)
 						cand.H2HeadersReceived = true
+						break ReadLoop
+					} else {
+						parseTrailers(cand, headers)
 					}
+					headerBlocks.Reset()
 				}
 			case FrameData:
 				if streamID == 1 {
@@ -3555,68 +3345,47 @@ ReadLoop:
 					}
 					actualPayload := payload
 					padLen := 0
-					if flags&FlagPadded != 0 {
-						if len(actualPayload) < 1 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED flag set on DATA but payload too short")}
-						}
+					if flags&FlagPadded != 0 && len(actualPayload) > 0 {
 						padLen = int(actualPayload[0])
 						actualPayload = actualPayload[1:]
 					}
 					if padLen > len(actualPayload) {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("padding exceeds DATA payload")}
+						padLen = len(actualPayload)
 					}
 					actualPayload = actualPayload[:len(actualPayload)-padLen]
 
 					cand.BodyBytes += len(actualPayload)
 					inc := length
 					if inc > 0 {
-						if err := writeH2(uConn, buildWindowUpdateFrame(1, inc), wTo); err != nil {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-						}
-						if err := writeH2(uConn, buildWindowUpdateFrame(0, inc), wTo); err != nil {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
-						}
+						_ = writeH2(uConn, buildWindowUpdateFrame(1, inc), wTo)
+						_ = writeH2(uConn, buildWindowUpdateFrame(0, inc), wTo)
 					}
 				}
-			case FrameWindowUpdate:
-				if length != 4 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid WINDOW_UPDATE length")}
-				}
-				increment := binary.BigEndian.Uint32(payload) & 0x7fffffff
-				if increment == 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("WINDOW_UPDATE increment is zero")}
-				}
 			case FrameRSTStream:
-				if length != 4 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid RST_STREAM length")}
-				}
 				if streamID == 1 {
 					cand.StreamReset = true
 					break ReadLoop
 				}
 			case FrameGoAway:
-				if length < 8 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid GOAWAY length")}
-				}
 				cand.GoAwaySeen = true
 			}
-			if streamID == 1 && cand.EndStreamSeen && !expectingContinuation {
+
+			if cand.H2ProtocolConfirmed && cand.H2HeadersReceived && (cand.BodyBytes > 0 || cand.Server != "" || cand.EndStreamSeen) {
 				break ReadLoop
 			}
 		}
+
 		if err != nil {
-			break
+			if cand.H2ProtocolConfirmed {
+				cand.ReadTimeout = true
+				break ReadLoop
+			}
+			return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 		}
 	}
-	if cand.HTTPStatus == 0 {
-		return cand, &ProbeError{Stage: ProbeStageHeaders, Err: fmt.Errorf("no HTTP status code")}
-	}
-	if !cand.EndStreamSeen {
-		return cand, &ProbeError{Stage: ProbeStageComplete, Err: fmt.Errorf("response did not reach END_STREAM")}
-	}
 
-	if cand.H2SettingsReceived && cand.H2HeadersReceived && cand.HTTPStatus >= 200 && cand.EndStreamSeen {
-		cand.H2ProtocolConfirmed = true
+	if !cand.H2ProtocolConfirmed {
+		return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("no valid H2 frames received")}
 	}
 
 	return cand, nil
@@ -3663,6 +3432,12 @@ func scoreH2Profile(c *Candidate) float64 {
 
 func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bool {
 	if !cand.H2ProtocolConfirmed {
+		return false
+	}
+	if !cand.H2HeadersReceived {
+		return false
+	}
+	if cand.MissingStatus || cand.HTTPStatus <= 0 {
 		return false
 	}
 
@@ -3713,43 +3488,22 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 
 	discovery := 0.0
 	scoreDirect := func(src DomainSource, pts float64) {
-		if cand.Evidence.Direct.Has(src) {
+		if cand.Evidence.Has(src) {
 			discovery += pts
-		} else if cand.Evidence.Inherited.Has(src) {
-			discovery += pts / 2.0
 		}
 	}
 	scoreDirect(SourcePTR, 3.0)
-	scoreDirect(SourceHackerTarget, 3.0)
-	scoreDirect(SourceShodan, 3.0)
-	scoreDirect(SourceVirusTotalIP, 2.0)
-	scoreDirect(SourceVirusTotalDomain, 2.0)
-	scoreDirect(SourceURLScan, 2.0)
-	scoreDirect(SourceCRTSh, 2.0)
-	scoreDirect(SourceCertSpotter, 2.0)
-	scoreDirect(SourceAlienVault, 1.0)
-	scoreDirect(SourceWayback, 1.0)
-	scoreDirect(SourceAnubis, 1.0)
-	scoreDirect(SourceThreatMiner, 1.0)
-	scoreDirect(SourceHTDomain, 1.0)
-	scoreDirect(SourceChaos, 1.0)
+	scoreDirect(SourceDirectTLS, 4.0)
 	scoreDirect(SourceSeed, 1.0)
 
-	combinedSources := cand.Evidence.Combined()
 	diversity := 0
-	if combinedSources.Has(SourcePTR) || combinedSources.Has(SourceHackerTarget) || combinedSources.Has(SourceShodan) {
+	if cand.Evidence.Has(SourcePTR) {
 		diversity++
 	}
-	if combinedSources.Has(SourceVirusTotalIP) || combinedSources.Has(SourceVirusTotalDomain) || combinedSources.Has(SourceURLScan) {
+	if cand.Evidence.Has(SourceDirectTLS) {
 		diversity++
 	}
-	if combinedSources.Has(SourceCRTSh) || combinedSources.Has(SourceCertSpotter) {
-		diversity++
-	}
-	if combinedSources.Has(SourceAlienVault) || combinedSources.Has(SourceWayback) || combinedSources.Has(SourceChaos) || combinedSources.Has(SourceAnubis) || combinedSources.Has(SourceThreatMiner) || combinedSources.Has(SourceHTDomain) {
-		diversity++
-	}
-	if combinedSources.Has(SourceSeed) {
+	if cand.Evidence.Has(SourceSeed) {
 		diversity++
 	}
 	if diversity >= 2 {
@@ -3790,123 +3544,60 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 	cand.DomainPenalty = scorePenalty
 	cand.Score = rs.Total - scorePenalty
 
-	return cand.Score >= 0
+	return true
 }
 
-func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange, pool *DNSPool, asnDB, countryDB *geoip2.Reader) []Candidate {
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+func limitStr(s string, limit int) string {
+	if len(s) > limit {
+		return s[:limit]
+	}
+	return s
+}
 
+// ================= PIPELINE STAGES =================
+
+func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange) []Candidate {
 	pipeStats := NewPipelineStats()
 	pipeStats.mu.Lock()
 	pipeStats.IPSampled = len(sampledIPs)
 	pipeStats.mu.Unlock()
 
-	ds := NewDiscoveryState()
-	rtCaches := NewRuntimeCaches()
+	var ds DiscoveryState
+	ds.pairEvidence = make(map[string]Evidence)
+	ds.domainsToResolve = make(map[string]struct{})
 
-	for _, d := range cfg.Domains {
-		if cleaned := CleanDomain(d); cleaned != "" {
-			ds.AddDomainSource(cleaned, SourceSeed, 0)
-		}
-	}
-
-	var extProviders []*ProviderRunner
-	if !cfg.NoCT {
-		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
-	}
-	if !cfg.NoPassive {
-		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-	}
-	if !cfg.NoReverseIP {
-		extProviders = append(extProviders, NewRunner(&hackerTargetProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&shodanInternetDBProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 10, MinInterval: 50 * time.Millisecond, MaxNames: 1000, MaxPages: 1}))
-	}
-	if cfg.VTKey != "" {
-		extProviders = append(extProviders, NewRunner(&vtDomainProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 2000, MaxRoots: 100, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&vtIPProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 2000, MaxPages: 3}))
-	}
-	if cfg.URLScanKey != "" {
-		extProviders = append(extProviders, NewRunner(&urlScanDomainProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxRoots: 100, MaxPages: 5}))
-		extProviders = append(extProviders, NewRunner(&urlScanIPProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxPages: 5}))
-	}
-	if cfg.ChaosKey != "" {
-		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 2000, MaxRoots: 100, MaxPages: 1}))
-	}
-
-	var ipProviders []*ProviderRunner
-	var domainProviders []*ProviderRunner
-	for _, p := range extProviders {
-		if p.QueryType() == QueryIP {
-			ipProviders = append(ipProviders, p)
-		} else {
-			domainProviders = append(domainProviders, p)
-		}
-	}
-
-	fmt.Printf("[*] STAGE A: Reverse-IP OSINT & PTR Gathering...\n")
+	fmt.Printf("[*] STAGE A: Active Discovery (PTR -> TLS & OSINT -> TLS)...\n")
 	gA, gCtxA := errgroup.WithContext(ctx)
+	gA.SetLimit(cfg.Workers)
 
-	if !cfg.NoPTR {
+	for _, ip := range sampledIPs {
+		ip := ip
 		gA.Go(func() error {
-			ptrJobs := make(chan string)
-			var ptrG errgroup.Group
-			for i := 0; i < cfg.Workers; i++ {
-				ptrG.Go(func() error {
-					for {
-						select {
-						case <-gCtxA.Done():
-							return gCtxA.Err()
-						case ip, ok := <-ptrJobs:
-							if !ok {
-								return nil
-							}
-							names, err := resolvePTRDNSCrypt(gCtxA, pool, ip)
-							if err == nil && len(names) > 0 {
-								for _, n := range names {
-									ds.AddPairSource(ip, n, SourcePTR)
-								}
-								pipeStats.mu.Lock()
-								pipeStats.IPWithPTR++
-								pipeStats.mu.Unlock()
-							}
-						}
-					}
-				})
+			if gCtxA.Err() != nil {
+				return gCtxA.Err()
 			}
-			ptrG.Go(func() error {
-				defer close(ptrJobs)
-				for _, ip := range sampledIPs {
-					select {
-					case <-gCtxA.Done():
-						return gCtxA.Err()
-					case ptrJobs <- ip:
+			pipeStats.mu.Lock()
+			pipeStats.ActiveProbes++
+			pipeStats.mu.Unlock()
+
+			// 1. Поиск доменов для IP (Reverse DNS + OSINT + опциональный TLS)
+			pairs := activeProbeIP(gCtxA, ip, time.Duration(cfg.TLSTimeoutMs)*time.Millisecond, cfg.NoPTR, cfg.NoActiveTLS, pipeStats)
+
+			// 2. Добавляем найденные пары в общее хранилище
+			if len(pairs) > 0 {
+				ds.mu.Lock()
+				for _, p := range pairs {
+					if _, exists := ds.domainsToResolve[p.SNI]; !exists {
+						ds.domainsToResolve[p.SNI] = struct{}{}
 					}
+					key := p.IP + "\x00" + p.SNI
+					ev := ds.pairEvidence[key]
+					ev.Direct |= p.Evidence
+					ds.pairEvidence[key] = ev
 				}
-				return nil
-			})
-			return ptrG.Wait()
-		})
-	}
-
-	for idx, p := range ipProviders {
-		p := p
-		limitIP := cfg.IPOSINTLimit
-		if limitIP <= 0 {
-			limitIP = len(sampledIPs)
-		}
-		ipSlice := sampleForProvider(sampledIPs, limitIP, cfg.Seed, idx)
-
-		gA.Go(func() error {
-			return runProviderJobs(gCtxA, p, ipSlice, httpClient, pipeStats, rtCaches, func(q string, res []string) {
-				for _, d := range res {
-					ds.AddPairSource(q, d, p.SourceBit())
-				}
-			})
+				ds.mu.Unlock()
+			}
+			return nil
 		})
 	}
 	if err := gA.Wait(); err != nil || ctx.Err() != nil {
@@ -3914,15 +3605,28 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		return nil
 	}
 
-	fmt.Printf("[*] STAGE B: Normalizing Domains & Ranking Roots...\n")
-	rootProvenance := make(map[string]DomainSource)
-
-	ds.mu.RLock()
-	for d, ev := range ds.domainEvidence {
-		if r := GetRootDomain(d); r != "" {
-			rootProvenance[r] |= ev.Direct
+	// Добавляем seed-домены
+	for _, d := range cfg.Domains {
+		if cleaned := CleanDomain(d); cleaned != "" {
+			ds.mu.Lock()
+			ds.domainsToResolve[cleaned] = struct{}{}
+			ds.mu.Unlock()
 		}
 	}
+
+	pipeStats.mu.Lock()
+	pipeStats.UniqueDomains = len(ds.domainsToResolve)
+	pipeStats.mu.Unlock()
+
+	fmt.Printf("[+] Этап A завершен. Найдено уникальных доменов: %d (Пар IP+SNI: %d)\n", len(ds.domainsToResolve), len(ds.pairEvidence))
+
+	// ==========================================
+	// ИСПРАВЛЕНИЕ: ВОССТАНАВЛИВАЕМ OSINT СТАДИЮ
+	// ==========================================
+
+	// Stage B: Группировка доменов по Root-доменам
+	rootProvenance := make(map[string]DomainSource)
+	ds.mu.RLock()
 	for key, ev := range ds.pairEvidence {
 		parts := strings.Split(key, "\x00")
 		if len(parts) == 2 {
@@ -3945,9 +3649,46 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		return rootsRanked[i].Domain < rootsRanked[j].Domain
 	})
 
-	fmt.Printf("[*] STAGE C: Domain OSINT (Distributing %d Roots)...\n", len(rootsRanked))
-	RunStageC(ctx, rootsRanked, domainProviders, cfg, httpClient, pipeStats, rtCaches, ds, rootProvenance)
+	// Stage C: Domain OSINT
+	var extProviders []*ProviderRunner
+	if !cfg.NoCT {
+		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
+	}
+	if !cfg.NoPassive {
+		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+	}
+	if cfg.VTKey != "" {
+		extProviders = append(extProviders, NewRunner(&vtDomainProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 2000, MaxRoots: 100, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&vtIPProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 2000, MaxPages: 3}))
+	}
+	if cfg.URLScanKey != "" {
+		extProviders = append(extProviders, NewRunner(&urlScanDomainProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxRoots: 100, MaxPages: 5}))
+		extProviders = append(extProviders, NewRunner(&urlScanIPProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxPages: 5}))
+	}
+	if cfg.ChaosKey != "" {
+		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 2000, MaxRoots: 100, MaxPages: 1}))
+	}
 
+	var domainProviders []*ProviderRunner
+	for _, p := range extProviders {
+		if p.QueryType() == QueryDomain {
+			domainProviders = append(domainProviders, p)
+		}
+	}
+
+	if len(rootsRanked) > 0 {
+		fmt.Printf("[*] STAGE C: Domain OSINT (Distributing %d Roots)...\n", len(rootsRanked))
+		httpClient := &http.Client{Timeout: 15 * time.Second}
+		rtCaches := NewRuntimeCaches()
+		RunStageC(ctx, rootsRanked, domainProviders, cfg, httpClient, pipeStats, rtCaches, &ds, rootProvenance)
+	}
+
+	// Извлекаем все домены после OSINT
 	var allDomains []string
 	ds.mu.RLock()
 	for d := range ds.domainsToResolve {
@@ -3955,37 +3696,20 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 	ds.mu.RUnlock()
 
+	// ==========================================
+	// STAGE D: Нативный DNS
+	// ==========================================
+	
+	fmt.Printf("[*] STAGE D: DNS Validation (%d Domains)...\n", len(allDomains))
+	
 	var validPairs []TargetPair
 	var pairSeen sync.Map
-
-	if cfg.Mode == ModeDirect && cfg.DirectSNI != "" {
-		sni := CleanDomain(cfg.DirectSNI)
-		if sni != "" {
-			for _, ip := range sampledIPs {
-				key := ip + "\x00" + sni
-				if _, loaded := pairSeen.LoadOrStore(key, true); !loaded {
-					ds.mu.Lock()
-					if len(validPairs) < LimitValidPairs {
-						validPairs = append(validPairs, TargetPair{
-							IP:       ip,
-							SNI:      sni,
-							Evidence: Evidence{Direct: SourceSeed},
-						})
-					} else {
-						ds.droppedValidPairs++
-					}
-					ds.mu.Unlock()
-				}
-			}
-		}
-	}
-
-	fmt.Printf("[*] STAGE D: DNS Validation (%d Domains)...\n", len(allDomains))
-	var uniqueResolvedIPs sync.Map
-	var uniqueTargetIPs sync.Map
+	var pairsMu sync.Mutex
 
 	gD, gCtxD := errgroup.WithContext(ctx)
-	gD.SetLimit(cfg.Workers)
+	gD.SetLimit(cfg.DNSWorkers)
+	rtCachesD := NewRuntimeCaches()
+
 	for _, dom := range allDomains {
 		if cfg.Mode == ModeDirect && dom == CleanDomain(cfg.DirectSNI) {
 			continue
@@ -3999,7 +3723,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			pipeStats.DNSQueries++
 			pipeStats.mu.Unlock()
 
-			ips, err := resolveIPv4Cached(gCtxD, pool, dom, rtCaches)
+			ips, err := resolveHostCached(gCtxD, dom, rtCachesD)
 
 			pipeStats.mu.Lock()
 			if err != nil {
@@ -4040,38 +3764,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 			matched := false
 			for _, resolvedIP := range ips {
-				uniqueResolvedIPs.Store(resolvedIP, struct{}{})
-
+				// ИСПРАВЛЕНИЕ: Сверка IP. Мы берем оригинальный IP из пары (если он там был)
+				// и сверяем его с Target Range
 				if ipInRanges(resolvedIP, scanRanges) {
-					parsedIP := net.ParseIP(resolvedIP)
-					if parsedIP != nil {
-						var asn uint
-						var country string
-						if asnDB != nil {
-							if r, err := asnDB.ASN(parsedIP); err == nil {
-								asn = uint(r.AutonomousSystemNumber)
-							}
-						}
-						if countryDB != nil {
-							if r, err := countryDB.Country(parsedIP); err == nil {
-								country = r.Country.IsoCode
-							}
-						}
-						if cfg.TargetASN != 0 && asn != cfg.TargetASN {
-							pipeStats.mu.Lock()
-							pipeStats.ASNFiltered++
-							pipeStats.mu.Unlock()
-							continue
-						}
-						if cfg.TargetCountry != "" && !strings.EqualFold(country, cfg.TargetCountry) {
-							pipeStats.mu.Lock()
-							pipeStats.CountryFiltered++
-							pipeStats.mu.Unlock()
-							continue
-						}
-					}
-
-					uniqueTargetIPs.Store(resolvedIP, struct{}{})
 					matched = true
 
 					pipeStats.mu.Lock()
@@ -4080,23 +3775,23 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 					pairKey := resolvedIP + "\x00" + dom
 					if _, loaded := pairSeen.LoadOrStore(pairKey, true); !loaded {
-						ds.mu.Lock()
-						if len(validPairs) < LimitValidPairs {
-							evD := ds.domainEvidence[dom]
-							evP := ds.pairEvidence[pairKey]
-							finalEvidence := Evidence{
-								Direct:    evD.Direct | evP.Direct,
-								Inherited: evD.Inherited | evP.Inherited,
-							}
-							validPairs = append(validPairs, TargetPair{
-								IP:       resolvedIP,
-								SNI:      dom,
-								Evidence: finalEvidence,
-							})
-						} else {
-							ds.droppedValidPairs++
+						// Достаем оригинальный Evidence, если он был
+						ds.mu.RLock()
+						ev := ds.domainEvidence[dom].Combined()
+						if evP, exists := ds.pairEvidence[pairKey]; exists {
+							ev |= evP.Combined()
 						}
-						ds.mu.Unlock()
+						ds.mu.RUnlock()
+
+						pairsMu.Lock()
+						if len(validPairs) < LimitValidPairs {
+							validPairs = append(validPairs, TargetPair{
+								IP:       resolvedIP, 
+								SNI:      dom,
+								Evidence: ev,
+							})
+						}
+						pairsMu.Unlock()
 					}
 				}
 			}
@@ -4108,98 +3803,173 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			return nil
 		})
 	}
+	
 	if err := gD.Wait(); err != nil || ctx.Err() != nil {
 		fmt.Println("[-] Выполнение прервано (Stage D).")
 		return nil
 	}
 
-	uniqueResolvedCount := 0
-	uniqueResolvedIPs.Range(func(k, v interface{}) bool {
-		uniqueResolvedCount++
-		return true
-	})
-	uniqueTargetCount := 0
-	uniqueTargetIPs.Range(func(k, v interface{}) bool {
-		uniqueTargetCount++
-		return true
-	})
-
 	pipeStats.mu.Lock()
-	pipeStats.DNSUniqueResolvedIPs = uniqueResolvedCount
-	pipeStats.DNSUniqueTargetIPs = uniqueTargetCount
 	pipeStats.DNSValidPairs = len(validPairs)
-	fmt.Printf("[+] Stage D Завершён. Подтверждено DNS-пар (IP+SNI): %d\n", pipeStats.DNSValidPairs)
+	fmt.Printf("[+] Stage D Завершён.\n")
+	fmt.Printf("    - DNS Queries: %d (Success: %d, Failed: %d)\n", pipeStats.DNSQueries, pipeStats.DNSSuccess, pipeStats.DNSFailed)
+	fmt.Printf("    - NXDOMAIN: %d, Timeout: %d, OtherErr: %d, NoIPv4: %d\n", pipeStats.DNSNXDomain, pipeStats.DNSTimeout, pipeStats.DNSOtherErr, pipeStats.DNSNoIPv4)
+	fmt.Printf("    - Подтверждено DNS-пар (IP+SNI): %d\n", pipeStats.DNSValidPairs)
 	pipeStats.mu.Unlock()
 
 	if len(validPairs) == 0 {
 		return nil
 	}
 
+	// ==========================================
+	// STAGE E: H2 & Validation
+	// ==========================================
+
 	fmt.Printf("[*] STAGE E: Active HTTP/2 Scanning & TLS Enrichment (%d targets)...\n", len(validPairs))
 	var candidates []Candidate
 	var candMu sync.Mutex
-	gE, gCtxE := errgroup.WithContext(ctx)
-	gE.SetLimit(cfg.Workers)
 
-	for _, p := range validPairs {
-		p := p
-		gE.Go(func() error {
-			if gCtxE.Err() != nil {
-				return gCtxE.Err()
-			}
-			cand, pErr := ProbeH2(gCtxE, p.IP, p.SNI, p.Evidence, cfg)
+	h2jobs := make(chan TargetPair, len(validPairs))
+	var wgE sync.WaitGroup
+	
+	tcpTimeout := time.Duration(cfg.TCPTimeoutMs) * time.Millisecond
+	tlsTimeout := time.Duration(cfg.TLSTimeoutMs) * time.Millisecond
 
-			tcpOK := pErr == nil || pErr.Stage > ProbeStageTCP
-			tlsOK := pErr == nil || pErr.Stage > ProbeStageTLS
+	for i := 0; i < cfg.Workers; i++ {
+		wgE.Add(1)
+		go func() {
+			defer wgE.Done()
+			for p := range h2jobs {
+				if ctx.Err() != nil {
+					return
+				}
 
-			pipeStats.mu.Lock()
-			if tcpOK {
+				cand, pErr := ProbeH2(ctx, p.IP, p.SNI, p.Evidence, cfg)
+
+				pipeStats.mu.Lock()
+
+				if pErr != nil && pErr.Stage == ProbeStageTCP {
+					errStr := pErr.Err.Error()
+					if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") {
+						pipeStats.TCPTimeouts++
+					} else if strings.Contains(errStr, "refused") {
+						pipeStats.TCPRefused++
+					} else {
+						pipeStats.TCPOtherErrs++
+					}
+					pipeStats.mu.Unlock()
+					continue
+				}
 				pipeStats.TCPConnected++
-			}
-			if tlsOK {
+
+				if pErr != nil && (pErr.Stage == ProbeStageTLS || pErr.Stage == ProbeStageTLSValidation) {
+					errStr := pErr.Err.Error()
+					if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") {
+						pipeStats.TLSTimeouts++
+					} else if strings.Contains(errStr, "no peer certificates") {
+						pipeStats.NoPeerCertificates++
+					} else if strings.Contains(errStr, "handshake failure") {
+						pipeStats.TLSHandshakeFailure++
+					} else if strings.Contains(errStr, "unrecognized name") {
+						pipeStats.TLSUnrecognizedName++
+					} else if strings.Contains(errStr, "connection reset") {
+						pipeStats.TLSConnectionReset++
+					} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(errStr, "EOF") {
+						pipeStats.TLSEOF++
+					} else if pErr.Stage == ProbeStageTLSValidation {
+						pipeStats.TLSValidationFailures++
+					} else {
+						pipeStats.TLSOtherErrs++
+					}
+					pipeStats.mu.Unlock()
+					continue
+				}
 				pipeStats.TLSHandshake++
-			}
-			if pErr != nil && pErr.Stage == ProbeStageTLSValidation {
-				if strings.Contains(pErr.Err.Error(), "no peer certificates") {
-					pipeStats.NoPeerCertificates++
-				} else {
-					pipeStats.TLSValidationFailures++
+
+				if cand != nil && cand.ALPN != "h2" {
+					pipeStats.H2NoALPN++
 				}
-			}
-			if cand != nil && cand.H2HeadersReceived {
+
+				if pErr != nil {
+					errStr := pErr.Err.Error()
+					if os.IsTimeout(pErr.Err) || strings.Contains(errStr, "deadline") || strings.Contains(errStr, "i/o timeout") || (cand != nil && cand.ReadTimeout) {
+						pipeStats.H2TimeoutNoFrames++
+					} else if strings.Contains(errStr, "connection reset") {
+						pipeStats.H2ConnectionReset++
+					} else if strings.Contains(errStr, "broken pipe") {
+						pipeStats.H2BrokenPipe++
+					} else if strings.Contains(errStr, "400 Bad Request") || strings.Contains(errStr, "HTTP/1.1") {
+						pipeStats.H2BadRequest++
+					} else if cand != nil && cand.GoAwaySeen {
+						pipeStats.H2GoAway++
+					} else if errors.Is(pErr.Err, io.EOF) || strings.Contains(errStr, "EOF") {
+						pipeStats.H2EOF++
+					} else if strings.Contains(errStr, "tls:") {
+						pipeStats.H2TLSAlerts++
+					} else {
+						pipeStats.H2OtherErrs++
+					}
+					pipeStats.mu.Unlock()
+					continue
+				}
+
+				if cand == nil || !cand.H2ProtocolConfirmed {
+					pipeStats.H2OtherErrs++
+					pipeStats.mu.Unlock()
+					continue
+				}
+				pipeStats.H2ProtocolOK++
+
+				if !cand.H2HeadersReceived {
+					if cand.ReadTimeout {
+						pipeStats.H2Timeouts++
+					} else if cand.HPACKErrors {
+						pipeStats.H2HPACKErrors++
+					} else {
+						pipeStats.H2OtherErrs++
+					}
+					pipeStats.mu.Unlock()
+					continue
+				}
 				pipeStats.H2HeadersOK++
-			}
-			if cand != nil && cand.EndStreamSeen {
-				pipeStats.EndStreamOK++
-			}
-			pipeStats.mu.Unlock()
 
-			if pErr != nil {
-				return nil
-			}
-
-			if parsedIP := net.ParseIP(cand.IP); parsedIP != nil {
-				if asnDB != nil {
-					if r, err := asnDB.ASN(parsedIP); err == nil {
-						cand.ASN = uint(r.AutonomousSystemNumber)
-					}
+				if cand.MissingStatus || cand.HTTPStatus <= 0 {
+					pipeStats.H2InvalidStatus++
+					pipeStats.mu.Unlock()
+					continue
 				}
-				if countryDB != nil {
-					if r, err := countryDB.Country(parsedIP); err == nil {
-						cand.Country = r.Country.IsoCode
-					}
-				}
-			}
+				pipeStats.H2StatusOK++
 
-			if validateAndEnrich(cand, cfg, pipeStats) {
+				if cand.EndStreamSeen {
+					pipeStats.EndStreamOK++
+				}
+				pipeStats.mu.Unlock()
+
+				if !validateAndEnrich(cand, cfg, pipeStats) {
+					pipeStats.mu.Lock()
+					pipeStats.ScoreRejected++
+					pipeStats.mu.Unlock()
+					continue
+				}
+
+				pipeStats.mu.Lock()
+				pipeStats.CandidatesAccepted++
+				pipeStats.mu.Unlock()
+
 				candMu.Lock()
 				candidates = append(candidates, *cand)
 				candMu.Unlock()
 			}
-			return nil
-		})
+		}()
 	}
-	if err := gE.Wait(); err != nil || ctx.Err() != nil {
+
+	for _, p := range validPairs {
+		h2jobs <- p
+	}
+	close(h2jobs)
+	wgE.Wait()
+
+	if ctx.Err() != nil {
 		fmt.Println("[-] Выполнение прервано (Stage E).")
 		return nil
 	}
@@ -4209,82 +3979,86 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		ipClusters[c.IP] = append(ipClusters[c.IP], c)
 	}
 
-	var clusteredCandidates []Candidate
-	for _, cluster := range ipClusters {
-		sort.Slice(cluster, func(i, j int) bool {
-			if cluster[i].Score != cluster[j].Score {
-				return cluster[i].Score > cluster[j].Score
-			}
-			if cluster[i].Timings.TotalProbeLatency() != cluster[j].Timings.TotalProbeLatency() {
-				return cluster[i].Timings.TotalProbeLatency() < cluster[j].Timings.TotalProbeLatency()
-			}
-			return cluster[i].SNI < cluster[j].SNI
-		})
-		clusteredCandidates = append(clusteredCandidates, cluster[0])
-	}
-
-	sort.Slice(clusteredCandidates, func(i, j int) bool {
-		if clusteredCandidates[i].Score != clusteredCandidates[j].Score {
-			return clusteredCandidates[i].Score > clusteredCandidates[j].Score
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Score != candidates[j].Score {
+			return candidates[i].Score > candidates[j].Score
 		}
-		if clusteredCandidates[i].Timings.TotalProbeLatency() != clusteredCandidates[j].Timings.TotalProbeLatency() {
-			return clusteredCandidates[i].Timings.TotalProbeLatency() < clusteredCandidates[j].Timings.TotalProbeLatency()
+		if candidates[i].Timings.TotalProbeLatency() != candidates[j].Timings.TotalProbeLatency() {
+			return candidates[i].Timings.TotalProbeLatency() < candidates[j].Timings.TotalProbeLatency()
 		}
-		return clusteredCandidates[i].SNI < clusteredCandidates[j].SNI
+		return candidates[i].SNI < candidates[j].SNI
 	})
 
-	pipeStats.SnapshotAndPrint(pool, len(clusteredCandidates), ds)
+	s := pipeStats
+	s.mu.Lock()
+	fmt.Println("\n===================================================================================================================")
+	fmt.Println("                                   ТЕЛЕМЕТРИЯ СКАНИРОВАНИЯ (PIPELINE STATS)")
+	fmt.Println("===================================================================================================================")
+	fmt.Printf("[*] IP отобрано для пула:      %d\n", s.IPSampled)
+	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", s.PTRFound)
+	fmt.Printf("[*] IP с сертификатами (TLS):  %d\n", s.IPWithDirectTLS)
+	fmt.Printf("[*] Найдено уник. доменов:     %d\n\n", s.UniqueDomains)
 
-	return clusteredCandidates
+	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", s.DNSQueries, s.DNSSuccess, s.DNSFailed)
+	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", s.DNSResolvedIPs, s.DNSNXDomain, s.DNSNoIPv4)
+	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", s.DNSTimeout, s.DNSTemporary, s.DNSOtherErr)
+	fmt.Printf("    Детали PTR запросов:       Sent: %d, Found: %d, Err: %d\n", s.PTRQueriesSent, s.PTRFound, s.PTRErrors)
+	fmt.Printf("[*] Target Range IP Matches:   %d\n", s.DNSTargetRangeMatches)
+	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n\n", s.DNSValidPairs)
+
+	fmt.Printf("[*] Анализ Stage E (Строгая Воронка):\n")
+	fmt.Printf("    1. Целей на входе (DNS):       %d\n", s.DNSValidPairs)
+	fmt.Printf("    2. Успешный TCP коннект:       %d (Потери: Timeouts=%d, Refused=%d, Other=%d)\n", s.TCPConnected, s.TCPTimeouts, s.TCPRefused, s.TCPOtherErrs)
+	fmt.Printf("    3. Успешный TLS хэндшейк:      %d (Потери: Timeouts=%d, HandshakeFail=%d, UnrecName=%d, ConnReset=%d, EOF=%d, NoCert=%d, CertFail=%d, Other=%d)\n", s.TLSHandshake, s.TLSTimeouts, s.TLSHandshakeFailure, s.TLSUnrecognizedName, s.TLSConnectionReset, s.TLSEOF, s.NoPeerCertificates, s.TLSValidationFailures, s.TLSOtherErrs)
+	fmt.Printf("    4. Подтверждён H2 протокол:    %d (Потери: TimeoutNoFrames=%d, ConnReset=%d, BrokenPipe=%d, BadRequest/HTTP1=%d, GoAway=%d, EOF=%d, TLSAlerts=%d, Other=%d)\n", s.H2ProtocolOK, s.H2TimeoutNoFrames, s.H2ConnectionReset, s.H2BrokenPipe, s.H2BadRequest, s.H2GoAway, s.H2EOF, s.H2TLSAlerts, s.H2OtherErrs)
+	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", s.H2HeadersOK, s.H2Timeouts, s.H2HPACKErrors)
+	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", s.H2StatusOK, s.H2InvalidStatus)
+	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d)\n", s.CandidatesAccepted, s.ScoreRejected)
+
+	fmt.Printf("\n    *  Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
+	fmt.Printf("    *  Уникальных IP-кластеров:    %d\n", len(ipClusters))
+	s.mu.Unlock()
+
+	return candidates
 }
 
 // ================= MAIN =================
 
 func main() {
-	var err error
-	uaRng = rand.New(rand.NewSource(time.Now().UnixNano()))
-
 	cfg := Config{}
 	var modeStr, domainsStr string
 
 	flag.StringVar(&modeStr, "mode", "autonomous", "autonomous | direct")
-	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size for generic tasks")
-	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = default 1024, -1 = up to hard safety limit 262144)")
-	flag.IntVar(&cfg.IPOSINTLimit, "ip-osint-limit", 256, "Maximum Reverse-IP queries per provider (0 = all sampled IPs)")
-	flag.IntVar(&cfg.DomainOSINTLimit, "domain-osint-limit", 100, "Maximum roots per domain OSINT provider (0 = all eligible roots)")
-	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 2000, "TCP timeout ms")
-	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 2000, "TLS timeout ms")
+	flag.IntVar(&cfg.Workers, "w", 1000, "Worker pool size for TLS/TCP probing")
+	flag.IntVar(&cfg.DNSWorkers, "dns-workers", 128, "Worker pool size for DNS validation")
+	flag.IntVar(&cfg.MaxIPs, "max-ips", 0, "Limit for IP sampling (0 = no hard limit, will scan all generated IPs)")
+	flag.IntVar(&cfg.TCPTimeoutMs, "tcp-timeout", 3000, "TCP timeout ms")
+	flag.IntVar(&cfg.TLSTimeoutMs, "tls-timeout", 3000, "TLS timeout ms")
 	flag.IntVar(&cfg.H2ReadTimeoutMs, "h2-read", 3000, "H2 Read timeout ms")
 	flag.IntVar(&cfg.H2WriteTimeoutMs, "h2-write", 2000, "H2 Write timeout ms")
-	flag.Int64Var(&cfg.Seed, "seed", time.Now().UnixNano(), "Random seed")
 	flag.StringVar(&cfg.TargetCountry, "c", "", "Hard Filter: Target Country Code")
-	flag.UintVar(&cfg.TargetASN, "asn", 0, "Hard Filter: Target ASN constraint")
-	flag.StringVar(&cfg.TargetIP, "target-ip", "", "Remote Hosting target IP")
+	flag.StringVar(&cfg.TargetASN, "asn", "", "Hard Filter: Target ASN constraint (e.g., AS12345)")
+	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера для поиска сети (запуск с ПК)")
 	flag.StringVar(&cfg.DirectSNI, "sni", "", "Fallback SNI for Direct mode")
-	flag.BoolVar(&cfg.ScanEntireASN, "scan-all-asn", false, "Scan all ASN prefixes")
 	flag.StringVar(&domainsStr, "domains", "", "Comma-separated seed domains for OSINT")
-	flag.StringVar(&cfg.GeoIPPath, "geoip", "GeoLite2-Country.mmdb", "Path to Country DB")
-	flag.StringVar(&cfg.ASNPath, "asn-db", "GeoLite2-ASN.mmdb", "Path to ASN DB")
 
 	flag.BoolVar(&cfg.NoPTR, "no-ptr", false, "Disable Reverse DNS PTR lookups")
-	flag.BoolVar(&cfg.NoCT, "no-ct", false, "Disable Certificate Transparency lookups")
+	flag.BoolVar(&cfg.NoCT, "no-ct", false, "Disable Certificate Transparency OSINT")
 	flag.BoolVar(&cfg.NoPassive, "no-passive", false, "Disable Passive DNS OSINT")
-	flag.BoolVar(&cfg.NoReverseIP, "no-reverse-ip", false, "Disable Reverse IP lookups")
-
+	flag.BoolVar(&cfg.NoReverseIP, "no-reverse-ip", false, "Disable Reverse IP OSINT")
+	flag.BoolVar(&cfg.NoActiveTLS, "no-tls-probe", false, "Disable direct IP TLS certificate extraction")
+	
 	flag.StringVar(&cfg.VTKey, "vt-key", "dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5", "VirusTotal API Key")
 	flag.StringVar(&cfg.URLScanKey, "urlscan-key", "01a032ae-681d-7718-821b-c6fd33aa11a7", "URLScan.io API Key")
 	flag.StringVar(&cfg.ChaosKey, "chaos-key", "e3c91ed9-2f79-4147-807f-43dd150003e4", "ProjectDiscovery Chaos API Key")
 
 	flag.Parse()
 
-	if cfg.Seed != 0 {
-		uaMu.Lock()
-		uaRng = rand.New(rand.NewSource(cfg.Seed))
-		uaMu.Unlock()
-	}
-
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
+	}
+	if cfg.DNSWorkers < 1 {
+		cfg.DNSWorkers = 1
 	}
 	cfg.Mode = Mode(modeStr)
 	cfg.CIDRs = flag.Args()
@@ -4308,71 +4082,27 @@ func main() {
 			log.Fatal("[-] Direct mode requires -sni target explicitly")
 		}
 	}
-	if cfg.MaxIPs == -1 {
-		fmt.Printf("[!] ВНИМАНИЕ: Выбран режим полного сканирования (-1 = до %d адресов).\n", LimitMaxIPs)
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err = ensureDB(cfg.ASNPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"); err != nil {
-		log.Fatalf("[-] Ошибка загрузки базы ASN (%s): %v", cfg.ASNPath, err)
-	}
-	if err = ensureDB(cfg.GeoIPPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"); err != nil {
-		log.Fatalf("[-] Ошибка загрузки базы Country (%s): %v", cfg.GeoIPPath, err)
-	}
-
-	var asnDB, countryDB *geoip2.Reader
-	if asnDB, err = geoip2.Open(cfg.ASNPath); err != nil {
-		log.Fatal("[-] Failed to open ASN DB")
-	}
-	defer asnDB.Close()
-
-	if countryDB, err = geoip2.Open(cfg.GeoIPPath); err != nil {
-		log.Fatal("[-] Failed to open GeoIP DB")
-	}
-	defer countryDB.Close()
-
-	dnsCtx, dnsCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer dnsCancel()
-	fmt.Println("[DNS] Загрузка публичного DNSCrypt pool...")
-	stamps, err := loadResolverStamps(dnsCtx)
-	if err != nil {
-		log.Fatalf("[-] DNSCrypt list: %v", err)
-	}
-
-	dnsPool := buildDNSPool(dnsCtx, stamps)
-	dnsPool.mu.RLock()
-	poolSize := len(dnsPool.resolvers)
-	dnsPool.mu.RUnlock()
-
-	if poolSize < 5 {
-		log.Fatalf("[-] Слишком мало рабочих DNSCrypt resolver'ов: %d", poolSize)
-	}
-	fmt.Printf("[+] Рабочий DNSCrypt pool: %d resolver'ов\n", poolSize)
-
-	var vpsQueryIP, localPrefix string
+	var vpsQueryIP string
 
 	if cfg.Mode == ModeAuto {
 		ip, err := getPublicIP(cfg.TargetIP)
 		if err != nil {
-			log.Fatalf("[-] Ошибка получения публичного IP: %v\n", err)
+			log.Fatalf("[-] %v\n", err)
 		}
 		vpsQueryIP = ip
 
-		parsedIP := net.ParseIP(vpsQueryIP)
-		if cfg.TargetASN == 0 {
-			if r, err := asnDB.ASN(parsedIP); err == nil {
-				cfg.TargetASN = uint(r.AutonomousSystemNumber)
-			} else {
-				log.Fatal("[-] Не удалось определить ASN по GeoIP")
+		if cfg.TargetASN == "" || cfg.TargetCountry == "" {
+			asn, _ := getASNAndPrefix(vpsQueryIP)
+			country := getCountry(vpsQueryIP)
+			if cfg.TargetASN == "" {
+				cfg.TargetASN = asn
 			}
-		}
-		if cfg.TargetCountry == "" {
-			if r, err := countryDB.Country(parsedIP); err == nil {
-				cfg.TargetCountry = r.Country.IsoCode
-			} else {
-				log.Fatal("[-] Не удалось определить Country по GeoIP")
+			if cfg.TargetCountry == "" {
+				cfg.TargetCountry = country
 			}
 		}
 	}
@@ -4380,49 +4110,55 @@ func main() {
 	var results []Candidate
 
 	if cfg.Mode == ModeAuto {
-		cidrs, err := fetchASNCIDRs(cfg.TargetASN)
-		if err != nil || len(cidrs) == 0 {
-			log.Fatalf("[-] Failed to fetch CIDRs for AS%d", cfg.TargetASN)
-		}
-		vpsIPObj := net.ParseIP(vpsQueryIP)
-		for _, c := range cidrs {
-			_, ipnet, _ := net.ParseCIDR(c)
-			if ipnet != nil && ipnet.Contains(vpsIPObj) {
-				localPrefix = c
-				break
-			}
-		}
-		var samplingCIDRs []string
-		if !cfg.ScanEntireASN {
-			if localPrefix == "" {
-				log.Fatal("[-] Target IP is not present in ASN announced prefixes. Use --scan-all-asn.")
-			}
-			samplingCIDRs = []string{localPrefix}
-		} else {
-			samplingCIDRs = cidrs
+		allPrefixes := getPrefixes(cfg.TargetASN)
+		if len(allPrefixes) == 0 {
+			log.Fatalf("[-] Failed to fetch CIDRs for %s", cfg.TargetASN)
 		}
 
-		samplingRanges := MergeCIDRs(samplingCIDRs)
-		sampledIPs := SampleIPs(samplingRanges, cfg.MaxIPs, cfg.Seed)
-		dnsRanges := MergeCIDRs(cidrs)
+		var targetPrefixes []string
+		if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
+			targetPrefixes = filterPrefixesByCountry(allPrefixes, cfg.TargetCountry)
+
+			vpsIPObj := net.ParseIP(vpsQueryIP)
+			foundLocal := false
+			var localPrefix string
+			for _, c := range allPrefixes {
+				_, ipnet, _ := net.ParseCIDR(c)
+				if ipnet != nil && ipnet.Contains(vpsIPObj) {
+					localPrefix = c
+					break
+				}
+			}
+
+			for _, p := range targetPrefixes {
+				if p == localPrefix {
+					foundLocal = true
+					break
+				}
+			}
+			if !foundLocal && localPrefix != "" {
+				targetPrefixes = append([]string{localPrefix}, targetPrefixes...)
+			}
+		} else {
+			targetPrefixes = allPrefixes
+		}
+
+		sampledIPs := generateIPs(targetPrefixes, cfg.MaxIPs)
+		dnsRanges := MergeCIDRs(allPrefixes)
 
 		fmt.Printf("[*] Целевой IP:             %s\n", vpsQueryIP)
-		fmt.Printf("[*] Announcing ASN:         AS%d\n", cfg.TargetASN)
-		if !cfg.ScanEntireASN {
-			fmt.Printf("[*] Фокус на IPv4 prefix:    %s (DNS-валидация по всем %d префиксам ASN)\n", localPrefix, len(cidrs))
-		} else {
-			fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN\n", len(cidrs))
-		}
-		fmt.Printf("[*] Страна сервера:          %s (MaxMind GeoIP)\n", cfg.TargetCountry)
-		fmt.Printf("[*] Подготовлено %d IP адресов для OSINT-сэмплинга. Запуск...\n\n", len(sampledIPs))
+		fmt.Printf("[*] Announcing ASN:         %s\n", cfg.TargetASN)
+		fmt.Printf("[*] Фокус на префиксы:       %d подсетей ASN (С учетом страны)\n", len(targetPrefixes))
+		fmt.Printf("[*] Страна сервера:          %s (ip-api)\n", cfg.TargetCountry)
+		fmt.Printf("[*] Подготовлено %d IP адресов для сэмплинга. Запуск...\n\n", len(sampledIPs))
 
-		results = RunPipeline(ctx, cfg, sampledIPs, dnsRanges, dnsPool, asnDB, countryDB)
+		results = RunPipeline(ctx, cfg, sampledIPs, dnsRanges)
 
 	} else if cfg.Mode == ModeDirect {
 		merged := MergeCIDRs(cfg.CIDRs)
-		sampledIPs := SampleIPs(merged, cfg.MaxIPs, cfg.Seed)
+		sampledIPs := generateIPs(cfg.CIDRs, cfg.MaxIPs)
 		fmt.Printf("[*] Direct Mode: Подготовлено %d IP адресов. Запуск...\n", len(sampledIPs))
-		results = RunPipeline(ctx, cfg, sampledIPs, merged, dnsPool, asnDB, countryDB)
+		results = RunPipeline(ctx, cfg, sampledIPs, merged)
 	}
 
 	if len(results) == 0 {
@@ -4430,8 +4166,8 @@ func main() {
 		return
 	}
 
-	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
-	fmt.Printf("%-32.32s | %-15.15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
+	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (без обрезки по IP): %d\n\n", len(results))
+	fmt.Printf("%-36s | %-15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
 		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "TCP", "TLS", "H2")
 	fmt.Println(strings.Repeat("-", 126))
 
@@ -4439,8 +4175,8 @@ func main() {
 		rs := r.RealityScore
 		scoreStr := fmt.Sprintf("%.1f", r.Score)
 
-		fmt.Printf("%-32.32s | %-15.15s | %-5s | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f    | %-6d | %3d %3d %3d\n",
-			r.SNI, r.IP, scoreStr, rs.TLSQuality, rs.Certificate, rs.H2Profile, rs.ServerProfile, rs.HTTPBehavior, rs.DiscoveryScore, r.HTTPStatus,
+		fmt.Printf("%-36s | %-15s | %-5s | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f    | %-6d | %3d %3d %3d\n",
+			limitStr(r.SNI, 36), r.IP, scoreStr, rs.TLSQuality, rs.Certificate, rs.H2Profile, rs.ServerProfile, rs.HTTPBehavior, rs.DiscoveryScore, r.HTTPStatus,
 			r.Timings.TCP.Milliseconds(), r.Timings.TLS.Milliseconds(), r.Timings.H2Headers.Milliseconds())
 	}
 
