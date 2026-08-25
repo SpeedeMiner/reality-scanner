@@ -3654,9 +3654,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	pipeStats.IPSampled = len(sampledIPs)
 	pipeStats.mu.Unlock()
 
-	fmt.Printf("[*] ECS client IP:          %s/%d\n", cfg.ECSIP, cfg.ECSPrefix)
-	fmt.Printf("[*] Raw UDP DNS pool:       %s\n", strings.Join(cfg.DNSResolvers, ", "))
-
 	ds := NewDiscoveryState()
 	rtCaches := NewRuntimeCaches()
 
@@ -4163,6 +4160,38 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 // ================= API HELPERS (ACTIVE-SCANNER STYLE) =================
 
+func getPublicIP(targetIP string) (string, error) {
+	if strings.TrimSpace(targetIP) != "" {
+		ip := net.ParseIP(strings.TrimSpace(targetIP))
+		if ip == nil || ip.To4() == nil {
+			return "", fmt.Errorf("invalid target IPv4: %s", targetIP)
+		}
+		return ip.To4().String(), nil
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, endpoint := range []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+		"http://ip-api.com/line/?fields=query",
+	} {
+		resp, err := client.Get(endpoint)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 128))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(strings.TrimSpace(string(body)))
+		if ip != nil && ip.To4() != nil {
+			return ip.To4().String(), nil
+		}
+	}
+	return "", fmt.Errorf("could not determine public IPv4")
+}
+
 func getPrefixes(asn string) []string {
 	asn = strings.TrimSpace(strings.ToUpper(asn))
 	if asn == "" || asn == "UNKNOWN_ASN" {
@@ -4286,7 +4315,7 @@ func main() {
 		Mode:              ModeAuto,
 		Workers:           30,
 		DNSWorkers:        128,
-		MaxIPs:            0, // preserve passive scanner default sampling: 1024 max when 0
+		MaxIPs:            -1, // full announced ASN scan, capped by LimitMaxIPs
 		IPOSINTLimit:      256,
 		DomainOSINTLimit:  100,
 		TCPTimeoutMs:      3000,
@@ -4304,6 +4333,7 @@ func main() {
 		NoCT:              false,
 		NoPassive:         false,
 		NoReverseIP:       false,
+		ScanEntireASN:     true,
 	}
 
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
@@ -4313,16 +4343,18 @@ func main() {
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
-	if cfg.TargetIP == "" {
-		log.Fatal("[-] -vps-ip is required")
-	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	publicIP, err := getPublicIP(cfg.TargetIP)
+	if err != nil {
+		log.Fatalf("[-] Не удалось определить публичный IPv4: %v", err)
+	}
+	cfg.TargetIP = publicIP
+
 	parsedIP := net.ParseIP(cfg.TargetIP)
 	if parsedIP == nil || parsedIP.To4() == nil {
-		log.Fatalf("[-] Invalid -vps-ip: %s", cfg.TargetIP)
+		log.Fatalf("[-] Invalid target IPv4: %s", cfg.TargetIP)
 	}
 	cfg.ECSIP = parsedIP.To4().String()
 
@@ -4335,8 +4367,6 @@ func main() {
 		log.Printf("[!] Не удалось определить Country для %s; продолжаем без country filter", cfg.TargetIP)
 	}
 
-	// Passive-first sampling: keep the passive scanner's original behavior by
-	// sampling the local announced prefix, while DNS validation checks all ASN prefixes.
 	cidrs := getPrefixes(cfg.TargetASN)
 	if len(cidrs) == 0 {
 		log.Fatalf("[-] Failed to fetch CIDRs for %s", cfg.TargetASN)
@@ -4353,49 +4383,59 @@ func main() {
 		log.Fatalf("[-] Target IP is not present in ASN announced prefixes")
 	}
 
-	samplingRanges := MergeCIDRs([]string{localPrefix})
+	var samplingCIDRs []string
+	if cfg.ScanEntireASN {
+		samplingCIDRs = cidrs
+	} else {
+		samplingCIDRs = []string{localPrefix}
+	}
+	samplingRanges := MergeCIDRs(samplingCIDRs)
 	sampledIPs := SampleIPs(samplingRanges, cfg.MaxIPs, cfg.Seed)
 	dnsRanges := MergeCIDRs(cidrs)
 
-	fmt.Printf("[*] ECS client IP:          %s/%d\\n", cfg.ECSIP, cfg.ECSPrefix)
-	fmt.Printf("[*] Raw UDP DNS pool:       %s\\n", strings.Join(cfg.DNSResolvers, ", "))
-	fmt.Printf("[*] Целевой IP:             %s\\n", cfg.TargetIP)
-	fmt.Printf("[*] Announcing ASN:         %s\\n", cfg.TargetASN)
-	fmt.Printf("[*] Фокус на IPv4 prefix:   %s (DNS-валидация по всем %d префиксам ASN)\\n", localPrefix, len(cidrs))
-	fmt.Printf("[*] Страна сервера:          %s (ip-api)\\n", cfg.TargetCountry)
-	fmt.Printf("[*] Подготовлено %d IP адресов для passive discovery. Запуск...\\n\\n", len(sampledIPs))
+	fmt.Printf("[*] ECS client IP:          %s/%d\n", cfg.ECSIP, cfg.ECSPrefix)
+	fmt.Printf("[*] Raw UDP DNS pool:       %s\n", strings.Join(cfg.DNSResolvers, ", "))
+	fmt.Printf("[*] Целевой IP:             %s\n", cfg.TargetIP)
+	fmt.Printf("[*] Announcing ASN:         %s\n", cfg.TargetASN)
+	if cfg.ScanEntireASN {
+		fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN\n", len(cidrs))
+	} else {
+		fmt.Printf("[*] Фокус на IPv4 prefix:   %s (DNS-валидация по всем %d префиксам ASN)\n", localPrefix, len(cidrs))
+	}
+	fmt.Printf("[*] Страна сервера:          %s (ip-api)\n", cfg.TargetCountry)
+	fmt.Printf("[*] Подготовлено %d IP адресов для passive discovery. Запуск...\n\n", len(sampledIPs))
 
 	results := RunPipeline(ctx, cfg, sampledIPs, dnsRanges)
 
 	if len(results) == 0 {
-		fmt.Println("\\n[-] Подходящих кандидатов не найдено.")
+		fmt.Println("\n[-] Подходящих кандидатов не найдено.")
 		return
 	}
 
-	fmt.Printf("\\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\\n\\n", len(results))
-	fmt.Printf("%-32.32s | %-15.15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\\n",
+	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
+	fmt.Printf("%-32.32s | %-15.15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
 		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "TCP", "TLS", "H2")
 	fmt.Println(strings.Repeat("-", 126))
 
 	for _, r := range results {
 		rs := r.RealityScore
 		scoreStr := fmt.Sprintf("%.1f", r.Score)
-		fmt.Printf("%-32.32s | %-15.15s | %-5s | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f    | %-6d | %3d %3d %3d\\n",
+		fmt.Printf("%-32.32s | %-15.15s | %-5s | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f    | %-6d | %3d %3d %3d\n",
 			r.SNI, r.IP, scoreStr, rs.TLSQuality, rs.Certificate, rs.H2Profile, rs.ServerProfile, rs.HTTPBehavior, rs.DiscoveryScore, r.HTTPStatus,
 			r.Timings.TCP.Milliseconds(), r.Timings.TLS.Milliseconds(), r.Timings.H2Headers.Milliseconds())
 	}
 
 	best := results[0]
-	fmt.Println("\\n===================================================================================================================")
+	fmt.Println("\n===================================================================================================================")
 	fmt.Println("                                   РЕКОМЕНДУЕМАЯ КОНФИГУРАЦИЯ DEST/SNI")
 	fmt.Println("===================================================================================================================")
-	fmt.Printf("\"dest\": \"%s:443\",\\n", best.SNI)
-	fmt.Printf("\"serverNames\": [\\n  \"%s\"\\n]\\n\\n", best.SNI)
-	fmt.Printf("Подробности лучшего кандидата:\\n")
-	fmt.Printf("TLS: %.0f/20 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | LATENCY: TCP %dms, TLS %dms, H2 %dms\\n",
+	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
+	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
+	fmt.Printf("Подробности лучшего кандидата:\n")
+	fmt.Printf("TLS: %.0f/20 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | LATENCY: TCP %dms, TLS %dms, H2 %dms\n",
 		best.RealityScore.TLSQuality, best.RealityScore.Certificate, best.RealityScore.H2Profile, best.RealityScore.ServerProfile, best.RealityScore.HTTPBehavior, best.RealityScore.DiscoveryScore,
 		best.Timings.TCP.Milliseconds(), best.Timings.TLS.Milliseconds(), best.Timings.H2Headers.Milliseconds())
-	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\\n")
-	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\\n",
+	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
+	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n",
 		best.RealityScore.Total, best.DomainPenalty, best.Score, best.HTTPStatus, best.Timings.TotalProbeLatency().Milliseconds())
 }
