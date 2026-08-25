@@ -71,6 +71,7 @@ const (
 	providerCBThreshold   = 2
 	providerCBCooldown    = 2 * time.Minute
 	provider429CBCooldown = 5 * time.Minute
+	providerMaxRetryAfter = 60 * time.Second
 )
 
 var (
@@ -1232,6 +1233,14 @@ func providerHTTPStatus(err error) int {
 	return 0
 }
 
+func providerRetryAfter(err error) time.Duration {
+	var httpErr *ProviderHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.RetryAfter
+	}
+	return 0
+}
+
 func isTransientProviderError(err error) bool {
 	if err == nil {
 		return false
@@ -2247,7 +2256,9 @@ func RunStageC(
 	pipeStats.mu.Lock()
 	pipeStats.Alloc = allocStats
 	pipeStats.StageC.TotalRoots = len(roots)
-	pipeStats.StageC.Assigned = allocStats.AssignedRoots + allocStats.OverlappedAssignments
+	pipeStats.StageC.Assigned =
+		allocStats.AssignedRoots +
+			allocStats.OverlappedAssignments
 	pipeStats.mu.Unlock()
 
 	providerLimits := make(map[*ProviderRunner]int, len(providers))
@@ -2432,6 +2443,7 @@ SchedulerLoop:
 					continue
 				}
 
+				// Квота на ретрай = 100% от первичной квоты
 				if providerUsed[candidate] < providerLimits[candidate]*2 {
 					nextP = candidate
 					break
@@ -3662,14 +3674,13 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	var extProviders []*ProviderRunner
 	if !cfg.NoCT {
-		// Резко уменьшены задержки (было 12s, стало 1s)
 		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
 		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
 	}
