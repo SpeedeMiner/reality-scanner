@@ -532,26 +532,21 @@ type DNSResolverStat struct {
 }
 
 type RuntimeCaches struct {
-	ProvCache              *SafeCache
-	ProvGroup              *singleflight.Group
-	DNSCache               *SafeDNSCache
-	DNSGroup               *singleflight.Group
-	DNSStatsMu             sync.Mutex
-	DNSResolverStats       map[string]*DNSResolverStat
-	DNSCircuitMu           sync.Mutex
-	DNSDisabledUntil       map[string]time.Time
-	DNSConsecutiveFailures map[string]int
+	ProvCache        *SafeCache
+	ProvGroup        *singleflight.Group
+	DNSCache         *SafeDNSCache
+	DNSGroup         *singleflight.Group
+	DNSStatsMu       sync.Mutex
+	DNSResolverStats map[string]*DNSResolverStat
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
 	return &RuntimeCaches{
-		ProvCache:              NewSafeCache(),
-		ProvGroup:              &singleflight.Group{},
-		DNSCache:               NewSafeDNSCache(),
-		DNSGroup:               &singleflight.Group{},
-		DNSResolverStats:       make(map[string]*DNSResolverStat),
-		DNSDisabledUntil:       make(map[string]time.Time),
-		DNSConsecutiveFailures: make(map[string]int),
+		ProvCache:        NewSafeCache(),
+		ProvGroup:        &singleflight.Group{},
+		DNSCache:         NewSafeDNSCache(),
+		DNSGroup:         &singleflight.Group{},
+		DNSResolverStats: make(map[string]*DNSResolverStat),
 	}
 }
 
@@ -961,31 +956,6 @@ func parseDNSPTRResponse(msg []byte, wantID uint16) ([]string, error) {
 	return uniqueStrings(names), nil
 }
 
-func (r *RuntimeCaches) dnsResolverHealthy(resolver string) bool {
-	r.DNSCircuitMu.Lock()
-	defer r.DNSCircuitMu.Unlock()
-	until := r.DNSDisabledUntil[resolver]
-	return until.IsZero() || time.Now().After(until)
-}
-
-func (r *RuntimeCaches) dnsResolverSuccess(resolver string) {
-	r.DNSCircuitMu.Lock()
-	r.DNSConsecutiveFailures[resolver] = 0
-	delete(r.DNSDisabledUntil, resolver)
-	r.DNSCircuitMu.Unlock()
-}
-
-func (r *RuntimeCaches) dnsResolverFailure(resolver string, timeout bool) {
-	r.DNSCircuitMu.Lock()
-	n := r.DNSConsecutiveFailures[resolver] + 1
-	r.DNSConsecutiveFailures[resolver] = n
-	if n >= 3 {
-		r.DNSDisabledUntil[resolver] = time.Now().Add(2 * time.Minute)
-		r.DNSConsecutiveFailures[resolver] = 0
-	}
-	r.DNSCircuitMu.Unlock()
-}
-
 func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
 	query, id, err := buildDNSQuery(domain, qtype, ecsIP, ecsPrefix)
 	if err != nil {
@@ -1038,9 +1008,6 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	for i := 0; i < len(resolvers); i++ {
 		idx := (int(start) + i) % len(resolvers)
 		resolver := resolvers[idx]
-		if !rtCaches.dnsResolverHealthy(resolver) {
-			continue
-		}
 		attempted++
 		stat := rtCaches.dnsResolverStat(resolver)
 		rtCaches.DNSStatsMu.Lock()
@@ -1063,13 +1030,11 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		rtCaches.DNSStatsMu.Unlock()
 
 		if err == nil {
-			rtCaches.dnsResolverSuccess(resolver)
 			return ips, nil
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
 			return nil, ErrDNSNXDomain
 		}
-		rtCaches.dnsResolverFailure(resolver, errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err))
 		lastErr = fmt.Errorf("%s: %w", resolver, err)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
