@@ -2332,7 +2332,15 @@ func RunStageC(
 		result   ExecResult
 	}
 
-	resultsCh := make(chan stageResult, len(roots)*len(providers))
+	totalCapacity := 0
+	for _, p := range providers {
+		totalCapacity += providerLimits[p] * 2
+	}
+	if totalCapacity < 1 {
+		totalCapacity = 1
+	}
+
+	resultsCh := make(chan stageResult, totalCapacity)
 	var workerWG sync.WaitGroup
 
 	for _, p := range providers {
@@ -2367,6 +2375,7 @@ func RunStageC(
 	scheduled := make(map[string]map[*ProviderRunner]bool, len(roots))
 	rootCtx := make(map[string]context.Context, len(roots))
 	rootCancel := make(map[string]context.CancelFunc, len(roots))
+	rootSkipped := make(map[string]bool, len(roots))
 
 	for _, root := range roots {
 		rctx, cancel := context.WithCancel(ctx)
@@ -2474,6 +2483,7 @@ func RunStageC(
 
 	inFlight := 0
 
+	// 7. Initial assignments
 	for _, p := range providers {
 		for _, root := range providerRoots[p] {
 			if rootStates[root.Domain] != RootPending {
@@ -2488,6 +2498,7 @@ func RunStageC(
 		}
 	}
 
+	// 7.1. Guarantee that every root gets at least one available provider
 	for _, root := range roots {
 		if rootStates[root.Domain] != RootPending {
 			continue
@@ -2583,6 +2594,7 @@ SchedulerLoop:
 
 			if res.Status == StatSkipped || res.Status == StatWaitCanceled {
 				providerUsed[p]--
+				rootSkipped[root.Domain] = true
 				if res.Status == StatWaitCanceled && ctx.Err() != nil {
 					markCanceled(root.Domain)
 					continue
@@ -2598,7 +2610,7 @@ SchedulerLoop:
 			nextP, blockedByCB := findNextProvider(root.Domain)
 
 			if nextP == nil {
-				if blockedByCB {
+				if blockedByCB || rootSkipped[root.Domain] {
 					markDeferred(root.Domain)
 				} else {
 					markLost(root.Domain)
