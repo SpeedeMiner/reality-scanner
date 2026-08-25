@@ -956,6 +956,42 @@ func parseDNSPTRResponse(msg []byte, wantID uint16) ([]string, error) {
 	return uniqueStrings(names), nil
 }
 
+func (r *RuntimeCaches) dnsResolverStat(resolver string) *DNSResolverStat {
+	r.DNSStatsMu.Lock()
+	defer r.DNSStatsMu.Unlock()
+	stat := r.DNSResolverStats[resolver]
+	if stat == nil {
+		stat = &DNSResolverStat{}
+		r.DNSResolverStats[resolver] = stat
+	}
+	return stat
+}
+
+func (r *RuntimeCaches) dnsResolverHealthy(resolver string) bool {
+	r.DNSCircuitMu.Lock()
+	defer r.DNSCircuitMu.Unlock()
+	until := r.DNSDisabledUntil[resolver]
+	return until.IsZero() || time.Now().After(until)
+}
+
+func (r *RuntimeCaches) dnsResolverSuccess(resolver string) {
+	r.DNSCircuitMu.Lock()
+	r.DNSConsecutiveFailures[resolver] = 0
+	delete(r.DNSDisabledUntil, resolver)
+	r.DNSCircuitMu.Unlock()
+}
+
+func (r *RuntimeCaches) dnsResolverFailure(resolver string, timeout bool) {
+	r.DNSCircuitMu.Lock()
+	n := r.DNSConsecutiveFailures[resolver] + 1
+	r.DNSConsecutiveFailures[resolver] = n
+	if n >= 3 {
+		r.DNSDisabledUntil[resolver] = time.Now().Add(2 * time.Minute)
+		r.DNSConsecutiveFailures[resolver] = 0
+	}
+	r.DNSCircuitMu.Unlock()
+}
+
 func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
 	query, id, err := buildDNSQuery(domain, qtype, ecsIP, ecsPrefix)
 	if err != nil {
@@ -1004,16 +1040,20 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 
 	var lastErr error
 	start := randomDNSID()
+	attempted := 0
 	for i := 0; i < len(resolvers); i++ {
 		idx := (int(start) + i) % len(resolvers)
 		resolver := resolvers[idx]
+		if !rtCaches.dnsResolverHealthy(resolver) {
+			continue
+		}
+		attempted++
 		stat := rtCaches.dnsResolverStat(resolver)
 		rtCaches.DNSStatsMu.Lock()
 		stat.Attempts++
 		rtCaches.DNSStatsMu.Unlock()
 
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, timeout)
-
 		rtCaches.DNSStatsMu.Lock()
 		if err == nil {
 			stat.Answers++
@@ -1029,15 +1069,20 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		rtCaches.DNSStatsMu.Unlock()
 
 		if err == nil {
+			rtCaches.dnsResolverSuccess(resolver)
 			return ips, nil
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
 			return nil, ErrDNSNXDomain
 		}
+		rtCaches.dnsResolverFailure(resolver, errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err))
 		lastErr = fmt.Errorf("%s: %w", resolver, err)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+	}
+	if attempted == 0 {
+		return nil, fmt.Errorf("all DNS resolvers temporarily circuit-open")
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all DNS resolvers failed")
@@ -4326,9 +4371,9 @@ func main() {
 		ECSPrefix:         DefaultECSIPv4Prefix,
 		DNSResolvers:      normalizeDNSResolvers(strings.Split(DefaultDNSResolvers, ",")),
 		Seed:              time.Now().UnixNano(),
-		VTKey:             strings.TrimSpace(os.Getenv("VT_API_KEY")),
-		URLScanKey:        strings.TrimSpace(os.Getenv("URLSCAN_API_KEY")),
-		ChaosKey:          strings.TrimSpace(os.Getenv("CHAOS_API_KEY")),
+		VTKey:             "dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5",
+		URLScanKey:        "01a032ae-681d-7718-821b-c6fd33aa11a7",
+		ChaosKey:          "e3c91ed9-2f79-4147-807f-43dd150003e4",
 		NoPTR:             false,
 		NoCT:              false,
 		NoPassive:         false,
