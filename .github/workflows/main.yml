@@ -23,10 +23,6 @@ jobs:
         # Скачиваем основные зависимости
         go get github.com/refraction-networking/utls
         go get golang.org/x/net/http2/hpack
-        go get github.com/ameshkov/dnscrypt/v2@v2.4.0
-        go get github.com/ameshkov/dnsstamps
-        go get github.com/miekg/dns
-        go get github.com/oschwald/geoip2-golang
         go get golang.org/x/sync/errgroup
         go get golang.org/x/sync/singleflight
         go get golang.org/x/net/publicsuffix
