@@ -532,21 +532,26 @@ type DNSResolverStat struct {
 }
 
 type RuntimeCaches struct {
-	ProvCache        *SafeCache
-	ProvGroup        *singleflight.Group
-	DNSCache         *SafeDNSCache
-	DNSGroup         *singleflight.Group
-	DNSStatsMu       sync.Mutex
-	DNSResolverStats map[string]*DNSResolverStat
+	ProvCache              *SafeCache
+	ProvGroup              *singleflight.Group
+	DNSCache               *SafeDNSCache
+	DNSGroup               *singleflight.Group
+	DNSStatsMu             sync.Mutex
+	DNSResolverStats       map[string]*DNSResolverStat
+	DNSCircuitMu           sync.Mutex
+	DNSDisabledUntil       map[string]time.Time
+	DNSConsecutiveFailures map[string]int
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
 	return &RuntimeCaches{
-		ProvCache:        NewSafeCache(),
-		ProvGroup:        &singleflight.Group{},
-		DNSCache:         NewSafeDNSCache(),
-		DNSGroup:         &singleflight.Group{},
-		DNSResolverStats: make(map[string]*DNSResolverStat),
+		ProvCache:              NewSafeCache(),
+		ProvGroup:              &singleflight.Group{},
+		DNSCache:               NewSafeDNSCache(),
+		DNSGroup:               &singleflight.Group{},
+		DNSResolverStats:       make(map[string]*DNSResolverStat),
+		DNSDisabledUntil:       make(map[string]time.Time),
+		DNSConsecutiveFailures: make(map[string]int),
 	}
 }
 
@@ -954,17 +959,6 @@ func parseDNSPTRResponse(msg []byte, wantID uint16) ([]string, error) {
 		}
 	}
 	return uniqueStrings(names), nil
-}
-
-func (r *RuntimeCaches) dnsResolverStat(resolver string) *DNSResolverStat {
-	r.DNSStatsMu.Lock()
-	defer r.DNSStatsMu.Unlock()
-	stat := r.DNSResolverStats[resolver]
-	if stat == nil {
-		stat = &DNSResolverStat{}
-		r.DNSResolverStats[resolver] = stat
-	}
-	return stat
 }
 
 func (r *RuntimeCaches) dnsResolverHealthy(resolver string) bool {
