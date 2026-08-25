@@ -67,14 +67,10 @@ const (
 	MaxDiscoveredDomains = 50000
 	LimitValidPairs      = 10000
 
-	// Оптимальные и стабильные настройки ретраев для OSINT
-	providerMaxAttempts    = 3
-	providerCBThreshold    = 10 // Только 10 подряд упавших задач отключают провайдера
-	providerCBCooldown     = 2 * time.Minute
-	provider429CBCooldown  = 5 * time.Minute
-	providerBackoffInitial = 1 * time.Second
-	providerBackoffSecond  = 3 * time.Second
-	providerMaxRetryAfter  = 60 * time.Second
+	// FAST-FAIL: Никаких повторных попыток. 2 ошибки = провайдер выключен.
+	providerCBThreshold   = 2
+	providerCBCooldown    = 2 * time.Minute
+	provider429CBCooldown = 5 * time.Minute
 )
 
 var (
@@ -1236,14 +1232,6 @@ func providerHTTPStatus(err error) int {
 	return 0
 }
 
-func providerRetryAfter(err error) time.Duration {
-	var httpErr *ProviderHTTPError
-	if errors.As(err, &httpErr) {
-		return httpErr.RetryAfter
-	}
-	return 0
-}
-
 func isTransientProviderError(err error) bool {
 	if err == nil {
 		return false
@@ -1298,64 +1286,25 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			return ExecResult{nil, StatSkipped}, nil
 		}
 
-		var (
-			rawRes  []string
-			err     error
-			retries int
-		)
+		if errWait := r.waitRate(ctx); errWait != nil {
+			pipeStats.recordProviderStat(statName, r.Category(), StatWaitCanceled, false, 0, 0, 0, 0, 0, 0, fmt.Sprintf("wait cancelled: %v", errWait), 0)
+			return ExecResult{nil, StatWaitCanceled}, nil
+		}
 
-		for attempt := 1; attempt <= providerMaxAttempts; attempt++ {
-			if errWait := r.waitRate(ctx); errWait != nil {
-				pipeStats.recordProviderStat(statName, r.Category(), StatWaitCanceled, false, 0, 0, 0, 0, 0, 0, fmt.Sprintf("wait cancelled: %v", errWait), retries)
-				return ExecResult{nil, StatWaitCanceled}, nil
-			}
-
-			if r.sem != nil {
-				select {
-				case r.sem <- struct{}{}:
-				case <-ctx.Done():
-					return ExecResult{nil, StatWaitCanceled}, nil
-				}
-			}
-
-			reqCtx, cancel := context.WithTimeout(ctx, r.Config.Timeout)
-			rawRes, err = r.Fetch(reqCtx, query, client, r.Config)
-			cancel()
-
-			if r.sem != nil {
-				<-r.sem
-			}
-
-			if err == nil {
-				break
-			}
-
-			if errors.Is(err, context.Canceled) {
-				break
-			}
-
-			// Больше не обрываем ретраи при 502/429/403. Даем провайдеру шанс восстановиться.
-			if !isTransientProviderError(err) || attempt == providerMaxAttempts {
-				break
-			}
-
-			retries++
-			backoff := providerRetryAfter(err)
-			if backoff <= 0 {
-				switch attempt {
-				case 1:
-					backoff = providerBackoffInitial
-				case 2:
-					backoff = providerBackoffSecond
-				default:
-					backoff = 4 * time.Second
-				}
-			}
+		if r.sem != nil {
 			select {
-			case <-time.After(backoff):
+			case r.sem <- struct{}{}:
 			case <-ctx.Done():
 				return ExecResult{nil, StatWaitCanceled}, nil
 			}
+		}
+
+		reqCtx, cancel := context.WithTimeout(ctx, r.Config.Timeout)
+		rawRes, err := r.Fetch(reqCtx, query, client, r.Config)
+		cancel()
+
+		if r.sem != nil {
+			<-r.sem
 		}
 
 		httpStatus := providerHTTPStatus(err)
@@ -1391,25 +1340,29 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				r.cbUntil = time.Time{}
 				r.mu.Unlock()
 
-				pipeStats.recordProviderStat(statName, r.Category(), StatNoData, false, 0, 0, 0, 0, 0, httpStatus, err.Error(), retries)
+				pipeStats.recordProviderStat(statName, r.Category(), StatNoData, false, 0, 0, 0, 0, 0, httpStatus, err.Error(), 0)
 				rtCaches.ProvCache.Put(cacheKey, []string{}, StatNoData, 2*time.Minute)
 				return ExecResult{[]string{}, StatNoData}, nil
 			}
 
 			if len(cleanRes) > 0 {
-				pipeStats.recordProviderStat(statName, r.Category(), StatPartial, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), retries)
+				pipeStats.recordProviderStat(statName, r.Category(), StatPartial, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), 0)
 				rtCaches.ProvCache.Put(cacheKey, cleanRes, StatPartial, 2*time.Minute)
 				return ExecResult{cleanRes, StatPartial}, nil
 			}
 
-			pipeStats.recordProviderStat(statName, r.Category(), StatFailed, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), retries)
+			pipeStats.recordProviderStat(statName, r.Category(), StatFailed, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), 0)
 
 			if !errors.Is(err, context.Canceled) {
 				r.mu.Lock()
 				r.cbFailures++
 
-				// Используем только счетчик падений для Circuit Breaker
-				if r.cbFailures >= providerCBThreshold {
+				// Мгновенный Circuit Breaker для WAF-блокировок и мёртвых API
+				isHardCB := httpStatus == http.StatusTooManyRequests ||
+					httpStatus == http.StatusForbidden ||
+					httpStatus >= 500
+
+				if r.cbFailures >= providerCBThreshold || isHardCB {
 					cooldown := providerCBCooldown
 					if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
 						cooldown = provider429CBCooldown
@@ -1431,12 +1384,12 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		r.mu.Unlock()
 
 		if len(cleanRes) == 0 {
-			pipeStats.recordProviderStat(statName, r.Category(), StatNoData, false, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, "http 200: no valid names found", retries)
+			pipeStats.recordProviderStat(statName, r.Category(), StatNoData, false, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, "http 200: no valid names found", 0)
 			rtCaches.ProvCache.Put(cacheKey, []string{}, StatNoData, 2*time.Minute)
 			return ExecResult{[]string{}, StatNoData}, nil
 		}
 
-		pipeStats.recordProviderStat(statName, r.Category(), StatSuccess, false, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, 0, "", retries)
+		pipeStats.recordProviderStat(statName, r.Category(), StatSuccess, false, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, 0, "", 0)
 		rtCaches.ProvCache.Put(cacheKey, cleanRes, StatSuccess, 10*time.Minute)
 		return ExecResult{cleanRes, StatSuccess}, nil
 	})
@@ -2294,9 +2247,7 @@ func RunStageC(
 	pipeStats.mu.Lock()
 	pipeStats.Alloc = allocStats
 	pipeStats.StageC.TotalRoots = len(roots)
-	pipeStats.StageC.Assigned =
-		allocStats.AssignedRoots +
-			allocStats.OverlappedAssignments
+	pipeStats.StageC.Assigned = allocStats.AssignedRoots + allocStats.OverlappedAssignments
 	pipeStats.mu.Unlock()
 
 	providerLimits := make(map[*ProviderRunner]int, len(providers))
@@ -2304,7 +2255,10 @@ func RunStageC(
 
 	for _, p := range providers {
 		limit := effectiveRootLimit(p, cfg)
-		if limit <= 0 || limit > len(roots) {
+		if limit <= 0 {
+			limit = len(roots)
+		}
+		if limit > len(roots) {
 			limit = len(roots)
 		}
 		providerLimits[p] = limit
@@ -2331,7 +2285,7 @@ func RunStageC(
 
 	totalCapacity := 0
 	for _, p := range providers {
-		totalCapacity += providerLimits[p] * 2
+		totalCapacity += providerLimits[p] * 2 // x2 квота для ретраев
 	}
 	if totalCapacity < 1 {
 		totalCapacity = 1
@@ -3708,18 +3662,19 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	var extProviders []*ProviderRunner
 	if !cfg.NoCT {
-		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
+		// Резко уменьшены задержки (было 12s, стало 1s)
+		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
-		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 3 * time.Second, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 3 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
 	}
 	if !cfg.NoReverseIP {
-		extProviders = append(extProviders, NewRunner(&hackerTargetProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 5 * time.Second, MaxNames: 1000, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&hackerTargetProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&shodanInternetDBProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 10, MinInterval: 50 * time.Millisecond, MaxNames: 1000, MaxPages: 1}))
 	}
 	if cfg.VTKey != "" {
