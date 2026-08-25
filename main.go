@@ -403,7 +403,7 @@ type StageCStats struct {
 type PipelineStats struct {
 	mu                    sync.Mutex
 	IPSampled             int
-	IPSampled             int
+	IPWithPTR             int
 	PTRFound              int
 	DNSQueries            int
 	DNSSuccess            int
@@ -3254,7 +3254,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	requestSent := time.Now()
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
 
-	const maxInboundFrameSize = uint32(clientAdvertisedMaxFrameSize)
+	const maxInboundFrameSize = uint32(16384)
 	buf := make([]byte, 32768)
 	recvBuf := bytes.Buffer{}
 	headerBlocks := bytes.Buffer{}
@@ -4162,6 +4162,45 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 }
 
 // ================= API HELPERS (ACTIVE-SCANNER STYLE) =================
+
+func getPrefixes(asn string) []string {
+	asn = strings.TrimSpace(strings.ToUpper(asn))
+	if asn == "" || asn == "UNKNOWN_ASN" {
+		return nil
+	}
+	if !strings.HasPrefix(asn, "AS") {
+		asn = "AS" + asn
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=%s", url.QueryEscape(asn)))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var result struct {
+		Data struct {
+			Prefixes []struct {
+				Prefix string `json:"prefix"`
+			} `json:"prefixes"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil
+	}
+	var prefixes []string
+	for _, item := range result.Data.Prefixes {
+		if strings.Contains(item.Prefix, ":") {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(item.Prefix); err == nil {
+			prefixes = append(prefixes, item.Prefix)
+		}
+	}
+	return uniqueStrings(prefixes)
+}
 
 func getCountry(ip string) string {
 	client := &http.Client{Timeout: 4 * time.Second}
