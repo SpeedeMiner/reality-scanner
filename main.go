@@ -27,7 +27,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/oschwald/geoip2-golang"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/publicsuffix"
@@ -106,15 +105,13 @@ type Config struct {
 	H2ReadTimeoutMs   int
 	H2WriteTimeoutMs  int
 	Seed              int64
-	TargetASN         uint
+	TargetASN         string
 	TargetCountry     string
 	TargetIP          string
 	DirectSNI         string
 	ScanEntireASN     bool
 	CIDRs             []string
 	Domains           []string
-	GeoIPPath         string
-	ASNPath           string
 	NoPTR             bool
 	NoCT              bool
 	NoPassive         bool
@@ -124,6 +121,8 @@ type Config struct {
 	URLScanKey string
 	ChaosKey   string
 }
+
+var ErrDNSNXDomain = errors.New("NXDOMAIN")
 
 // ================= EVIDENCE & PROVENANCE =================
 
@@ -404,7 +403,8 @@ type StageCStats struct {
 type PipelineStats struct {
 	mu                    sync.Mutex
 	IPSampled             int
-	IPWithPTR             int
+	IPSampled             int
+	PTRFound              int
 	DNSQueries            int
 	DNSSuccess            int
 	DNSFailed             int
@@ -2846,119 +2846,6 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 }
 
 // ================= DB & IP HELPERS =================
-func ensureDB(path, dbURL string) error {
-	if fi, err := os.Stat(path); err == nil && fi.Size() > 1024*1024 {
-		if db, err := geoip2.Open(path); err == nil {
-			db.Close()
-			return nil
-		}
-	}
-	tempFile := path + ".tmp"
-	out, err := os.Create(tempFile)
-	if err != nil {
-		return err
-	}
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(dbURL)
-	if err != nil {
-		out.Close()
-		os.Remove(tempFile)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		out.Close()
-		os.Remove(tempFile)
-		return fmt.Errorf("bad HTTP status: %d", resp.StatusCode)
-	}
-	if _, err = io.Copy(out, resp.Body); err != nil {
-		out.Close()
-		os.Remove(tempFile)
-		return err
-	}
-	out.Close()
-	testDB, err := geoip2.Open(tempFile)
-	if err != nil {
-		os.Remove(tempFile)
-		return fmt.Errorf("invalid MaxMind database: %v", err)
-	}
-	testDB.Close()
-	return os.Rename(tempFile, path)
-}
-
-func readPublicIPv4(resp *http.Response) (string, error) {
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	ipStr := strings.TrimSpace(string(body))
-	ip := net.ParseIP(ipStr)
-	if ip == nil || ip.To4() == nil {
-		return "", fmt.Errorf("invalid IPv4: %s", ipStr)
-	}
-	return ip.To4().String(), nil
-}
-
-func getPublicIP(targetIP string) (string, error) {
-	if targetIP != "" {
-		ip := net.ParseIP(targetIP)
-		if ip == nil || ip.To4() == nil {
-			return "", fmt.Errorf("invalid target IPv4: %s", targetIP)
-		}
-		return ip.To4().String(), nil
-	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	if resp, err := client.Get("https://api.ipify.org"); err == nil {
-		if ip, err := readPublicIPv4(resp); err == nil {
-			return ip, nil
-		}
-	}
-	if resp, err := client.Get("http://ip-api.com/line/?fields=query"); err == nil {
-		if ip, err := readPublicIPv4(resp); err == nil {
-			return ip, nil
-		}
-	}
-	return "", fmt.Errorf("failed to fetch valid public IPv4")
-}
-
-type RipeStatResponse struct {
-	Data struct {
-		Prefixes []struct {
-			Prefix string `json:"prefix"`
-		} `json:"prefixes"`
-	} `json:"data"`
-}
-
-func fetchASNCIDRs(asn uint) ([]string, error) {
-	urlStr := fmt.Sprintf("https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS%d", asn)
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(urlStr)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("RIPEstat HTTP %d", resp.StatusCode)
-	}
-	var stat RipeStatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&stat); err != nil {
-		return nil, err
-	}
-	var cidrs []string
-	for _, p := range stat.Data.Prefixes {
-		if !strings.Contains(p.Prefix, ":") {
-			if _, _, err := net.ParseCIDR(p.Prefix); err == nil {
-				cidrs = append(cidrs, p.Prefix)
-			}
-		}
-	}
-	return cidrs, nil
-}
 
 // ================= CIDR & SAMPLING =================
 type ipRange struct{ start, end uint64 }
@@ -3246,7 +3133,30 @@ func parseTrailers(cand *Candidate, headers []hpack.HeaderField) {
 	cand.ResponseTrailersSeen = true
 }
 
-func ProbeH2(ctx context.Context, ip, sni string, ev DomainSource, cfg Config) (*Candidate, *ProbeError) {
+type ProbeStage int
+
+const (
+	ProbeStageTCP ProbeStage = iota
+	ProbeStageTLS
+	ProbeStageTLSValidation
+	ProbeStageH2
+	ProbeStageHeaders
+	ProbeStageComplete
+)
+
+type ProbeError struct {
+	Stage ProbeStage
+	Err   error
+}
+
+func (e *ProbeError) Error() string {
+	if e == nil || e.Err == nil {
+		return ""
+	}
+	return e.Err.Error()
+}
+
+func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Candidate, *ProbeError) {
 	cand := &Candidate{
 		IP:            ip,
 		SNI:           sni,
@@ -3736,7 +3646,7 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 	return cand.Score >= 0
 }
 
-func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange, asnDB, countryDB *geoip2.Reader) []Candidate {
+func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange) []Candidate {
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 
 	pipeStats := NewPipelineStats()
@@ -3989,34 +3899,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				uniqueResolvedIPs.Store(resolvedIP, struct{}{})
 
 				if ipInRanges(resolvedIP, scanRanges) {
-					parsedIP := net.ParseIP(resolvedIP)
-					if parsedIP != nil {
-						var asn uint
-						var country string
-						if asnDB != nil {
-							if r, err := asnDB.ASN(parsedIP); err == nil {
-								asn = uint(r.AutonomousSystemNumber)
-							}
-						}
-						if countryDB != nil {
-							if r, err := countryDB.Country(parsedIP); err == nil {
-								country = r.Country.IsoCode
-							}
-						}
-						if cfg.TargetASN != 0 && asn != cfg.TargetASN {
-							pipeStats.mu.Lock()
-							pipeStats.ASNFiltered++
-							pipeStats.mu.Unlock()
-							continue
-						}
-						if cfg.TargetCountry != "" && !strings.EqualFold(country, cfg.TargetCountry) {
-							pipeStats.mu.Lock()
-							pipeStats.CountryFiltered++
-							pipeStats.mu.Unlock()
-							continue
-						}
-					}
-
 					uniqueTargetIPs.Store(resolvedIP, struct{}{})
 					matched = true
 
@@ -4279,6 +4161,83 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	return clusteredCandidates
 }
 
+// ================= API HELPERS (ACTIVE-SCANNER STYLE) =================
+
+func getCountry(ip string) string {
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode", ip))
+	if err != nil {
+		return "UNKNOWN"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "UNKNOWN"
+	}
+	var result struct {
+		CountryCode string `json:"countryCode"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.CountryCode == "" {
+		return "UNKNOWN"
+	}
+	return strings.ToUpper(result.CountryCode)
+}
+
+func getASNAndPrefix(ip string) (string, string) {
+	client := &http.Client{Timeout: 6 * time.Second}
+	var asn, prefix string
+
+	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
+	if err == nil {
+		var result struct {
+			Data struct {
+				ASNs   []interface{} `json:"asns"`
+				Prefix string        `json:"prefix"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			if len(result.Data.ASNs) > 0 {
+				asn = fmt.Sprintf("%v", result.Data.ASNs[0])
+				if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
+					asn = "AS" + asn
+				}
+			}
+			prefix = result.Data.Prefix
+		}
+		resp.Body.Close()
+	}
+
+	if asn == "" {
+		resp2, err2 := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=as", ip))
+		if err2 == nil {
+			var res2 struct {
+				AS string `json:"as"`
+			}
+			if err := json.NewDecoder(resp2.Body).Decode(&res2); err == nil && res2.AS != "" {
+				parts := strings.Split(res2.AS, " ")
+				if len(parts) > 0 {
+					asn = strings.ToUpper(parts[0])
+					if !strings.HasPrefix(asn, "AS") {
+						asn = "AS" + asn
+					}
+				}
+			}
+			resp2.Body.Close()
+		}
+	}
+
+	if asn == "" {
+		asn = "UNKNOWN_ASN"
+	}
+	if prefix == "" {
+		parsedIP := net.ParseIP(ip)
+		if parsedIP != nil && parsedIP.To4() != nil {
+			v := parsedIP.To4()
+			prefix = fmt.Sprintf("%d.%d.%d.0/24", v[0], v[1], v[2])
+		}
+	}
+	return asn, prefix
+}
+
 // ================= MAIN =================
 
 func main() {
@@ -4306,8 +4265,6 @@ func main() {
 		NoCT:              false,
 		NoPassive:         false,
 		NoReverseIP:       false,
-		GeoIPPath:         "GeoLite2-Country.mmdb",
-		ASNPath:           "GeoLite2-ASN.mmdb",
 	}
 
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
@@ -4324,40 +4281,19 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := ensureDB(cfg.ASNPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb"); err != nil {
-		log.Fatalf("[-] Ошибка загрузки базы ASN (%s): %v", cfg.ASNPath, err)
-	}
-	if err := ensureDB(cfg.GeoIPPath, "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"); err != nil {
-		log.Fatalf("[-] Ошибка загрузки базы Country (%s): %v", cfg.GeoIPPath, err)
-	}
-
-	asnDB, err := geoip2.Open(cfg.ASNPath)
-	if err != nil {
-		log.Fatalf("[-] Failed to open ASN DB: %v", err)
-	}
-	defer asnDB.Close()
-
-	countryDB, err := geoip2.Open(cfg.GeoIPPath)
-	if err != nil {
-		log.Fatalf("[-] Failed to open GeoIP DB: %v", err)
-	}
-	defer countryDB.Close()
-
 	parsedIP := net.ParseIP(cfg.TargetIP)
 	if parsedIP == nil || parsedIP.To4() == nil {
 		log.Fatalf("[-] Invalid -vps-ip: %s", cfg.TargetIP)
 	}
 	cfg.ECSIP = parsedIP.To4().String()
 
-	if r, err := asnDB.ASN(parsedIP); err == nil {
-		cfg.TargetASN = fmt.Sprintf("AS%d", r.AutonomousSystemNumber)
-	} else {
-		log.Fatalf("[-] Не удалось определить ASN по GeoIP: %v", err)
+	cfg.TargetASN, _ = getASNAndPrefix(cfg.TargetIP)
+	cfg.TargetCountry = getCountry(cfg.TargetIP)
+	if cfg.TargetASN == "UNKNOWN_ASN" {
+		log.Fatalf("[-] Не удалось определить ASN для %s", cfg.TargetIP)
 	}
-	if r, err := countryDB.Country(parsedIP); err == nil {
-		cfg.TargetCountry = strings.ToUpper(r.Country.IsoCode)
-	} else {
-		log.Fatalf("[-] Не удалось определить Country по GeoIP: %v", err)
+	if cfg.TargetCountry == "UNKNOWN" {
+		log.Printf("[!] Не удалось определить Country для %s; продолжаем без country filter", cfg.TargetIP)
 	}
 
 	// Passive-first sampling: keep the passive scanner's original behavior by
@@ -4387,10 +4323,10 @@ func main() {
 	fmt.Printf("[*] Целевой IP:             %s\\n", cfg.TargetIP)
 	fmt.Printf("[*] Announcing ASN:         %s\\n", cfg.TargetASN)
 	fmt.Printf("[*] Фокус на IPv4 prefix:   %s (DNS-валидация по всем %d префиксам ASN)\\n", localPrefix, len(cidrs))
-	fmt.Printf("[*] Страна сервера:          %s (MaxMind GeoIP)\\n", cfg.TargetCountry)
+	fmt.Printf("[*] Страна сервера:          %s (ip-api)\\n", cfg.TargetCountry)
 	fmt.Printf("[*] Подготовлено %d IP адресов для passive discovery. Запуск...\\n\\n", len(sampledIPs))
 
-	results := RunPipeline(ctx, cfg, sampledIPs, dnsRanges, asnDB, countryDB)
+	results := RunPipeline(ctx, cfg, sampledIPs, dnsRanges)
 
 	if len(results) == 0 {
 		fmt.Println("\\n[-] Подходящих кандидатов не найдено.")
