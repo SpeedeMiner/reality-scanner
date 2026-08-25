@@ -88,7 +88,6 @@ var (
 
 	ErrProviderNoData = errors.New("provider returned no data")
 
-	// Детерминированный генератор для User-Agent
 	uaRng *rand.Rand
 	uaMu  sync.Mutex
 )
@@ -1134,6 +1133,38 @@ func makeProviderHTTPError(resp *http.Response) error {
 	}
 }
 
+func providerCooldown(err error) (time.Duration, bool) {
+	var httpErr *ProviderHTTPError
+	if !errors.As(err, &httpErr) {
+		return 0, false
+	}
+
+	switch httpErr.StatusCode {
+	case http.StatusTooManyRequests:
+		if httpErr.RetryAfter > 0 {
+			return httpErr.RetryAfter, true
+		}
+		return provider429CBCooldown, true
+
+	case http.StatusForbidden,
+		http.StatusUnauthorized,
+		http.StatusBadRequest,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed,
+		http.StatusGone,
+		http.StatusUnprocessableEntity:
+		return providerCBCooldown, true
+
+	case http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return providerCBCooldown, true
+	}
+
+	return 0, false
+}
+
 type ProviderQueryType int
 
 const (
@@ -1248,14 +1279,6 @@ func providerHTTPStatus(err error) int {
 	return 0
 }
 
-func providerRetryAfter(err error) time.Duration {
-	var httpErr *ProviderHTTPError
-	if errors.As(err, &httpErr) {
-		return httpErr.RetryAfter
-	}
-	return 0
-}
-
 func isTransientProviderError(err error) bool {
 	if err == nil {
 		return false
@@ -1292,6 +1315,10 @@ func isTransientProviderError(err error) bool {
 }
 
 func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http.Client, pipeStats *PipelineStats, rtCaches *RuntimeCaches) ExecResult {
+	if err := ctx.Err(); err != nil {
+		return ExecResult{Names: nil, Status: StatWaitCanceled}
+	}
+
 	statName := r.StatsKey()
 	cacheKey := fmt.Sprintf("%s:%d:%s:maxnames=%d:maxpages=%d", r.Name(), r.QueryType(), query, r.Config.MaxNames, r.Config.MaxPages)
 
@@ -1327,6 +1354,11 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 
 		if r.sem != nil {
 			<-r.sem
+		}
+
+		if err != nil && ctx.Err() != nil {
+			pipeStats.recordProviderStat(statName, r.Category(), StatWaitCanceled, false, 0, 0, 0, 0, 0, 0, "root canceled", 0)
+			return ExecResult{nil, StatWaitCanceled}, nil
 		}
 
 		httpStatus := providerHTTPStatus(err)
@@ -1376,19 +1408,15 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			pipeStats.recordProviderStat(statName, r.Category(), StatFailed, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), 0)
 
 			if !errors.Is(err, context.Canceled) {
+				cooldown, hardBlock := providerCooldown(err)
 				r.mu.Lock()
-				r.cbFailures++
-
-				isHardCB := httpStatus == http.StatusTooManyRequests ||
-					httpStatus == http.StatusForbidden ||
-					httpStatus >= 500
-
-				if r.cbFailures >= providerCBThreshold || isHardCB {
-					cooldown := providerCBCooldown
-					if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusForbidden {
-						cooldown = provider429CBCooldown
-					}
+				if hardBlock {
 					r.cbUntil = time.Now().Add(cooldown)
+				} else {
+					r.cbFailures++
+					if r.cbFailures >= providerCBThreshold {
+						r.cbUntil = time.Now().Add(providerCBCooldown)
+					}
 				}
 				r.mu.Unlock()
 			} else {
@@ -2117,7 +2145,7 @@ func distributeRoots(roots []RootCandidate, providers []*ProviderRunner, overlap
 			limit = len(roots)
 		}
 		if isBlocked(p) {
-			capacity[p] = 0 
+			capacity[p] = 0
 		} else {
 			capacity[p] = limit
 		}
@@ -2239,6 +2267,12 @@ const (
 	RootDeferred
 )
 
+type RootJob struct {
+	Root   RootCandidate
+	Ctx    context.Context
+	Cancel context.CancelFunc
+}
+
 func RunStageC(
 	ctx context.Context,
 	roots []RootCandidate,
@@ -2284,12 +2318,12 @@ func RunStageC(
 			limit = len(roots)
 		}
 		providerLimits[p] = limit
-		providerUsed[p] = 0 
+		providerUsed[p] = 0
 	}
 
-	jobQueues := make(map[*ProviderRunner]chan RootCandidate, len(providers))
+	jobQueues := make(map[*ProviderRunner]chan RootJob, len(providers))
 	for _, p := range providers {
-		jobQueues[p] = make(chan RootCandidate, len(roots))
+		jobQueues[p] = make(chan RootJob, len(roots))
 	}
 
 	type stageResult struct {
@@ -2312,12 +2346,17 @@ func RunStageC(
 			workerWG.Add(1)
 			go func() {
 				defer workerWG.Done()
-				for root := range jobQueues[p] {
-					res := p.Execute(ctx, root.Domain, client, pipeStats, rtCaches)
-					resultsCh <- stageResult{
+				for job := range jobQueues[p] {
+					res := p.Execute(job.Ctx, job.Root.Domain, client, pipeStats, rtCaches)
+					
+					select {
+					case resultsCh <- stageResult{
 						provider: p,
-						root:     root,
+						root:     job.Root,
 						result:   res,
+					}:
+					case <-ctx.Done():
+						return
 					}
 				}
 			}()
@@ -2325,12 +2364,16 @@ func RunStageC(
 	}
 
 	rootStates := make(map[string]RootState, len(roots))
-	history := make(map[string]map[*ProviderRunner]bool, len(roots))
 	scheduled := make(map[string]map[*ProviderRunner]bool, len(roots))
+	rootCtx := make(map[string]context.Context, len(roots))
+	rootCancel := make(map[string]context.CancelFunc, len(roots))
 
 	for _, root := range roots {
+		rctx, cancel := context.WithCancel(ctx)
+		rootCtx[root.Domain] = rctx
+		rootCancel[root.Domain] = cancel
+
 		rootStates[root.Domain] = RootPending
-		history[root.Domain] = make(map[*ProviderRunner]bool)
 		scheduled[root.Domain] = make(map[*ProviderRunner]bool)
 	}
 
@@ -2339,6 +2382,11 @@ func RunStageC(
 			return
 		}
 		rootStates[domain] = RootCompleted
+
+		if cancel, ok := rootCancel[domain]; ok {
+			cancel()
+		}
+
 		pipeStats.mu.Lock()
 		pipeStats.StageC.CompletedRoots++
 		pipeStats.mu.Unlock()
@@ -2349,6 +2397,11 @@ func RunStageC(
 			return
 		}
 		rootStates[domain] = RootLost
+
+		if cancel, ok := rootCancel[domain]; ok {
+			cancel()
+		}
+
 		pipeStats.mu.Lock()
 		pipeStats.StageC.LostRoots++
 		pipeStats.StageC.Lost++
@@ -2360,6 +2413,11 @@ func RunStageC(
 			return
 		}
 		rootStates[domain] = RootCanceled
+
+		if cancel, ok := rootCancel[domain]; ok {
+			cancel()
+		}
+
 		pipeStats.mu.Lock()
 		pipeStats.StageC.CanceledRoots++
 		pipeStats.mu.Unlock()
@@ -2370,6 +2428,11 @@ func RunStageC(
 			return
 		}
 		rootStates[domain] = RootDeferred
+
+		if cancel, ok := rootCancel[domain]; ok {
+			cancel()
+		}
+
 		pipeStats.mu.Lock()
 		pipeStats.StageC.DeferredRoots++
 		pipeStats.mu.Unlock()
@@ -2399,7 +2462,11 @@ func RunStageC(
 
 			scheduled[root.Domain][p] = true
 			providerUsed[p]++
-			jobQueues[p] <- root
+			jobQueues[p] <- RootJob{
+				Root:   root,
+				Ctx:    rootCtx[root.Domain],
+				Cancel: rootCancel[root.Domain],
+			}
 			return true
 		}
 		return false
@@ -2407,7 +2474,6 @@ func RunStageC(
 
 	inFlight := 0
 
-	// 7. Initial assignments
 	for _, p := range providers {
 		for _, root := range providerRoots[p] {
 			if rootStates[root.Domain] != RootPending {
@@ -2422,7 +2488,6 @@ func RunStageC(
 		}
 	}
 
-	// 7.1. Guarantee that every root gets at least one available provider
 	for _, root := range roots {
 		if rootStates[root.Domain] != RootPending {
 			continue
@@ -2522,8 +2587,6 @@ SchedulerLoop:
 					markCanceled(root.Domain)
 					continue
 				}
-			} else {
-				history[root.Domain][p] = true
 			}
 
 			switch res.Status {
@@ -2550,8 +2613,18 @@ SchedulerLoop:
 			pipeStats.StageC.Reassigned++
 			pipeStats.mu.Unlock()
 
-			jobQueues[nextP] <- root
+			jobQueues[nextP] <- RootJob{
+				Root:   root,
+				Ctx:    rootCtx[root.Domain],
+				Cancel: rootCancel[root.Domain],
+			}
 			inFlight++
+		}
+	}
+
+	for _, root := range roots {
+		if cancel, ok := rootCancel[root.Domain]; ok {
+			cancel()
 		}
 	}
 
