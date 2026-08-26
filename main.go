@@ -72,8 +72,12 @@ const (
 	PTRQueryTimeoutDefault = 2500 * time.Millisecond
 	DNSCooldownBase        = 750 * time.Millisecond
 	DNSCooldownMax         = 5 * time.Second
+	DNSMaxAttemptsA        = 6
+	DNSMaxAttemptsPTR      = 5
 	DefaultECSIPv4Prefix   = 24
-	DefaultDNSResolvers    = "8.8.8.8,8.8.4.4,9.9.9.11,149.112.112.11,9.9.9.12,149.112.112.12,208.67.222.222,77.88.8.8,208.67.220.220"
+	// Broad anycast/public DNS fallback set. Keep a mix of independent operators:
+	// Cloudflare, Google, Quad9, OpenDNS, AdGuard and DNS.WATCH.
+	DefaultDNSResolvers = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,94.140.14.140,94.140.14.141,84.200.69.80,84.200.70.40,77.88.8.8,77.88.8.1,9.9.9.10,149.112.112.10"
 )
 
 var (
@@ -597,8 +601,8 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 		order = append(order, resolver)
 	}
 
-	// Never drop coverage. If every resolver is cooling down, use the one
-	// whose cooldown expires first, then continue in round-robin order.
+	// Preserve coverage, but do not let cooled resolvers dominate the first
+	// attempts. They are appended only after all currently healthy resolvers.
 	if len(cooled) > 0 {
 		sort.SliceStable(cooled, func(i, j int) bool {
 			a := r.DNSCooldownUntil[cooled[i]]
@@ -1063,6 +1067,47 @@ func parseDNSPTRResponse(msg []byte, wantID uint16) ([]string, error) {
 	return uniqueStrings(names), nil
 }
 
+func dnsExchangeTCP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
+	query, id, err := buildDNSQuery(domain, qtype, ecsIP, ecsPrefix)
+	if err != nil {
+		return nil, err
+	}
+	addr := net.JoinHostPort(resolver, "53")
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(timeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	_ = conn.SetDeadline(deadline)
+	frame := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
+	copy(frame[2:], query)
+	if _, err := conn.Write(frame); err != nil {
+		return nil, err
+	}
+	var hdr [2]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return nil, err
+	}
+	length := int(binary.BigEndian.Uint16(hdr[:]))
+	if length < 12 || length > 65535 {
+		return nil, fmt.Errorf("invalid TCP DNS response length: %d", length)
+	}
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
+	if qtype == 12 {
+		return parseDNSPTRResponse(buf, id)
+	}
+	return parseDNSAResponse(buf, id)
+}
+
 func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
 	query, id, err := buildDNSQuery(domain, qtype, ecsIP, ecsPrefix)
 	if err != nil {
@@ -1110,6 +1155,9 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	}
 
 	ordered := rtCaches.dnsResolverOrder(resolvers)
+	if len(ordered) > DNSMaxAttemptsA {
+		ordered = ordered[:DNSMaxAttemptsA]
+	}
 	var lastErr error
 	nxCount := 0
 	emptyCount := 0
@@ -1120,9 +1168,11 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 
 		if err == nil {
 			if len(ips) > 0 {
-				stat := rtCaches.dnsResolverStat(resolver)
 				rtCaches.DNSStatsMu.Lock()
-				stat.IPv4s += len(ips)
+				stat := rtCaches.DNSResolverStats[resolver]
+				if stat != nil {
+					stat.IPv4s += len(ips)
+				}
 				rtCaches.DNSStatsMu.Unlock()
 				return ips, nil
 			}
@@ -1159,30 +1209,49 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	if len(resolvers) == 0 {
 		return nil, fmt.Errorf("DNS resolver pool is empty")
 	}
+	if timeout <= 0 {
+		timeout = PTRQueryTimeoutDefault
+	}
+
 	ordered := rtCaches.dnsResolverOrder(resolvers)
+	if len(ordered) > DNSMaxAttemptsPTR {
+		ordered = ordered[:DNSMaxAttemptsPTR]
+	}
 	var lastErr error
 	nxCount := 0
+	emptyCount := 0
 	for _, resolver := range ordered {
 		started := time.Now()
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, timeout)
+		if err != nil && (errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)) {
+			// PTR answers are small; a TCP/53 retry is useful on networks where
+			// UDP/53 is selectively filtered or packets are lost.
+			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, timeout); tcpErr == nil {
+				names, err = tcpNames, nil
+			}
+		}
 		rtCaches.recordDNSResult(resolver, err, time.Since(started))
 
 		if err == nil {
 			if len(names) > 0 {
 				return names, nil
 			}
+			emptyCount++
 			continue
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
 			nxCount++
+			// NXDOMAIN is authoritative evidence that this address has no PTR.
+			// Do not waste the remaining fallback slots on the same negative answer.
 			continue
 		}
-		lastErr = err
+		lastErr = fmt.Errorf("%s: %w", resolver, err)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 	}
-	if nxCount == len(ordered) {
+
+	if nxCount == len(ordered) || (nxCount > 0 && emptyCount+nxCount == len(ordered)) {
 		return nil, ErrDNSNXDomain
 	}
 	if lastErr == nil {
