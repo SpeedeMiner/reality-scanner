@@ -69,6 +69,9 @@ const (
 	providerMaxRetryAfter  = 60 * time.Second
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
+	PTRQueryTimeoutDefault = 2500 * time.Millisecond
+	DNSCooldownBase        = 750 * time.Millisecond
+	DNSCooldownMax         = 5 * time.Second
 	DefaultECSIPv4Prefix   = 24
 	DefaultDNSResolvers    = "8.8.8.8,8.8.4.4,9.9.9.11,149.112.112.11,9.9.9.12,149.112.112.12,208.67.222.222,77.88.8.8,208.67.220.220"
 )
@@ -533,21 +536,26 @@ type DNSResolverStat struct {
 }
 
 type RuntimeCaches struct {
-	ProvCache        *SafeCache
-	ProvGroup        *singleflight.Group
-	DNSCache         *SafeDNSCache
-	DNSGroup         *singleflight.Group
-	DNSStatsMu       sync.Mutex
-	DNSResolverStats map[string]*DNSResolverStat
+	ProvCache              *SafeCache
+	ProvGroup              *singleflight.Group
+	DNSCache               *SafeDNSCache
+	DNSGroup               *singleflight.Group
+	DNSStatsMu             sync.Mutex
+	DNSResolverStats       map[string]*DNSResolverStat
+	DNSRoundRobinCursor    int
+	DNSCooldownUntil       map[string]time.Time
+	DNSConsecutiveFailures map[string]int
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
 	return &RuntimeCaches{
-		ProvCache:        NewSafeCache(),
-		ProvGroup:        &singleflight.Group{},
-		DNSCache:         NewSafeDNSCache(),
-		DNSGroup:         &singleflight.Group{},
-		DNSResolverStats: make(map[string]*DNSResolverStat),
+		ProvCache:              NewSafeCache(),
+		ProvGroup:              &singleflight.Group{},
+		DNSCache:               NewSafeDNSCache(),
+		DNSGroup:               &singleflight.Group{},
+		DNSResolverStats:       make(map[string]*DNSResolverStat),
+		DNSCooldownUntil:       make(map[string]time.Time),
+		DNSConsecutiveFailures: make(map[string]int),
 	}
 }
 
@@ -562,43 +570,102 @@ func (r *RuntimeCaches) dnsResolverStat(resolver string) *DNSResolverStat {
 	return stat
 }
 
-func (r *RuntimeCaches) adaptiveDNSOrder(resolvers []string) []string {
-	order := append([]string(nil), resolvers...)
-	r.DNSStatsMu.Lock()
-	type scored struct {
-		resolver string
-		score    float64
+func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
+	if len(resolvers) == 0 {
+		return nil
 	}
-	scoredList := make([]scored, 0, len(order))
-	for i, resolver := range order {
-		stat := r.DNSResolverStats[resolver]
-		if stat == nil || stat.Attempts < 4 {
-			// Keep newer/unprobed resolvers in the fallback pool, but after measured healthy ones.
-			scoredList = append(scoredList, scored{resolver: resolver, score: 1000 + float64(i)})
+
+	now := time.Now()
+	r.DNSStatsMu.Lock()
+	defer r.DNSStatsMu.Unlock()
+
+	start := r.DNSRoundRobinCursor % len(resolvers)
+	if start < 0 {
+		start = 0
+	}
+	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
+
+	order := make([]string, 0, len(resolvers))
+	cooled := make([]string, 0, len(resolvers))
+	for i := 0; i < len(resolvers); i++ {
+		resolver := resolvers[(start+i)%len(resolvers)]
+		until := r.DNSCooldownUntil[resolver]
+		if !until.IsZero() && now.Before(until) {
+			cooled = append(cooled, resolver)
 			continue
 		}
-		failRate := float64(stat.Failures) / float64(stat.Attempts)
-		timeoutRate := float64(stat.Timeouts) / float64(stat.Attempts)
-		answerRate := float64(stat.Answers) / float64(stat.Attempts)
-		rttPenalty := 0.0
-		if stat.RTTMs > 0 {
-			rttPenalty = stat.RTTMs / 25.0
-		}
-		// Lower is better. Preserve availability: this only reorders; it never disables a resolver.
-		score := failRate*500 + timeoutRate*400 - answerRate*150 + rttPenalty
-		scoredList = append(scoredList, scored{resolver: resolver, score: score})
+		order = append(order, resolver)
 	}
-	r.DNSStatsMu.Unlock()
-	sort.SliceStable(scoredList, func(i, j int) bool {
-		if scoredList[i].score != scoredList[j].score {
-			return scoredList[i].score < scoredList[j].score
-		}
-		return scoredList[i].resolver < scoredList[j].resolver
-	})
-	for i := range scoredList {
-		order[i] = scoredList[i].resolver
+
+	// Never drop coverage. If every resolver is cooling down, use the one
+	// whose cooldown expires first, then continue in round-robin order.
+	if len(cooled) > 0 {
+		sort.SliceStable(cooled, func(i, j int) bool {
+			a := r.DNSCooldownUntil[cooled[i]]
+			b := r.DNSCooldownUntil[cooled[j]]
+			return a.Before(b)
+		})
+		order = append(order, cooled...)
 	}
 	return order
+}
+
+func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time.Duration) {
+	r.DNSStatsMu.Lock()
+	defer r.DNSStatsMu.Unlock()
+
+	stat, ok := r.DNSResolverStats[resolver]
+	if !ok {
+		stat = &DNSResolverStat{}
+		r.DNSResolverStats[resolver] = stat
+	}
+
+	stat.Attempts++
+	elapsedMs := float64(elapsed.Microseconds()) / 1000.0
+	if stat.RTTMs == 0 {
+		stat.RTTMs = elapsedMs
+	} else {
+		stat.RTTMs = stat.RTTMs*0.8 + elapsedMs*0.2
+	}
+
+	if err == nil {
+		stat.Answers++
+		r.DNSConsecutiveFailures[resolver] = 0
+		delete(r.DNSCooldownUntil, resolver)
+		return
+	}
+	if errors.Is(err, ErrDNSNXDomain) {
+		stat.NXDomain++
+		// NXDOMAIN is a valid DNS response, not a transport/provider failure.
+		return
+	}
+
+	stat.Failures++
+	isTimeout := errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)
+	if isTimeout {
+		stat.Timeouts++
+	}
+
+	n := r.DNSConsecutiveFailures[resolver] + 1
+	r.DNSConsecutiveFailures[resolver] = n
+
+	cooldown := DNSCooldownBase
+	for i := 1; i < n; i++ {
+		cooldown *= 2
+		if cooldown >= DNSCooldownMax {
+			cooldown = DNSCooldownMax
+			break
+		}
+	}
+	if !isTimeout {
+		if cooldown > 2*time.Second {
+			cooldown = 2 * time.Second
+		}
+	}
+	if cooldown > DNSCooldownMax {
+		cooldown = DNSCooldownMax
+	}
+	r.DNSCooldownUntil[resolver] = time.Now().Add(cooldown)
 }
 
 type DNSCacheEntry struct {
@@ -1042,46 +1109,41 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		timeout = DNSQueryTimeoutDefault
 	}
 
+	ordered := rtCaches.dnsResolverOrder(resolvers)
 	var lastErr error
-	ordered := rtCaches.adaptiveDNSOrder(resolvers)
+	nxCount := 0
+	emptyCount := 0
 	for _, resolver := range ordered {
-		stat := rtCaches.dnsResolverStat(resolver)
-		rtCaches.DNSStatsMu.Lock()
-		stat.Attempts++
-		rtCaches.DNSStatsMu.Unlock()
-
 		started := time.Now()
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, timeout)
-		elapsedMs := float64(time.Since(started).Microseconds()) / 1000.0
-		rtCaches.DNSStatsMu.Lock()
-		if stat.RTTMs == 0 {
-			stat.RTTMs = elapsedMs
-		} else {
-			stat.RTTMs = stat.RTTMs*0.8 + elapsedMs*0.2
-		}
-		if err == nil {
-			stat.Answers++
-			stat.IPv4s += len(ips)
-		} else if errors.Is(err, ErrDNSNXDomain) {
-			stat.NXDomain++
-		} else {
-			stat.Failures++
-			if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-				stat.Timeouts++
-			}
-		}
-		rtCaches.DNSStatsMu.Unlock()
+		rtCaches.recordDNSResult(resolver, err, time.Since(started))
 
 		if err == nil {
-			return ips, nil
+			if len(ips) > 0 {
+				stat := rtCaches.dnsResolverStat(resolver)
+				rtCaches.DNSStatsMu.Lock()
+				stat.IPv4s += len(ips)
+				rtCaches.DNSStatsMu.Unlock()
+				return ips, nil
+			}
+			emptyCount++
+			continue
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
-			return nil, ErrDNSNXDomain
+			nxCount++
+			continue
 		}
 		lastErr = fmt.Errorf("%s: %w", resolver, err)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+	}
+
+	if nxCount == len(ordered) {
+		return nil, ErrDNSNXDomain
+	}
+	if emptyCount > 0 && emptyCount+nxCount == len(ordered) {
+		return []string{}, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all DNS resolvers failed")
@@ -1097,47 +1159,25 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	if len(resolvers) == 0 {
 		return nil, fmt.Errorf("DNS resolver pool is empty")
 	}
-	ordered := rtCaches.adaptiveDNSOrder(resolvers)
+	ordered := rtCaches.dnsResolverOrder(resolvers)
 	var lastErr error
 	nxCount := 0
 	for _, resolver := range ordered {
-		stat := rtCaches.dnsResolverStat(resolver)
 		started := time.Now()
-		rtCaches.DNSStatsMu.Lock()
-		stat.Attempts++
-		rtCaches.DNSStatsMu.Unlock()
-
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, timeout)
-		elapsedMs := float64(time.Since(started).Microseconds()) / 1000.0
-		rtCaches.DNSStatsMu.Lock()
-		if stat.RTTMs == 0 {
-			stat.RTTMs = elapsedMs
-		} else {
-			stat.RTTMs = stat.RTTMs*0.8 + elapsedMs*0.2
-		}
-		switch {
-		case err == nil:
-			stat.Answers++
-		case errors.Is(err, ErrDNSNXDomain):
-			stat.NXDomain++
-		default:
-			stat.Failures++
-			if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-				stat.Timeouts++
-			}
-		}
-		rtCaches.DNSStatsMu.Unlock()
+		rtCaches.recordDNSResult(resolver, err, time.Since(started))
 
-		if err == nil && len(names) > 0 {
-			return names, nil
+		if err == nil {
+			if len(names) > 0 {
+				return names, nil
+			}
+			continue
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
 			nxCount++
 			continue
 		}
-		if err != nil {
-			lastErr = err
-		}
+		lastErr = err
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -1146,7 +1186,7 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		return nil, ErrDNSNXDomain
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("all DNS resolvers failed")
+		lastErr = fmt.Errorf("all DNS resolvers returned no PTR")
 	}
 	return nil, lastErr
 }
@@ -2120,15 +2160,20 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 		if len(lastSort) > 0 {
 			parts := make([]string, 0, len(lastSort))
 			for _, raw := range lastSort {
-				var v interface{}
-				if err := json.Unmarshal(raw, &v); err != nil {
-					return domains, fmt.Errorf("invalid urlscan sort value: %w", err)
+				raw = bytes.TrimSpace(raw)
+				if len(raw) == 0 {
+					return domains, fmt.Errorf("invalid empty urlscan sort value")
 				}
-				switch x := v.(type) {
-				case string:
-					parts = append(parts, x)
-				default:
-					parts = append(parts, fmt.Sprint(x))
+				if raw[0] == '"' {
+					var v string
+					if err := json.Unmarshal(raw, &v); err != nil {
+						return domains, fmt.Errorf("invalid urlscan string sort value: %w", err)
+					}
+					parts = append(parts, v)
+				} else {
+					// Preserve numeric precision exactly; converting to float64 turns
+					// the 13-digit URLScan timestamp into scientific notation and causes 400.
+					parts = append(parts, string(raw))
 				}
 			}
 			newSearchAfter := strings.Join(parts, ",")
@@ -3778,7 +3823,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 							if !ok {
 								return nil
 							}
-							names, err := resolvePTRRaw(gCtxA, ip, cfg.DNSResolvers, time.Duration(cfg.DNSQueryTimeoutMs)*time.Millisecond, rtCaches)
+							names, err := resolvePTRRaw(gCtxA, ip, cfg.DNSResolvers, PTRQueryTimeoutDefault, rtCaches)
 							if err == nil && len(names) > 0 {
 								for _, n := range names {
 									ds.AddPairSource(ip, n, SourcePTR)
