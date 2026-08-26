@@ -69,11 +69,11 @@ const (
 	providerMaxRetryAfter  = 60 * time.Second
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
-	PTRQueryTimeoutDefault = 2500 * time.Millisecond
+	PTRQueryTimeoutDefault = 1000 * time.Millisecond
 	DNSCooldownBase        = 500 * time.Millisecond
 	DNSCooldownMax         = 4 * time.Second
 	DNSMaxAttemptsA        = 3
-	DNSMaxAttemptsPTR      = 3
+	DNSMaxAttemptsPTR      = 2
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	// Broad anycast/public DNS fallback set. Keep a mix of independent operators:
@@ -413,6 +413,9 @@ type PipelineStats struct {
 	IPSampled             int
 	IPWithPTR             int
 	PTRFound              int
+	PTRSystemFallbacks    int
+	PTRDoHFallbacks       int
+	PTRNegativeResponses  int
 	DNSQueries            int
 	DNSSuccess            int
 	DNSFailed             int
@@ -465,6 +468,7 @@ type PipelineStats struct {
 
 	// Final
 	ScoreRejected      int
+	LowScoreCandidates int
 	CandidatesAccepted int
 
 	ASNFiltered     int
@@ -761,6 +765,16 @@ func (c *SafeCache) Put(key string, vals []string, status StatResult, ttl time.D
 		Expires: time.Now().Add(ttl),
 	}
 }
+
+// ================= V14 REMEDIATION PLAN =================
+// 1) Restore PTR compatibility: system resolver first, then raw UDP/TCP, then DoH.
+// 2) Never terminate PTR on the first NXDOMAIN; compare multiple independent paths.
+// 3) Keep raw UDP A/ECS health-aware round-robin, with bounded attempts.
+// 4) Treat Reality score as ranking only: valid H2 + valid HTTP status is never
+//    dropped solely because penalties make the score negative.
+// 5) Emit explicit PTR fallback/negative telemetry and distinguish low-score
+//    candidates from structurally rejected candidates.
+// ================= END V14 REMEDIATION PLAN =================
 
 // ================= RAW UDP DNS + EDNS CLIENT SUBNET =================
 
@@ -1209,7 +1223,34 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	if err != nil {
 		return nil, err
 	}
+
+	// The old Linux scanner got PTRs through a mature recursive resolver pool.
+	// In the raw-UDP build, UDP/53 from a VPS can be selectively filtered while
+	// the local/system resolver still has working access to the reverse zone.
+	// Try the system resolver first: it is the fastest compatibility path and
+	// preserves the old scanner's PTR behavior without giving up raw DNS.
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+	names, lookupErr := net.DefaultResolver.LookupAddr(lookupCtx, ip)
+	cancel()
+	if lookupErr == nil && len(names) > 0 {
+		clean := make([]string, 0, len(names))
+		for _, n := range names {
+			if d := CleanDomain(strings.TrimSuffix(strings.TrimSpace(n), ".")); d != "" {
+				clean = append(clean, d)
+			}
+		}
+		if len(clean) > 0 {
+			rtCaches.DNSStatsMu.Lock()
+			rtCaches.PTRSystemFallbacks++
+			rtCaches.DNSStatsMu.Unlock()
+			return uniqueStrings(clean), nil
+		}
+	}
+
 	if len(resolvers) == 0 {
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
 		return nil, fmt.Errorf("DNS resolver pool is empty")
 	}
 	if timeout <= 0 {
@@ -1221,12 +1262,12 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		ordered = ordered[:DNSMaxAttemptsPTR]
 	}
 	var lastErr error
+	nxCount := 0
+	emptyCount := 0
 	for _, resolver := range ordered {
 		started := time.Now()
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, timeout)
 		if err != nil && (errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)) {
-			// A TCP/53 retry is only used for this same resolver after UDP timeout;
-			// this avoids multiplying every successful PTR request into two packets.
 			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, timeout); tcpErr == nil {
 				names, err = tcpNames, nil
 			}
@@ -1237,13 +1278,18 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 			if len(names) > 0 {
 				return names, nil
 			}
-			// Empty NOERROR is not enough to conclude there is no PTR; allow the
-			// remaining healthy resolver slots and then use DoH once.
+			emptyCount++
 			continue
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
-			// NXDOMAIN is a valid negative response for the reverse name.
-			return nil, ErrDNSNXDomain
+			nxCount++
+			rtCaches.DNSStatsMu.Lock()
+			rtCaches.PTRNegativeResponses++
+			rtCaches.DNSStatsMu.Unlock()
+			// NXDOMAIN from one recursive resolver is not sufficient here: the old
+			// scanner used a much broader resolver population. Keep checking the
+			// other healthy fallback resolvers before declaring a negative result.
+			continue
 		}
 		lastErr = fmt.Errorf("%s: %w", resolver, err)
 		if ctx.Err() != nil {
@@ -1252,11 +1298,17 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	}
 
 	if dohNames, dohErr := resolvePTRDoH(ctx, rev, PTRDoHTimeout); dohErr == nil && len(dohNames) > 0 {
+		rtCaches.DNSStatsMu.Lock()
+		rtCaches.PTRDoHFallbacks++
+		rtCaches.DNSStatsMu.Unlock()
 		return dohNames, nil
 	} else if dohErr != nil {
 		lastErr = dohErr
 	}
 
+	if nxCount == len(ordered) || (nxCount > 0 && emptyCount+nxCount == len(ordered)) {
+		return nil, ErrDNSNXDomain
+	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all DNS resolvers returned no PTR")
 	}
@@ -3024,6 +3076,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	pH2Head := s.H2HeadersOK
 	pStatus := s.H2StatusOK
 	pFinal := s.CandidatesAccepted
+	pLowScore := s.LowScoreCandidates
 
 	localStats := make(map[string]ProviderStats)
 	for k, v := range s.ProviderStats {
@@ -3042,7 +3095,15 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Println("                                   ТЕЛЕМЕТРИЯ СКАНИРОВАНИЯ (PIPELINE STATS)")
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("[*] IP отобрано для пула:      %d\n", pSampled)
-	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n\n", pWithPTR)
+	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n", pWithPTR)
+	rtCaches.DNSStatsMu.Lock()
+	ptrSystem := rtCaches.PTRSystemFallbacks
+	ptrDoHFallbacks := rtCaches.PTRDoHFallbacks
+	ptrNegative := rtCaches.PTRNegativeResponses
+	rtCaches.DNSStatsMu.Unlock()
+	fmt.Printf("[*] PTR system fallback:         %d\n", ptrSystem)
+	fmt.Printf("[*] PTR DoH fallback:            %d\n", ptrDoHFallbacks)
+	fmt.Printf("[*] PTR NXDOMAIN responses:      %d\n\n", ptrNegative)
 
 	rtCaches.DNSStatsMu.Lock()
 	ptrDoH := 0
@@ -3129,7 +3190,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 		pH2, s.H2TimeoutNoFrames, s.H2ConnectionReset, s.H2BrokenPipe, s.H2BadRequest, s.H2GoAway, s.H2EOF, s.H2TLSAlerts, s.H2OtherErrs)
 	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", pH2Head, s.H2Timeouts, s.H2HPACKErrors)
 	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", pStatus, s.H2InvalidStatus)
-	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d)\n", pFinal, s.ScoreRejected)
+	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d, Ниже нуля=%d)\n", pFinal, s.ScoreRejected, pLowScore)
 	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
 	fmt.Printf("    * Уникальных IP-кластеров:    %d\n", clustered)
 
@@ -3944,7 +4005,15 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 	cand.DomainPenalty = scorePenalty
 	cand.Score = rs.Total - scorePenalty
 
-	return cand.Score >= 0
+	// A confirmed H2 response with a valid HTTP status is already a working
+	// candidate. Score is for ranking only; it must never silently discard a
+	// technically valid target. Low scores remain visible in telemetry.
+	if cand.Score < 0 && pipeStats != nil {
+		pipeStats.mu.Lock()
+		pipeStats.LowScoreCandidates++
+		pipeStats.mu.Unlock()
+	}
+	return true
 }
 
 func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRanges []ipRange) []Candidate {
@@ -4397,6 +4466,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 				// 6. Enrichment + score
 				if !validateAndEnrich(cand, cfg, pipeStats) {
+					// validateAndEnrich currently rejects only structurally invalid
+					// H2 candidates, which are already filtered above. Keep this guard
+					// for future hard validation without using score as a gate.
 					pipeStats.mu.Lock()
 					pipeStats.ScoreRejected++
 					pipeStats.mu.Unlock()
