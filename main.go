@@ -554,6 +554,11 @@ type RuntimeCaches struct {
 	DNSRoundRobinCursor    int
 	DNSCooldownUntil       map[string]time.Time
 	DNSConsecutiveFailures map[string]int
+
+	// PTR fallback telemetry. Access under DNSStatsMu.
+	PTRSystemFallbacks   int
+	PTRDoHFallbacks      int
+	PTRNegativeResponses int
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
