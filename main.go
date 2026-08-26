@@ -20,7 +20,6 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -642,12 +641,11 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	type candidate struct {
-		resolver string
-		weight   int
-		until    time.Time
-	}
-	available := make([]candidate, 0, len(resolvers))
+	// True round-robin is the primary scheduling rule. Health affects only
+	// whether a resolver is eligible, not whether one "best" resolver receives
+	// the entire workload. This prevents a single healthy resolver from becoming
+	// a hotspot while the rest of the pool is gradually quarantined.
+	order := make([]string, 0, len(resolvers))
 	var earliest string
 	var earliestUntil time.Time
 
@@ -664,47 +662,13 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 			}
 			continue
 		}
-
-		weight := 4
-		if st := r.DNSResolverStats[resolver]; st != nil && st.Attempts >= 3 {
-			timeoutRate := float64(st.Timeouts) / float64(st.Attempts)
-			failureRate := float64(st.Failures) / float64(st.Attempts)
-			switch {
-			case timeoutRate >= 0.50 || failureRate >= 0.50:
-				weight = 1
-			case timeoutRate >= 0.25 || failureRate >= 0.25:
-				weight = 2
-			case timeoutRate >= 0.10 || failureRate >= 0.10:
-				weight = 3
-			}
-			if st.RTTMs >= 500 {
-				if weight > 1 {
-					weight--
-				}
-			}
-		}
-		available = append(available, candidate{resolver: resolver, weight: weight, until: until})
+		order = append(order, resolver)
 	}
 
-	if len(available) == 0 {
-		// Only temporarily cooled resolvers may be reused. A resolver disabled
-		// for this run is never resurrected by the fallback path.
-		if earliest != "" && !r.DNSDisabledForRun[earliest] {
-			return []string{earliest}
-		}
-		return nil
-	}
-
-	// Health-aware round-robin: preserve the rotating starting point while
-	// preferring healthier/faster resolvers. Each resolver appears at most once
-	// in a single lookup attempt set, so a bad resolver cannot consume the
-	// bounded retry budget by being duplicated.
-	sort.SliceStable(available, func(i, j int) bool {
-		return available[i].weight > available[j].weight
-	})
-	order := make([]string, 0, len(available))
-	for _, c := range available {
-		order = append(order, c.resolver)
+	if len(order) == 0 && earliest != "" && !r.DNSDisabledForRun[earliest] {
+		// All eligible resolvers are temporarily cooling. Reuse only the one
+		// whose cooldown expires first; run-disabled resolvers remain excluded.
+		return []string{earliest}
 	}
 	return order
 }
@@ -1040,43 +1004,51 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 	}
 	results := make(chan result, len(resolvers))
 	var wg sync.WaitGroup
+
 	for _, resolver := range resolvers {
 		resolver := resolver
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Warm-up validates both a positive answer and a negative answer.
-			// A resolver that cannot reliably answer both is removed from this run.
-			healthy := true
 
+			// Warm-up answers one real A query. A resolver is considered healthy
+			// when it can complete a normal DNS exchange within the transport
+			// budget. We deliberately DO NOT require a particular NXDOMAIN policy:
+			// public resolvers legitimately differ in handling reserved/invalid
+			// names, and that must not quarantine an otherwise healthy transport.
+			healthy := false
 			qctx, cancel := context.WithTimeout(ctx, DNSWarmupTimeout)
 			started := time.Now()
 			ips, err := dnsExchangeUDP(qctx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
 			if errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-				tcpIPs, tcpErr := dnsExchangeTCP(qctx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
-				if tcpErr == nil {
+				tcpCtx, tcpCancel := context.WithTimeout(ctx, DNSWarmupTimeout)
+				if tcpIPs, tcpErr := dnsExchangeTCP(tcpCtx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout); tcpErr == nil {
 					ips, err = tcpIPs, nil
 				} else {
 					err = tcpErr
 				}
+				tcpCancel()
 			}
 			rtCaches.recordDNSResult(resolver, err, time.Since(started), len(ips))
 			cancel()
-			if err != nil || len(ips) == 0 {
-				healthy = false
-			}
 
-			qctx2, cancel2 := context.WithTimeout(ctx, DNSWarmupTimeout)
-			started = time.Now()
-			_, negErr := dnsExchangeUDP(qctx2, resolver, "this-name-should-not-exist.invalid", mdns.TypeA, "", 0, DNSWarmupTimeout)
-			if errors.Is(negErr, ErrDNSTruncated) || errors.Is(negErr, context.DeadlineExceeded) || os.IsTimeout(negErr) {
-				_, tcpErr := dnsExchangeTCP(qctx2, resolver, "this-name-should-not-exist.invalid", mdns.TypeA, "", 0, DNSWarmupTimeout)
-				negErr = tcpErr
-			}
-			rtCaches.recordDNSResult(resolver, negErr, time.Since(started), 0)
-			cancel2()
-			if !errors.Is(negErr, ErrDNSNXDomain) {
-				healthy = false
+			if err == nil && len(ips) > 0 {
+				healthy = true
+			} else {
+				// One bounded secondary positive query reduces false negatives caused
+				// by an ECS-specific answer path for a single name, without adding a
+				// blocking delay to Stage C.
+				qctx2, cancel2 := context.WithTimeout(ctx, DNSWarmupTimeout)
+				started = time.Now()
+				ips2, err2 := dnsExchangeUDP(qctx2, resolver, "www.cloudflare.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
+				if errors.Is(err2, ErrDNSTruncated) || errors.Is(err2, context.DeadlineExceeded) || os.IsTimeout(err2) {
+					if tcpIPs, tcpErr := dnsExchangeTCP(qctx2, resolver, "www.cloudflare.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout); tcpErr == nil {
+						ips2, err2 = tcpIPs, nil
+					}
+				}
+				rtCaches.recordDNSResult(resolver, err2, time.Since(started), len(ips2))
+				cancel2()
+				healthy = err2 == nil && len(ips2) > 0
 			}
 
 			if !healthy {
