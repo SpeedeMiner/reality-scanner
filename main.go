@@ -64,23 +64,20 @@ const (
 	providerBackoffSecond  = 3 * time.Second
 	providerMaxRetryAfter  = 60 * time.Second
 
-	DNSQueryTimeoutDefault  = 1500 * time.Millisecond
-	PTRQueryTimeoutDefault  = 1000 * time.Millisecond
-	DNSCooldownBase         = 2 * time.Second
-	DNSCooldownMax          = 30 * time.Second
-	DNSMaxAttemptsA         = 5
-	DNSMaxAttemptsPTR       = 8
-	DNSWarmupTimeout        = 900 * time.Millisecond
-	DNSAdaptiveTimeoutMin   = 700 * time.Millisecond
-	DNSAdaptiveTimeoutMax   = 1500 * time.Millisecond
-	DNSHealthSampleMin      = 8
-	DNSHealthBadTimeoutRate = 0.65
-	DNSHealthBadCooldown    = 15 * time.Second
-	PTRDoHTimeout           = 1200 * time.Millisecond
-	DefaultECSIPv4Prefix    = 24
-	MaxPairEvidenceEntries  = LimitValidPairs * 8
-	MaxH2BufferedBytes      = 9 + 16384
-	MaxH2HeaderBlockBytes   = 64 * 1024
+	DNSQueryTimeoutDefault = 1500 * time.Millisecond
+	PTRQueryTimeoutDefault = 1000 * time.Millisecond
+	DNSCooldownBase        = 2 * time.Second
+	DNSCooldownMax         = 30 * time.Second
+	DNSMaxAttemptsA        = 5
+	DNSMaxAttemptsPTR      = 8
+	DNSWarmupTimeout       = 900 * time.Millisecond
+	DNSAdaptiveTimeoutMin  = 700 * time.Millisecond
+	DNSAdaptiveTimeoutMax  = 1500 * time.Millisecond
+	PTRDoHTimeout          = 1200 * time.Millisecond
+	DefaultECSIPv4Prefix   = 24
+	MaxPairEvidenceEntries = LimitValidPairs * 8
+	MaxH2BufferedBytes     = 9 + 16384
+	MaxH2HeaderBlockBytes  = 64 * 1024
 	// Broad public DNS set: Cloudflare, Google, Quad9, OpenDNS, AdGuard, DNS.WATCH and ControlD (unfiltered).
 	DefaultDNSResolvers = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,94.140.14.140,94.140.14.141,84.200.69.80,84.200.70.40,77.88.8.8,77.88.8.1,9.9.9.10,149.112.112.10,9.9.9.11,149.112.112.11,185.222.222.222,185.184.222.222,156.154.70.1,156.154.71.1,185.228.168.9,185.228.169.9,223.5.5.5,223.6.6.6"
 )
@@ -845,7 +842,8 @@ func (c *SafeCache) Put(key string, vals []string, status StatResult, ttl time.D
 // 2) Keep health-aware round-robin for raw DNS, but rank resolvers by observed failure/RTT.
 // 3) For A/ECS: UDP -> TCP on timeout/truncation -> DoH with ECS -> system resolver.
 // 4) Require two independent NXDOMAIN responses before hard-negative caching.
-// 5) Reduce DNS burst pressure from 128 to 64 workers to avoid public-resolver timeout storms.
+// 5) Keep DNS concurrency bounded to 32 workers to avoid VPS UDP burst loss.
+//    Resolver selection remains round-robin; health only gates eligibility.
 // 6) Fix URLScan pagination precision by preserving JSON numeric sort values verbatim.
 // 7) Use the current Anubis DB API path; isolate quota-limited VT/URLScan from hot provider scheduling.
 // 8) Keep score as ranking only; valid H2 + HTTP candidates remain eligible.
@@ -1064,9 +1062,13 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 			}
 
 			if !healthy {
+				// Warm-up failure is temporary evidence only. Do not permanently
+				// disable a resolver before the scan has started; transport failures
+				// are handled by recordDNSResult with normal cooldown/backoff.
 				rtCaches.DNSStatsMu.Lock()
-				rtCaches.DNSDisabledForRun[resolver] = true
-				delete(rtCaches.DNSCooldownUntil, resolver)
+				if !rtCaches.DNSDisabledForRun[resolver] {
+					rtCaches.DNSCooldownUntil[resolver] = time.Now().Add(DNSCooldownBase)
+				}
 				rtCaches.DNSStatsMu.Unlock()
 			}
 			results <- result{resolver: resolver, healthy: healthy}
@@ -5201,7 +5203,7 @@ func main() {
 
 	cfg := Config{
 		Workers:           30,
-		DNSWorkers:        64,
+		DNSWorkers:        32,
 		MaxIPs:            -1, // full announced ASN scan, capped by LimitMaxIPs
 		IPOSINTLimit:      256,
 		DomainOSINTLimit:  100,
