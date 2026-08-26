@@ -3199,6 +3199,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", pH2Head, s.H2Timeouts, s.H2HPACKErrors)
 	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", pStatus, s.H2InvalidStatus)
 	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d, Ниже нуля=%d)\n", pFinal, s.ScoreRejected, pLowScore)
+	fmt.Printf("    8. После кластеризации по IP:  %d (оставлен лучший SNI на IP)\n", clustered)
 	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
 	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
 	fmt.Printf("    * Уникальных IP-кластеров:    %d (дедупликация финального списка по IP)\n", clustered)
@@ -4104,6 +4105,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 								}
 								pipeStats.mu.Lock()
 								pipeStats.IPWithPTR++
+								pipeStats.PTRFound++
 								pipeStats.mu.Unlock()
 							}
 						}
