@@ -1587,6 +1587,7 @@ type ProviderRunner struct {
 	nextAllowed     time.Time
 	cbFailures      int
 	cbUntil         time.Time
+	everResponded   bool // provider produced a valid response (success/no-data/partial) in this run
 	disabled        bool
 	disableReason   string
 	globalNamesUsed int
@@ -1807,6 +1808,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				r.mu.Lock()
 				r.cbFailures = 0
 				r.cbUntil = time.Time{}
+				r.everResponded = true
 				r.mu.Unlock()
 				pipeStats.recordProviderStat(statName, r.Category(), StatNoData, false, 0, 0, 0, 0, 0, httpStatus, err.Error(), 0)
 				rtCaches.ProvCache.Put(cacheKey, []string{}, StatNoData, 2*time.Minute)
@@ -1821,15 +1823,15 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 					r.cbUntil = time.Time{}
 					r.mu.Unlock()
 				} else {
-					// Transient transport/server failures are retried only a few times.
-					// Once the provider has failed repeatedly in this run, disable it
-					// for the remainder of the run instead of keeping a long cooldown
-					// window that only creates Deferred roots.
+					// A provider that has never produced any response in this run is
+					// effectively dead for the current pass: do not keep waiting on it.
+					// Providers that have already answered at least once stay eligible
+					// and only accumulate consecutive-failure telemetry.
 					r.mu.Lock()
 					r.cbFailures++
-					if r.cbFailures >= providerCBThreshold {
+					if !r.everResponded && r.cbFailures >= providerCBThreshold {
 						r.disabled = true
-						r.disableReason = fmt.Sprintf("disabled for run after %d transient failures: %v", r.cbFailures, err)
+						r.disableReason = fmt.Sprintf("disabled for run after %d transient failures with no response: %v", r.cbFailures, err)
 						r.cbUntil = time.Time{}
 					}
 					r.mu.Unlock()
@@ -1841,6 +1843,9 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			}
 
 			if len(cleanRes) > 0 {
+				r.mu.Lock()
+				r.everResponded = true
+				r.mu.Unlock()
 				pipeStats.recordProviderStat(statName, r.Category(), StatPartial, isTimeout, rawCount, uniqueCount, invalidCount, limitedCount, acceptedCount, httpStatus, err.Error(), 0)
 				rtCaches.ProvCache.Put(cacheKey, cleanRes, StatPartial, 2*time.Minute)
 				return ExecResult{cleanRes, StatPartial}, nil
@@ -1854,6 +1859,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		if !r.disabled {
 			r.cbFailures = 0
 			r.cbUntil = time.Time{}
+			r.everResponded = true
 		}
 		r.mu.Unlock()
 
@@ -4965,9 +4971,9 @@ func main() {
 	}
 
 	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
-	fmt.Printf("%-32.32s | %-15.15s | %-6s | %-16s | %-30s | %4s\n",
-		"Цель (SNI)", "IP адрес", "STATUS", "TLS curve", "certificate", "RTT")
-	fmt.Println(strings.Repeat("-", 116))
+	fmt.Printf("%-32.32s | %-15.15s | %-6s | %-30s | %4s\n",
+		"Цель (SNI)", "IP адрес", "STATUS", "certificate", "RTT")
+	fmt.Println(strings.Repeat("-", 101))
 
 	for _, r := range results {
 		cert := r.CertSubject
@@ -4983,8 +4989,8 @@ func main() {
 		}
 		certCol := fmt.Sprintf("%s [%s]", limitStr(cert, 21), certState)
 		rtt := r.Timings.TCP + r.Timings.TLS + r.Timings.H2Headers
-		fmt.Printf("%-32.32s | %-15.15s | %-6d | %-16.16s | %-30.30s | %4dms\n",
-			r.SNI, r.IP, r.HTTPStatus, r.TLSCurve, certCol, rtt.Milliseconds())
+		fmt.Printf("%-32.32s | %-15.15s | %-6d | %-30.30s | %4dms\n",
+			r.SNI, r.IP, r.HTTPStatus, certCol, rtt.Milliseconds())
 	}
 
 	best := results[0]
@@ -4994,8 +5000,8 @@ func main() {
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
 	fmt.Printf("Подробности лучшего кандидата:\n")
-	fmt.Printf("STATUS: %d | TLS: %.0f/20 | curve: %s | X25519: %t | certificate: %s | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
-		best.HTTPStatus, best.RealityScore.TLSQuality, best.TLSCurve, best.X25519, best.CertSubject, best.CertSNIMatch, best.RealityFeasible,
+	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate: %s | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
+		best.HTTPStatus, best.RealityScore.TLSQuality, best.CertSubject, best.CertSNIMatch, best.RealityFeasible,
 		(best.Timings.TCP + best.Timings.TLS + best.Timings.H2Headers).Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
 	fmt.Printf("RANK: RealityFeasible=%t | BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n", best.RealityFeasible,
