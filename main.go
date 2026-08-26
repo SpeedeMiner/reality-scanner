@@ -73,6 +73,9 @@ const (
 	DNSWarmupTimeout       = 900 * time.Millisecond
 	DNSAdaptiveTimeoutMin  = 700 * time.Millisecond
 	DNSAdaptiveTimeoutMax  = 1500 * time.Millisecond
+	DNSHealthWindowSize    = 32
+	DNSHealthWindowMin     = 24
+	DNSHealthWindowBadRate = 0.90
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	MaxPairEvidenceEntries = LimitValidPairs * 8
@@ -578,6 +581,13 @@ type DNSResolverStat struct {
 	RTTMs    float64
 }
 
+type DNSHealthWindow struct {
+	Samples  [DNSHealthWindowSize]bool
+	Head     int
+	Count    int
+	Failures int
+}
+
 type RuntimeCaches struct {
 	ProvCache              *SafeCache
 	ProvGroup              *singleflight.Group
@@ -589,6 +599,11 @@ type RuntimeCaches struct {
 	DNSCooldownUntil       map[string]time.Time
 	DNSConsecutiveFailures map[string]int
 	DNSDisabledForRun      map[string]bool
+	DNSHealthWindows       map[string]*DNSHealthWindow
+
+	// RunCtx is the pipeline-wide context used as the shared singleflight leader context.
+	// It prevents one root cancellation from aborting a request shared by other roots.
+	RunCtx context.Context
 
 	// PTR fallback telemetry. Access under DNSStatsMu.
 	PTRSystemFallbacks     int
@@ -611,6 +626,7 @@ func NewRuntimeCaches() *RuntimeCaches {
 		DNSCooldownUntil:       make(map[string]time.Time),
 		DNSConsecutiveFailures: make(map[string]int),
 		DNSDisabledForRun:      make(map[string]bool),
+		DNSHealthWindows:       make(map[string]*DNSHealthWindow),
 	}
 }
 
@@ -671,6 +687,31 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	return order
 }
 
+func (r *RuntimeCaches) recordDNSHealthLocked(resolver string, transportFailure bool) bool {
+	hw := r.DNSHealthWindows[resolver]
+	if hw == nil {
+		hw = &DNSHealthWindow{}
+		r.DNSHealthWindows[resolver] = hw
+	}
+	if hw.Count == DNSHealthWindowSize {
+		if hw.Samples[hw.Head] {
+			hw.Failures--
+		}
+	} else {
+		hw.Count++
+	}
+	hw.Samples[hw.Head] = transportFailure
+	if transportFailure {
+		hw.Failures++
+	}
+	hw.Head = (hw.Head + 1) % DNSHealthWindowSize
+	if hw.Count >= DNSHealthWindowMin {
+		rate := float64(hw.Failures) / float64(hw.Count)
+		return rate >= DNSHealthWindowBadRate
+	}
+	return false
+}
+
 func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time.Duration, ipv4Count int) {
 	r.DNSStatsMu.Lock()
 	defer r.DNSStatsMu.Unlock()
@@ -694,18 +735,16 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 		if ipv4Count > 0 {
 			stat.IPv4s += ipv4Count
 		}
-		// Any successfully received DNS response proves the transport is alive.
-		// Reset the consecutive transport-failure streak, including responses
-		// which contain no A records.
+		// A received DNS response proves transport health even when it has no A records.
+		r.recordDNSHealthLocked(resolver, false)
 		r.DNSConsecutiveFailures[resolver] = 0
 		delete(r.DNSCooldownUntil, resolver)
 		return
 	}
 	if errors.Is(err, ErrDNSNXDomain) {
 		stat.NXDomain++
-		// NXDOMAIN is a valid DNS response, not a transport/provider failure.
-		// It also proves that the resolver answered, so it MUST reset the
-		// transport failure streak and clear a temporary cooldown.
+		// NXDOMAIN is a valid DNS response and MUST NOT count as transport failure.
+		r.recordDNSHealthLocked(resolver, false)
 		r.DNSConsecutiveFailures[resolver] = 0
 		delete(r.DNSCooldownUntil, resolver)
 		return
@@ -720,13 +759,11 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 	n := r.DNSConsecutiveFailures[resolver] + 1
 	r.DNSConsecutiveFailures[resolver] = n
 
-	// Transport failures trigger short cooldowns first. A resolver is disabled
-	// for the rest of this run only after a sustained failure pattern, not after
-	// a few isolated timeouts. This prevents the pool from collapsing to a
-	// single resolver during a large scan.
-	statAttempts := stat.Attempts
-	statFailures := stat.Failures
-	if n >= 6 && statAttempts >= 12 && statFailures >= 8 && statFailures*100 >= statAttempts*90 {
+	// Use only a bounded recent transport-health window for run quarantine.
+	// Historical cumulative failure ratios must never re-quarantine a resolver
+	// immediately after its cooldown expires.
+	windowBad := r.recordDNSHealthLocked(resolver, true)
+	if windowBad {
 		r.DNSDisabledForRun[resolver] = true
 		delete(r.DNSCooldownUntil, resolver)
 		return
@@ -1484,6 +1521,9 @@ func CleanDomain(d string) string {
 	if d == "localhost" || strings.HasPrefix(d, "localhost.") {
 		return ""
 	}
+	if net.ParseIP(d) != nil {
+		return ""
+	}
 	if !domainRe.MatchString(d) {
 		return ""
 	}
@@ -1742,7 +1782,7 @@ func (r *ProviderRunner) disableForRun(reason string) {
 	}
 }
 
-func (r *ProviderRunner) currentRunContext(parent context.Context) context.Context {
+func (r *ProviderRunner) currentRunContext(parent context.Context) (context.Context, func()) {
 	r.mu.Lock()
 	providerCtx := r.runCtx
 	r.mu.Unlock()
@@ -1753,8 +1793,14 @@ func (r *ProviderRunner) currentRunContext(parent context.Context) context.Conte
 		r.mu.Unlock()
 	}
 	ctx, cancel := context.WithCancel(parent)
-	context.AfterFunc(providerCtx, cancel)
-	return ctx
+	if providerCtx == parent {
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(providerCtx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 func (r *ProviderRunner) StatsKey() string {
@@ -1882,12 +1928,17 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 	}
 
 	ch := rtCaches.ProvGroup.DoChan(cacheKey, func() (interface{}, error) {
+		sharedCtx := rtCaches.RunCtx
+		if sharedCtx == nil {
+			sharedCtx = ctx
+		}
+
 		if blocked, reason := providerDisabled(r); blocked {
 			pipeStats.recordProviderStat(statName, r.Category(), StatSkipped, false, 0, 0, 0, 0, 0, 0, reason, 0)
 			return ExecResult{nil, StatSkipped}, nil
 		}
 
-		if errWait := r.waitRate(ctx); errWait != nil {
+		if errWait := r.waitRate(sharedCtx); errWait != nil {
 			pipeStats.recordProviderStat(statName, r.Category(), StatWaitCanceled, false, 0, 0, 0, 0, 0, 0, fmt.Sprintf("wait cancelled: %v", errWait), 0)
 			return ExecResult{nil, StatWaitCanceled}, nil
 		}
@@ -1903,21 +1954,19 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		if r.sem != nil {
 			select {
 			case r.sem <- struct{}{}:
-			case <-ctx.Done():
+				defer func() { <-r.sem }()
+			case <-sharedCtx.Done():
 				return ExecResult{nil, StatWaitCanceled}, nil
 			}
 		}
 
-		providerCtx := r.currentRunContext(ctx)
+		providerCtx, cleanupRunCtx := r.currentRunContext(sharedCtx)
+		defer cleanupRunCtx()
 		reqCtx, cancel := context.WithTimeout(providerCtx, r.Config.Timeout)
+		defer cancel()
 		rawRes, err := r.Fetch(reqCtx, query, client, r.Config)
-		cancel()
 
-		if r.sem != nil {
-			<-r.sem
-		}
-
-		if err != nil && ctx.Err() != nil {
+		if err != nil && (ctx.Err() != nil || sharedCtx.Err() != nil) {
 			pipeStats.recordProviderStat(statName, r.Category(), StatWaitCanceled, false, 0, 0, 0, 0, 0, 0, "root canceled", 0)
 			return ExecResult{nil, StatWaitCanceled}, nil
 		}
@@ -2156,7 +2205,9 @@ func (p *hackerTargetHostSearchProvider) Fetch(ctx context.Context, query string
 		return nil, makeProviderHTTPError(resp)
 	}
 	buf := new(bytes.Buffer)
-	_, _ = buf.ReadFrom(resp.Body)
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("read failed: %w", err)
+	}
 	content := buf.String()
 	if strings.Contains(strings.ToLower(content), "api count exceeded") {
 		return nil, &ProviderHTTPError{StatusCode: http.StatusTooManyRequests, Body: content}
@@ -2399,7 +2450,9 @@ func (p *hackerTargetProvider) Fetch(ctx context.Context, query string, client *
 		return nil, makeProviderHTTPError(resp)
 	}
 	buf := new(bytes.Buffer)
-	_, _ = buf.ReadFrom(resp.Body)
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("read failed: %w", err)
+	}
 	content := buf.String()
 	if strings.Contains(strings.ToLower(content), "api count exceeded") {
 		return nil, &ProviderHTTPError{StatusCode: http.StatusTooManyRequests, Body: content}
@@ -3738,6 +3791,9 @@ func buildH2HeadersEncoder(sni string) []byte {
 
 func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte {
 	length := len(payload)
+	if length > 0xFFFFFF {
+		panic("HTTP/2 frame payload exceeds 24-bit length limit")
+	}
 	header := make([]byte, 9)
 	header[0], header[1], header[2] = byte(length>>16), byte(length>>8), byte(length)
 	header[3], header[4] = frameType, flags
@@ -4462,6 +4518,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	ds := NewDiscoveryState()
 	rtCaches := NewRuntimeCaches()
+	rtCaches.RunCtx = ctx
 	warmDNSResolvers(ctx, cfg.DNSResolvers, cfg.ECSIP, cfg.ECSPrefix, rtCaches)
 
 	for _, d := range cfg.Domains {
@@ -4906,12 +4963,15 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 				// 6. Enrichment + score
 				if !validateAndEnrich(cand, cfg, pipeStats) {
-					// validateAndEnrich currently rejects only structurally invalid
-					// H2 candidates, which are already filtered above. Keep this guard
-					// for future hard validation without using score as a gate.
 					pipeStats.mu.Lock()
 					pipeStats.ScoreRejected++
 					pipeStats.mu.Unlock()
+					continue
+				}
+
+				// Reality feasibility is a hard acceptance condition. Keep Score
+				// strictly for ranking; never let a non-feasible target reach output.
+				if !cand.RealityFeasible {
 					continue
 				}
 
@@ -5158,22 +5218,26 @@ func getASNAndPrefix(ip string) (string, string) {
 
 	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
 	if err == nil {
-		var result struct {
-			Data struct {
-				ASNs   []interface{} `json:"asns"`
-				Prefix string        `json:"prefix"`
-			} `json:"data"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
-			if len(result.Data.ASNs) > 0 {
-				asn = fmt.Sprintf("%v", result.Data.ASNs[0])
-				if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
-					asn = "AS" + asn
-				}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+		} else {
+			var result struct {
+				Data struct {
+					ASNs   []interface{} `json:"asns"`
+					Prefix string        `json:"prefix"`
+				} `json:"data"`
 			}
-			prefix = result.Data.Prefix
+			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+				if len(result.Data.ASNs) > 0 {
+					asn = fmt.Sprintf("%v", result.Data.ASNs[0])
+					if !strings.HasPrefix(strings.ToUpper(asn), "AS") {
+						asn = "AS" + asn
+					}
+				}
+				prefix = result.Data.Prefix
+			}
+			resp.Body.Close()
 		}
-		resp.Body.Close()
 	}
 
 	if asn == "" {
