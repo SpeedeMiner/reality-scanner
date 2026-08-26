@@ -64,18 +64,23 @@ const (
 	providerBackoffSecond  = 3 * time.Second
 	providerMaxRetryAfter  = 60 * time.Second
 
-	DNSQueryTimeoutDefault = 1500 * time.Millisecond
-	PTRQueryTimeoutDefault = 1000 * time.Millisecond
-	DNSCooldownBase        = 400 * time.Millisecond
-	DNSCooldownMax         = 10 * time.Second
-	DNSMaxAttemptsA        = 5
-	DNSMaxAttemptsPTR      = 8
-	DNSWarmupTimeout       = 900 * time.Millisecond
-	PTRDoHTimeout          = 1200 * time.Millisecond
-	DefaultECSIPv4Prefix   = 24
-	MaxPairEvidenceEntries = LimitValidPairs * 8
-	MaxH2BufferedBytes     = 9 + 16384
-	MaxH2HeaderBlockBytes  = 64 * 1024
+	DNSQueryTimeoutDefault  = 1500 * time.Millisecond
+	PTRQueryTimeoutDefault  = 1000 * time.Millisecond
+	DNSCooldownBase         = 2 * time.Second
+	DNSCooldownMax          = 30 * time.Second
+	DNSMaxAttemptsA         = 5
+	DNSMaxAttemptsPTR       = 8
+	DNSWarmupTimeout        = 900 * time.Millisecond
+	DNSAdaptiveTimeoutMin   = 700 * time.Millisecond
+	DNSAdaptiveTimeoutMax   = 1500 * time.Millisecond
+	DNSHealthSampleMin      = 8
+	DNSHealthBadTimeoutRate = 0.65
+	DNSHealthBadCooldown    = 15 * time.Second
+	PTRDoHTimeout           = 1200 * time.Millisecond
+	DefaultECSIPv4Prefix    = 24
+	MaxPairEvidenceEntries  = LimitValidPairs * 8
+	MaxH2BufferedBytes      = 9 + 16384
+	MaxH2HeaderBlockBytes   = 64 * 1024
 	// Broad public DNS set: Cloudflare, Google, Quad9, OpenDNS, AdGuard, DNS.WATCH and ControlD (unfiltered).
 	DefaultDNSResolvers = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,94.140.14.140,94.140.14.141,84.200.69.80,84.200.70.40,77.88.8.8,77.88.8.1,9.9.9.10,149.112.112.10,76.76.2.0,76.76.10.0"
 )
@@ -635,36 +640,42 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	// True round-robin over currently healthy resolvers. Health only decides
-	// eligibility; it does not reorder healthy resolvers by RTT, so traffic
-	// keeps rotating instead of concentrating on the fastest endpoint.
 	order := make([]string, 0, len(resolvers))
+	var earliest string
+	var earliestUntil time.Time
+
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
-		if until := r.DNSCooldownUntil[resolver]; !until.IsZero() && now.Before(until) {
-			continue
-		}
-		order = append(order, resolver)
-	}
-
-	// Never return an empty ring while there is a cooled resolver available:
-	// choose the one with the earliest expiry as the final rescue attempt.
-	if len(order) == 0 {
-		var earliest string
-		var earliestUntil time.Time
-		for _, resolver := range resolvers {
-			until := r.DNSCooldownUntil[resolver]
-			if until.IsZero() || !now.Before(until) {
-				continue
-			}
+		until := r.DNSCooldownUntil[resolver]
+		if !until.IsZero() && now.Before(until) {
 			if earliest == "" || until.Before(earliestUntil) {
 				earliest = resolver
 				earliestUntil = until
 			}
+			continue
 		}
-		if earliest != "" {
-			order = append(order, earliest)
+
+		// Re-entry is health-aware: a resolver with a persistently high timeout
+		// rate is temporarily quarantined even if it occasionally succeeds.
+		if st := r.DNSResolverStats[resolver]; st != nil && st.Attempts >= DNSHealthSampleMin {
+			timeoutRate := float64(st.Timeouts) / float64(st.Attempts)
+			if timeoutRate >= DNSHealthBadTimeoutRate {
+				r.DNSCooldownUntil[resolver] = now.Add(DNSHealthBadCooldown)
+				if earliest == "" || r.DNSCooldownUntil[resolver].Before(earliestUntil) {
+					earliest = resolver
+					earliestUntil = r.DNSCooldownUntil[resolver]
+				}
+				continue
+			}
 		}
+
+		order = append(order, resolver)
+	}
+
+	// If all resolvers are quarantined, probe only the one nearest to recovery.
+	// This prevents a synchronized timeout storm across the whole pool.
+	if len(order) == 0 && earliest != "" {
+		order = append(order, earliest)
 	}
 	return order
 }
@@ -711,6 +722,9 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 	n := r.DNSConsecutiveFailures[resolver] + 1
 	r.DNSConsecutiveFailures[resolver] = n
 
+	// Quarantine immediately after the first transport failure. Subsequent
+	// failures increase the cooldown exponentially, capped at 30s. NXDOMAIN
+	// never reaches this path because it is a valid DNS response.
 	cooldown := DNSCooldownBase
 	for i := 1; i < n; i++ {
 		cooldown *= 2
@@ -719,8 +733,8 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 			break
 		}
 	}
-	if !isTimeout && cooldown > 2*time.Second {
-		cooldown = 2 * time.Second
+	if !isTimeout && cooldown > 5*time.Second {
+		cooldown = 5 * time.Second
 	}
 	if cooldown > DNSCooldownMax {
 		cooldown = DNSCooldownMax
@@ -1017,6 +1031,31 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 	fmt.Printf("[DNS] Warm-up: %d/%d resolvers answered\n", healthy, len(resolvers))
 }
 
+func (r *RuntimeCaches) dnsResolverTimeout(resolver string, fallback time.Duration) time.Duration {
+	r.DNSStatsMu.Lock()
+	defer r.DNSStatsMu.Unlock()
+	if st := r.DNSResolverStats[resolver]; st != nil && st.RTTMs > 0 {
+		d := time.Duration(st.RTTMs*4.0) * time.Millisecond
+		if d < DNSAdaptiveTimeoutMin {
+			d = DNSAdaptiveTimeoutMin
+		}
+		if d > DNSAdaptiveTimeoutMax {
+			d = DNSAdaptiveTimeoutMax
+		}
+		return d
+	}
+	if fallback <= 0 {
+		return DNSQueryTimeoutDefault
+	}
+	if fallback < DNSAdaptiveTimeoutMin {
+		return DNSAdaptiveTimeoutMin
+	}
+	if fallback > DNSAdaptiveTimeoutMax {
+		return DNSAdaptiveTimeoutMax
+	}
+	return fallback
+}
+
 func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
 	domain = CleanDomain(domain)
 	if domain == "" {
@@ -1042,13 +1081,13 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 
 	for _, resolver := range ordered {
 		started := time.Now()
-		ips, err := dnsExchangeUDP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, timeout)
+		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
+		ips, err := dnsExchangeUDP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, resolverTimeout)
 
-		// UDP can fail because the answer was truncated. For transport timeouts
-		// and truncation, retry the same resolver over TCP before consuming the
-		// next resolver. This mirrors the behavior of a full recursive pool.
-		if errors.Is(err, ErrDNSTruncated) {
-			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, timeout)
+		// UDP timeout or truncation: fall back to TCP on the same resolver once.
+		// If TCP also fails, immediately rotate to the next healthy resolver.
+		if errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, resolverTimeout)
 			if tcpErr == nil {
 				ips, err = tcpIPs, nil
 			} else {
@@ -1161,9 +1200,10 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	emptyCount := 0
 	for _, resolver := range ordered {
 		started := time.Now()
-		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, timeout)
-		if err != nil && (errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)) {
-			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, timeout); tcpErr == nil {
+		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
+		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, resolverTimeout)
+		if errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, resolverTimeout); tcpErr == nil {
 				names, err = tcpNames, nil
 			} else {
 				err = tcpErr
