@@ -595,11 +595,13 @@ type RuntimeCaches struct {
 	DNSConsecutiveFailures map[string]int
 
 	// PTR fallback telemetry. Access under DNSStatsMu.
-	PTRSystemFallbacks   int
-	PTRDoHFallbacks      int
-	PTRNegativeResponses int
-	DNSDoHFallbacks      int
-	DNSSystemFallbacks   int
+	PTRSystemFallbacks     int
+	PTRDoHFallbacks        int
+	PTRNegativeResponses   int
+	PTRResolverNXResponses int
+	PTRNegativeIPs         map[string]struct{}
+	DNSDoHFallbacks        int
+	DNSSystemFallbacks     int
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
@@ -609,6 +611,7 @@ func NewRuntimeCaches() *RuntimeCaches {
 		DNSCache:               NewSafeDNSCache(),
 		DNSGroup:               &singleflight.Group{},
 		DNSResolverStats:       make(map[string]*DNSResolverStat),
+		PTRNegativeIPs:         make(map[string]struct{}),
 		DNSCooldownUntil:       make(map[string]time.Time),
 		DNSConsecutiveFailures: make(map[string]int),
 	}
@@ -640,9 +643,11 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
 	type item struct {
-		resolver string
-		failures int
-		idx      int
+		resolver    string
+		failures    int
+		timeoutRate float64
+		rtt         float64
+		idx         int
 	}
 	ready := make([]item, 0, len(resolvers))
 	var earliest string
@@ -657,15 +662,37 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 			}
 			continue
 		}
-		ready = append(ready, item{resolver: resolver, failures: r.DNSConsecutiveFailures[resolver], idx: i})
+		st := r.DNSResolverStats[resolver]
+		var failures, timeouts int
+		var rtt float64
+		if st != nil {
+			failures = st.Failures
+			timeouts = st.Timeouts
+			rtt = st.RTTMs
+		}
+		attempts := 1
+		if st != nil && st.Attempts > 0 {
+			attempts = st.Attempts
+		}
+		ready = append(ready, item{
+			resolver:    resolver,
+			failures:    r.DNSConsecutiveFailures[resolver],
+			timeoutRate: float64(timeouts) / float64(attempts),
+			rtt:         rtt,
+			idx:         i,
+		})
 	}
 
-	// Round-robin remains the primary policy. Inside one cycle, move resolvers
-	// with repeated failures toward the end so healthy resolvers get first chance
-	// without creating a permanent fastest-resolver hotspot.
+	// Health first, round-robin second. NXDOMAIN does not affect this ordering.
 	sort.SliceStable(ready, func(i, j int) bool {
 		if ready[i].failures != ready[j].failures {
 			return ready[i].failures < ready[j].failures
+		}
+		if ready[i].timeoutRate != ready[j].timeoutRate {
+			return ready[i].timeoutRate < ready[j].timeoutRate
+		}
+		if ready[i].rtt != ready[j].rtt {
+			return ready[i].rtt < ready[j].rtt
 		}
 		return ready[i].idx < ready[j].idx
 	})
@@ -1156,11 +1183,10 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		if errors.Is(err, ErrDNSNXDomain) {
 			nxCount++
 			rtCaches.DNSStatsMu.Lock()
-			rtCaches.PTRNegativeResponses++
+			rtCaches.PTRResolverNXResponses++
 			rtCaches.DNSStatsMu.Unlock()
-			// NXDOMAIN from one recursive resolver is not sufficient here: the old
-			// scanner used a much broader resolver population. Keep checking the
-			// other healthy fallback resolvers before declaring a negative result.
+			// NXDOMAIN is resolver telemetry, not the final per-IP result. The
+			// unique-IP counter is updated only once when all viable fallbacks agree.
 			continue
 		}
 		lastErr = fmt.Errorf("%s: %w", resolver, err)
@@ -1179,6 +1205,10 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	}
 
 	if nxCount == len(ordered) || (nxCount > 0 && emptyCount+nxCount == len(ordered)) {
+		rtCaches.DNSStatsMu.Lock()
+		rtCaches.PTRNegativeIPs[ip] = struct{}{}
+		rtCaches.PTRNegativeResponses = len(rtCaches.PTRNegativeIPs)
+		rtCaches.DNSStatsMu.Unlock()
 		return nil, ErrDNSNXDomain
 	}
 	if lastErr == nil {
@@ -1536,12 +1566,13 @@ const (
 )
 
 type ProviderConfig struct {
-	Timeout       time.Duration
-	MaxConcurrent int
-	MinInterval   time.Duration
-	MaxRoots      int
-	MaxNames      int
-	MaxPages      int
+	Timeout        time.Duration
+	MaxConcurrent  int
+	MinInterval    time.Duration
+	MaxRoots       int
+	MaxNames       int
+	MaxPages       int
+	GlobalMaxNames int // hard per-run cap across all queries for this provider
 }
 
 type ExecResult struct {
@@ -1559,14 +1590,15 @@ type SNIProvider interface {
 
 type ProviderRunner struct {
 	SNIProvider
-	Config        ProviderConfig
-	sem           chan struct{}
-	mu            sync.Mutex
-	nextAllowed   time.Time
-	cbFailures    int
-	cbUntil       time.Time
-	disabled      bool
-	disableReason string
+	Config          ProviderConfig
+	sem             chan struct{}
+	mu              sync.Mutex
+	nextAllowed     time.Time
+	cbFailures      int
+	cbUntil         time.Time
+	disabled        bool
+	disableReason   string
+	globalNamesUsed int
 }
 
 func NewRunner(p SNIProvider, cfg ProviderConfig) *ProviderRunner {
@@ -1668,6 +1700,30 @@ func providerHTTPStatus(err error) int {
 	return 0
 }
 
+func (r *ProviderRunner) applyGlobalNameBudget(names []string) (accepted []string, exhausted bool) {
+	if r.Config.GlobalMaxNames <= 0 || len(names) == 0 {
+		return names, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	remaining := r.Config.GlobalMaxNames - r.globalNamesUsed
+	if remaining <= 0 {
+		r.disabled = true
+		r.disableReason = fmt.Sprintf("global name budget exhausted (%d)", r.Config.GlobalMaxNames)
+		return nil, true
+	}
+	if len(names) > remaining {
+		names = names[:remaining]
+	}
+	r.globalNamesUsed += len(names)
+	if r.globalNamesUsed >= r.Config.GlobalMaxNames {
+		r.disabled = true
+		r.disableReason = fmt.Sprintf("global name budget exhausted (%d)", r.Config.GlobalMaxNames)
+		exhausted = true
+	}
+	return names, exhausted
+}
+
 func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http.Client, pipeStats *PipelineStats, rtCaches *RuntimeCaches) ExecResult {
 	if err := ctx.Err(); err != nil {
 		return ExecResult{Names: nil, Status: StatWaitCanceled}
@@ -1744,6 +1800,15 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			acceptedCount = r.Config.MaxNames
 			limitedCount = uniqueCount - acceptedCount
 			cleanRes = cleanRes[:acceptedCount]
+		}
+
+		if err == nil && len(cleanRes) > 0 {
+			before := len(cleanRes)
+			cleanRes, _ = r.applyGlobalNameBudget(cleanRes)
+			if len(cleanRes) < before {
+				limitedCount += before - len(cleanRes)
+				acceptedCount = len(cleanRes)
+			}
 		}
 
 		if err != nil {
@@ -2710,9 +2775,16 @@ func RunStageC(
 
 	jobQueues := make(map[*ProviderRunner]chan RootJob, len(providers))
 	for _, p := range providers {
-		queueSize := providerLimits[p] * 2
-		if queueSize < 1 {
-			queueSize = 1
+		workers := p.Config.MaxConcurrent
+		if workers <= 0 {
+			workers = 1
+		}
+		// Keep only a tiny amount of queued work. This is important when a provider
+		// returns 429/403/quota errors: stale jobs are not allowed to pile up behind
+		// a provider that has just become unavailable.
+		queueSize := workers * 2
+		if queueSize < 2 {
+			queueSize = 2
 		}
 		jobQueues[p] = make(chan RootJob, queueSize)
 	}
@@ -2725,7 +2797,11 @@ func RunStageC(
 
 	totalCapacity := 0
 	for _, p := range providers {
-		totalCapacity += providerLimits[p] * 2
+		workers := p.Config.MaxConcurrent
+		if workers <= 0 {
+			workers = 1
+		}
+		totalCapacity += workers * 2
 	}
 	if totalCapacity < 1 {
 		totalCapacity = 1
@@ -3095,6 +3171,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	dnsDoH := rtCaches.DNSDoHFallbacks
 	dnsSystem := rtCaches.DNSSystemFallbacks
 	ptrNegative := rtCaches.PTRNegativeResponses
+	ptrResolverNegative := rtCaches.PTRResolverNXResponses
 	rtCaches.DNSStatsMu.Unlock()
 	s.mu.Lock()
 	s.PTRSystemFallbacks = ptrSystem
@@ -3106,7 +3183,8 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("[*] PTR DoH fallback:            %d\n", ptrDoHFallbacks)
 	fmt.Printf("[*] DNS A DoH fallback:          %d\n", dnsDoH)
 	fmt.Printf("[*] DNS A system fallback:       %d\n", dnsSystem)
-	fmt.Printf("[*] PTR NXDOMAIN responses:      %d\n\n", ptrNegative)
+	fmt.Printf("[*] PTR unique NXDOMAIN IPs:     %d\n", ptrNegative)
+	fmt.Printf("[*] PTR resolver NXDOMAIN replies:%d\n\n", ptrResolverNegative)
 
 	rtCaches.DNSStatsMu.Lock()
 	ptrDoH := 0
@@ -4097,7 +4175,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		extProviders = append(extProviders, NewRunner(&urlScanIPProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxPages: 5}))
 	}
 	if cfg.ChaosKey != "" {
-		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 750, MaxRoots: 100, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 750, MaxRoots: 100, MaxPages: 1, GlobalMaxNames: 10000}))
 	}
 
 	var ipProviders []*ProviderRunner
