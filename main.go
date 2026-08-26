@@ -310,6 +310,10 @@ type Candidate struct {
 	IP                    string
 	SNI                   string
 	ALPN                  string
+	TLSCurve              string
+	X25519                bool
+	RealityFeasible       bool
+	CertExpiry            time.Time
 	H2HeadersReceived     bool
 	ResponseHeadersParsed bool
 	ResponseTrailersSeen  bool
@@ -3736,6 +3740,9 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 
 	state := uConn.ConnectionState()
 
+	cand.TLSCurve = fmt.Sprintf("%v", state.CurveID)
+	cand.X25519 = state.CurveID == tls.X25519 || strings.Contains(strings.ToUpper(cand.TLSCurve), "X25519MLKEM")
+
 	if state.Version != tls.VersionTLS13 {
 		return cand, &ProbeError{
 			Stage: ProbeStageTLS,
@@ -3766,6 +3773,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 
 	now := time.Now()
 	cand.CertValidTime = now.After(cert.NotBefore) && now.Before(cert.NotAfter)
+	cand.CertExpiry = cert.NotAfter
 
 	opts := x509.VerifyOptions{
 		DNSName:       sni,
@@ -4016,6 +4024,8 @@ ReadLoop:
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("no valid H2 SETTINGS exchange received")}
 	}
 
+	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.X25519 && cand.CertSNIMatch && cand.CertValidTime
+
 	return cand, nil
 }
 
@@ -4183,6 +4193,7 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 		scorePenalty += 10.0
 	}
 
+	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.X25519 && cand.CertSNIMatch && cand.CertValidTime
 	cand.RealityScore = rs
 	cand.DomainPenalty = scorePenalty
 	cand.Score = rs.Total - scorePenalty
@@ -4980,16 +4991,26 @@ func main() {
 	}
 
 	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
-	fmt.Printf("%-32.32s | %-15.15s | %-5s | %-4s | %-4s | %-4s | %-4s | %-4s | %-5s | %-6s | %4s %4s %4s\n",
-		"Цель (SNI)", "IP адрес", "SCORE", "TLS", "CERT", "H2", "SRV", "HTTP", "DSCOV", "STATUS", "TCP", "TLS", "H2")
-	fmt.Println(strings.Repeat("-", 126))
+	fmt.Printf("%-32.32s | %-15.15s | %-6s | %-16s | %-30s | %4s\n",
+		"Цель (SNI)", "IP адрес", "STATUS", "TLS curve", "certificate", "RTT")
+	fmt.Println(strings.Repeat("-", 116))
 
 	for _, r := range results {
-		rs := r.RealityScore
-		scoreStr := fmt.Sprintf("%.1f", r.Score)
-		fmt.Printf("%-32.32s | %-15.15s | %-5s | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f   | %2.0f    | %-6d | %3d %3d %3d\n",
-			r.SNI, r.IP, scoreStr, rs.TLSQuality, rs.Certificate, rs.H2Profile, rs.ServerProfile, rs.HTTPBehavior, rs.DiscoveryScore, r.HTTPStatus,
-			r.Timings.TCP.Milliseconds(), r.Timings.TLS.Milliseconds(), r.Timings.H2Headers.Milliseconds())
+		cert := r.CertSubject
+		if cert == "" {
+			cert = r.CertIssuer
+		}
+		if cert == "" {
+			cert = "-"
+		}
+		certState := "INVALID"
+		if r.CertSNIMatch && r.CertValidTime {
+			certState = "valid"
+		}
+		certCol := fmt.Sprintf("%s [%s]", limitStr(cert, 21), certState)
+		rtt := r.Timings.TCP + r.Timings.TLS + r.Timings.H2Headers
+		fmt.Printf("%-32.32s | %-15.15s | %-6d | %-16.16s | %-30.30s | %4dms\n",
+			r.SNI, r.IP, r.HTTPStatus, r.TLSCurve, certCol, rtt.Milliseconds())
 	}
 
 	best := results[0]
@@ -4999,9 +5020,9 @@ func main() {
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
 	fmt.Printf("Подробности лучшего кандидата:\n")
-	fmt.Printf("TLS: %.0f/20 | CERT: %.0f/20 | H2: %.0f/20 | SERVER: %.0f/10 | HTTP: %.0f/10 | DSCOV: %.0f/10 | LATENCY: TCP %dms, TLS %dms, H2 %dms\n",
-		best.RealityScore.TLSQuality, best.RealityScore.Certificate, best.RealityScore.H2Profile, best.RealityScore.ServerProfile, best.RealityScore.HTTPBehavior, best.RealityScore.DiscoveryScore,
-		best.Timings.TCP.Milliseconds(), best.Timings.TLS.Milliseconds(), best.Timings.H2Headers.Milliseconds())
+	fmt.Printf("STATUS: %d | TLS: %.0f/20 | curve: %s | X25519: %t | certificate: %s | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
+		best.HTTPStatus, best.RealityScore.TLSQuality, best.TLSCurve, best.X25519, best.CertSubject, best.CertSNIMatch, best.RealityFeasible,
+		(best.Timings.TCP + best.Timings.TLS + best.Timings.H2Headers).Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
 	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n",
 		best.RealityScore.Total, best.DomainPenalty, best.Score, best.HTTPStatus, best.Timings.TotalProbeLatency().Milliseconds())
