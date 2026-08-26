@@ -1583,6 +1583,20 @@ func GetRootDomain(domain string) string {
 	return root
 }
 
+func limitStr(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n <= 3 {
+		return string(r[:n])
+	}
+	return string(r[:n-3]) + "..."
+}
+
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]bool)
 	var result []string
@@ -3740,8 +3754,10 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 
 	state := uConn.ConnectionState()
 
-	cand.TLSCurve = fmt.Sprintf("%v", state.CurveID)
-	cand.X25519 = state.CurveID == tls.X25519 || strings.Contains(strings.ToUpper(cand.TLSCurve), "X25519MLKEM")
+	// utls.ConnectionState does not expose the negotiated TLS key-share/curve.
+	// Keep this explicit rather than guessing from the ClientHello.
+	cand.TLSCurve = "unavailable (utls)"
+	cand.X25519 = false
 
 	if state.Version != tls.VersionTLS13 {
 		return cand, &ProbeError{
@@ -4024,7 +4040,7 @@ ReadLoop:
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("no valid H2 SETTINGS exchange received")}
 	}
 
-	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.X25519 && cand.CertSNIMatch && cand.CertValidTime
+	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertValidTime
 
 	return cand, nil
 }
@@ -4193,7 +4209,7 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 		scorePenalty += 10.0
 	}
 
-	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.X25519 && cand.CertSNIMatch && cand.CertValidTime
+	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertValidTime
 	cand.RealityScore = rs
 	cand.DomainPenalty = scorePenalty
 	cand.Score = rs.Total - scorePenalty
