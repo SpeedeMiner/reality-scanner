@@ -131,6 +131,7 @@ type Config struct {
 }
 
 var ErrDNSNXDomain = errors.New("NXDOMAIN")
+var ErrDNSTruncated = errors.New("DNS truncated response")
 
 // ================= EVIDENCE & PROVENANCE =================
 
@@ -559,6 +560,8 @@ type RuntimeCaches struct {
 	PTRSystemFallbacks   int
 	PTRDoHFallbacks      int
 	PTRNegativeResponses int
+	DNSDoHFallbacks      int
+	DNSSystemFallbacks   int
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
@@ -588,7 +591,6 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	if len(resolvers) == 0 {
 		return nil
 	}
-
 	now := time.Now()
 	r.DNSStatsMu.Lock()
 	defer r.DNSStatsMu.Unlock()
@@ -599,28 +601,47 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	order := make([]string, 0, len(resolvers))
-	var earliest string
-	var earliestUntil time.Time
+	type candidate struct {
+		resolver string
+		score    float64
+		order    int
+	}
+	cands := make([]candidate, 0, len(resolvers))
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
-		until := r.DNSCooldownUntil[resolver]
-		if !until.IsZero() && now.Before(until) {
-			if earliest == "" || until.Before(earliestUntil) {
-				earliest = resolver
-				earliestUntil = until
-			}
+		if until := r.DNSCooldownUntil[resolver]; !until.IsZero() && now.Before(until) {
 			continue
 		}
-		order = append(order, resolver)
+		st := r.DNSResolverStats[resolver]
+		score := 0.0
+		if st != nil && st.Attempts > 0 {
+			failureRate := float64(st.Failures) / float64(st.Attempts)
+			score += failureRate * 1000.0
+			if st.RTTMs > 0 {
+				score += math.Min(st.RTTMs, 1000)
+			}
+		}
+		cands = append(cands, candidate{resolver: resolver, score: score, order: i})
+	}
+	if len(cands) == 0 {
+		// All are cooling down: probe the next resolver in strict RR rather than
+		// waiting for the whole pool to become available.
+		resolver := resolvers[start]
+		return []string{resolver}
 	}
 
-	// Healthy resolvers are the only normal candidates. If every resolver is
-	// cooling down, probe only the one whose cooldown expires first instead of
-	// hammering the entire unhealthy pool. This is the health-aware part of
-	// round-robin and prevents timeout storms.
-	if len(order) == 0 && earliest != "" {
-		order = append(order, earliest)
+	// Stable sort: health is primary, RR position breaks ties. This avoids
+	// repeatedly selecting a resolver with a rising timeout rate while still
+	// rotating traffic among healthy providers.
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].score != cands[j].score {
+			return cands[i].score < cands[j].score
+		}
+		return cands[i].order < cands[j].order
+	})
+	order := make([]string, 0, len(cands))
+	for _, c := range cands {
+		order = append(order, c.resolver)
 	}
 	return order
 }
@@ -771,15 +792,17 @@ func (c *SafeCache) Put(key string, vals []string, status StatResult, ttl time.D
 	}
 }
 
-// ================= V14 REMEDIATION PLAN =================
-// 1) Restore PTR compatibility: system resolver first, then raw UDP/TCP, then DoH.
-// 2) Never terminate PTR on the first NXDOMAIN; compare multiple independent paths.
-// 3) Keep raw UDP A/ECS health-aware round-robin, with bounded attempts.
-// 4) Treat Reality score as ranking only: valid H2 + valid HTTP status is never
-//    dropped solely because penalties make the score negative.
-// 5) Emit explicit PTR fallback/negative telemetry and distinguish low-score
-//    candidates from structurally rejected candidates.
-// ================= END V14 REMEDIATION PLAN =================
+// ================= V17 REMEDIATION PLAN =================
+// 1) Keep PTR compatibility: system resolver -> raw UDP/TCP -> DoH; count each path.
+// 2) Keep health-aware round-robin for raw DNS, but rank resolvers by observed failure/RTT.
+// 3) For A/ECS: UDP -> TCP on timeout/truncation -> DoH with ECS -> system resolver.
+// 4) Require two independent NXDOMAIN responses before hard-negative caching.
+// 5) Reduce DNS burst pressure from 128 to 64 workers to avoid public-resolver timeout storms.
+// 6) Fix URLScan pagination precision by preserving JSON numeric sort values verbatim.
+// 7) Use the current Anubis DB API path; isolate quota-limited VT/URLScan from hot provider scheduling.
+// 8) Keep score as ranking only; valid H2 + HTTP candidates remain eligible.
+// 9) Distinguish pre-cluster accepted candidates from post-cluster output in telemetry.
+// ================= END V17 REMEDIATION PLAN =================
 
 // ================= RAW UDP DNS + EDNS CLIENT SUBNET =================
 
@@ -1154,6 +1177,12 @@ func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, 
 	if err != nil {
 		return nil, err
 	}
+	if n >= 4 {
+		flags := binary.BigEndian.Uint16(buf[2:4])
+		if flags&0x0200 != 0 {
+			return nil, ErrDNSTruncated
+		}
+	}
 	if qtype == 12 {
 		return parseDNSPTRResponse(buf[:n], id)
 	}
@@ -1182,40 +1211,72 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	var lastErr error
 	nxCount := 0
 	emptyCount := 0
+
 	for _, resolver := range ordered {
 		started := time.Now()
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, timeout)
+
+		// UDP can fail because the answer was truncated. For transport timeouts
+		// and truncation, retry the same resolver over TCP before consuming the
+		// next resolver. This mirrors the behavior of a full recursive pool.
+		if err != nil && (errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)) {
+			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, timeout)
+			if tcpErr == nil {
+				ips, err = tcpIPs, nil
+			} else {
+				lastErr = tcpErr
+			}
+		}
 		rtCaches.recordDNSResult(resolver, err, time.Since(started))
 
 		if err == nil {
 			if len(ips) > 0 {
-				rtCaches.DNSStatsMu.Lock()
-				stat := rtCaches.DNSResolverStats[resolver]
-				if stat != nil {
-					stat.IPv4s += len(ips)
-				}
-				rtCaches.DNSStatsMu.Unlock()
 				return ips, nil
 			}
 			emptyCount++
 			continue
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
-			// A recursive resolver returning NXDOMAIN is a valid negative answer.
-			// Do not multiply one negative lookup into several more DNS requests.
-			return nil, ErrDNSNXDomain
+			nxCount++
+			// Require two independent negative answers before declaring NXDOMAIN.
+			// This prevents one resolver's transient/geo-specific negative answer
+			// from suppressing a valid answer from another resolver.
+			if nxCount >= 2 {
+				return nil, ErrDNSNXDomain
+			}
+			continue
 		}
-		lastErr = fmt.Errorf("%s: %w", resolver, err)
+		if lastErr == nil {
+			lastErr = fmt.Errorf("%s: %w", resolver, err)
+		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 	}
 
-	if nxCount == len(ordered) {
-		return nil, ErrDNSNXDomain
+	// Last-resort DoH with the same ECS prefix. This is intentionally only
+	// used after bounded UDP/TCP attempts so healthy public resolvers remain the
+	// fast path. It is the primary safety net for VPS networks that throttle UDP/53.
+	if dohIPs, dohErr := resolveADoH(ctx, domain, ecsIP, ecsPrefix, PTRDoHTimeout); dohErr == nil && len(dohIPs) > 0 {
+		rtCaches.DNSStatsMu.Lock()
+		rtCaches.DNSDoHFallbacks++
+		rtCaches.DNSStatsMu.Unlock()
+		return dohIPs, nil
+	} else if dohErr != nil {
+		lastErr = dohErr
 	}
-	if emptyCount > 0 && emptyCount+nxCount == len(ordered) {
-		return []string{}, nil
+
+	// Final compatibility fallback through the host resolver. This path does
+	// not guarantee ECS, but is preferable to losing a live name completely.
+	if sysIPs, sysErr := resolveASystem(ctx, domain); sysErr == nil && len(sysIPs) > 0 {
+		rtCaches.DNSStatsMu.Lock()
+		rtCaches.DNSSystemFallbacks++
+		rtCaches.DNSStatsMu.Unlock()
+		return sysIPs, nil
+	}
+
+	if nxCount > 0 && emptyCount+nxCount == len(ordered) {
+		return nil, ErrDNSNXDomain
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all DNS resolvers failed")
@@ -1318,6 +1379,103 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		lastErr = fmt.Errorf("all DNS resolvers returned no PTR")
 	}
 	return nil, lastErr
+}
+
+func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
+	if timeout <= 0 {
+		timeout = 1200 * time.Millisecond
+	}
+	ecs := ecsIP
+	if parsed := net.ParseIP(ecsIP); parsed != nil && parsed.To4() != nil {
+		masked := append(net.IP(nil), parsed.To4()...)
+		used := (ecsPrefix + 7) / 8
+		if used > 0 && ecsPrefix%8 != 0 {
+			masked[used-1] &= byte(0xFF << uint(8-(ecsPrefix%8)))
+		}
+		for i := used; i < 4; i++ {
+			masked[i] = 0
+		}
+		ecs = masked.String() + "/" + strconv.Itoa(ecsPrefix)
+	}
+	endpoints := []string{
+		"https://dns.google/resolve",
+		"https://cloudflare-dns.com/dns-query",
+	}
+	var lastErr error
+	for _, endpoint := range endpoints {
+		values := url.Values{}
+		values.Set("name", domain)
+		values.Set("type", "A")
+		if ecs != "" {
+			values.Set("edns_client_subnet", ecs)
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint+"?"+values.Encode(), nil)
+		if err != nil {
+			cancel()
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Accept", "application/dns-json")
+		req.Header.Set("User-Agent", "reality-scanner/1.0")
+		resp, err := (&http.Client{Timeout: timeout}).Do(req)
+		if err != nil {
+			cancel()
+			lastErr = err
+			continue
+		}
+		var payload struct {
+			Status int `json:"Status"`
+			Answer []struct {
+				Type int    `json:"type"`
+				Data string `json:"data"`
+			} `json:"Answer"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
+		resp.Body.Close()
+		cancel()
+		if decodeErr != nil {
+			lastErr = decodeErr
+			continue
+		}
+		if payload.Status == 3 {
+			return nil, ErrDNSNXDomain
+		}
+		if payload.Status != 0 {
+			lastErr = fmt.Errorf("DoH DNS status=%d", payload.Status)
+			continue
+		}
+		ips := make([]string, 0, len(payload.Answer))
+		for _, answer := range payload.Answer {
+			if answer.Type != 1 {
+				continue
+			}
+			if ip := net.ParseIP(strings.TrimSpace(answer.Data)); ip != nil && ip.To4() != nil {
+				ips = append(ips, ip.To4().String())
+			}
+		}
+		return uniqueStrings(ips), nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("DNS A DoH fallback failed")
+	}
+	return nil, lastErr
+}
+
+func resolveASystem(ctx context.Context, domain string) ([]string, error) {
+	lookupCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, domain)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if ip := addr.IP.To4(); ip != nil {
+			ips = append(ips, ip.String())
+		}
+	}
+	return uniqueStrings(ips), nil
 }
 
 func resolvePTRDoH(ctx context.Context, rev string, timeout time.Duration) ([]string, error) {
@@ -3101,6 +3259,8 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	rtCaches.DNSStatsMu.Lock()
 	ptrSystem := rtCaches.PTRSystemFallbacks
 	ptrDoHFallbacks := rtCaches.PTRDoHFallbacks
+	dnsDoH := rtCaches.DNSDoHFallbacks
+	dnsSystem := rtCaches.DNSSystemFallbacks
 	ptrNegative := rtCaches.PTRNegativeResponses
 	rtCaches.DNSStatsMu.Unlock()
 	s.mu.Lock()
@@ -3111,6 +3271,8 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	s.mu.Unlock()
 	fmt.Printf("[*] PTR system fallback:         %d\n", ptrSystem)
 	fmt.Printf("[*] PTR DoH fallback:            %d\n", ptrDoHFallbacks)
+	fmt.Printf("[*] DNS A DoH fallback:          %d\n", dnsDoH)
+	fmt.Printf("[*] DNS A system fallback:       %d\n", dnsSystem)
 	fmt.Printf("[*] PTR NXDOMAIN responses:      %d\n\n", ptrNegative)
 
 	rtCaches.DNSStatsMu.Lock()
@@ -4060,11 +4222,11 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		extProviders = append(extProviders, NewRunner(&shodanInternetDBProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 10, MinInterval: 50 * time.Millisecond, MaxNames: 1000, MaxPages: 1}))
 	}
 	if cfg.VTKey != "" {
-		extProviders = append(extProviders, NewRunner(&vtDomainProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 1500, MaxRoots: 75, MaxPages: 2}))
+		extProviders = append(extProviders, NewRunner(&vtDomainProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 15 * time.Second, MaxNames: 1500, MaxRoots: 75, MaxPages: 2}))
 		extProviders = append(extProviders, NewRunner(&vtIPProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 2000, MaxPages: 3}))
 	}
 	if cfg.URLScanKey != "" {
-		extProviders = append(extProviders, NewRunner(&urlScanDomainProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MaxNames: 8000, MaxRoots: 100, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&urlScanDomainProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MaxNames: 8000, MaxRoots: 100, MaxPages: 3}))
 		extProviders = append(extProviders, NewRunner(&urlScanIPProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxPages: 5}))
 	}
 	if cfg.ChaosKey != "" {
@@ -4698,7 +4860,7 @@ func main() {
 	cfg := Config{
 		Mode:              ModeAuto,
 		Workers:           30,
-		DNSWorkers:        128,
+		DNSWorkers:        64,
 		MaxIPs:            -1, // full announced ASN scan, capped by LimitMaxIPs
 		IPOSINTLimit:      256,
 		DomainOSINTLimit:  100,
