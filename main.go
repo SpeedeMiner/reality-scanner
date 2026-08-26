@@ -643,11 +643,11 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
 	type item struct {
-		resolver    string
-		failures    int
-		timeoutRate float64
-		rtt         float64
-		idx         int
+		resolver            string
+		consecutiveFailures int
+		timeoutRate         float64
+		rtt                 float64
+		idx                 int
 	}
 	ready := make([]item, 0, len(resolvers))
 	var earliest string
@@ -663,10 +663,9 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 			continue
 		}
 		st := r.DNSResolverStats[resolver]
-		var failures, timeouts int
+		var timeouts int
 		var rtt float64
 		if st != nil {
-			failures = st.Failures
 			timeouts = st.Timeouts
 			rtt = st.RTTMs
 		}
@@ -675,18 +674,18 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 			attempts = st.Attempts
 		}
 		ready = append(ready, item{
-			resolver:    resolver,
-			failures:    r.DNSConsecutiveFailures[resolver],
-			timeoutRate: float64(timeouts) / float64(attempts),
-			rtt:         rtt,
-			idx:         i,
+			resolver:            resolver,
+			consecutiveFailures: r.DNSConsecutiveFailures[resolver],
+			timeoutRate:         float64(timeouts) / float64(attempts),
+			rtt:                 rtt,
+			idx:                 i,
 		})
 	}
 
 	// Health first, round-robin second. NXDOMAIN does not affect this ordering.
 	sort.SliceStable(ready, func(i, j int) bool {
-		if ready[i].failures != ready[j].failures {
-			return ready[i].failures < ready[j].failures
+		if ready[i].consecutiveFailures != ready[j].consecutiveFailures {
+			return ready[i].consecutiveFailures < ready[j].consecutiveFailures
 		}
 		if ready[i].timeoutRate != ready[j].timeoutRate {
 			return ready[i].timeoutRate < ready[j].timeoutRate
