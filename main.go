@@ -70,10 +70,11 @@ const (
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
 	PTRQueryTimeoutDefault = 2500 * time.Millisecond
-	DNSCooldownBase        = 750 * time.Millisecond
-	DNSCooldownMax         = 5 * time.Second
-	DNSMaxAttemptsA        = 6
-	DNSMaxAttemptsPTR      = 5
+	DNSCooldownBase        = 500 * time.Millisecond
+	DNSCooldownMax         = 4 * time.Second
+	DNSMaxAttemptsA        = 3
+	DNSMaxAttemptsPTR      = 3
+	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	// Broad anycast/public DNS fallback set. Keep a mix of independent operators:
 	// Cloudflare, Google, Quad9, OpenDNS, AdGuard and DNS.WATCH.
@@ -590,26 +591,27 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
 	order := make([]string, 0, len(resolvers))
-	cooled := make([]string, 0, len(resolvers))
+	var earliest string
+	var earliestUntil time.Time
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
 		until := r.DNSCooldownUntil[resolver]
 		if !until.IsZero() && now.Before(until) {
-			cooled = append(cooled, resolver)
+			if earliest == "" || until.Before(earliestUntil) {
+				earliest = resolver
+				earliestUntil = until
+			}
 			continue
 		}
 		order = append(order, resolver)
 	}
 
-	// Preserve coverage, but do not let cooled resolvers dominate the first
-	// attempts. They are appended only after all currently healthy resolvers.
-	if len(cooled) > 0 {
-		sort.SliceStable(cooled, func(i, j int) bool {
-			a := r.DNSCooldownUntil[cooled[i]]
-			b := r.DNSCooldownUntil[cooled[j]]
-			return a.Before(b)
-		})
-		order = append(order, cooled...)
+	// Healthy resolvers are the only normal candidates. If every resolver is
+	// cooling down, probe only the one whose cooldown expires first instead of
+	// hammering the entire unhealthy pool. This is the health-aware part of
+	// round-robin and prevents timeout storms.
+	if len(order) == 0 && earliest != "" {
+		order = append(order, earliest)
 	}
 	return order
 }
@@ -1180,8 +1182,9 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 			continue
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
-			nxCount++
-			continue
+			// A recursive resolver returning NXDOMAIN is a valid negative answer.
+			// Do not multiply one negative lookup into several more DNS requests.
+			return nil, ErrDNSNXDomain
 		}
 		lastErr = fmt.Errorf("%s: %w", resolver, err)
 		if ctx.Err() != nil {
@@ -1218,14 +1221,12 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		ordered = ordered[:DNSMaxAttemptsPTR]
 	}
 	var lastErr error
-	nxCount := 0
-	emptyCount := 0
 	for _, resolver := range ordered {
 		started := time.Now()
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, timeout)
 		if err != nil && (errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)) {
-			// PTR answers are small; a TCP/53 retry is useful on networks where
-			// UDP/53 is selectively filtered or packets are lost.
+			// A TCP/53 retry is only used for this same resolver after UDP timeout;
+			// this avoids multiplying every successful PTR request into two packets.
 			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, timeout); tcpErr == nil {
 				names, err = tcpNames, nil
 			}
@@ -1236,14 +1237,13 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 			if len(names) > 0 {
 				return names, nil
 			}
-			emptyCount++
+			// Empty NOERROR is not enough to conclude there is no PTR; allow the
+			// remaining healthy resolver slots and then use DoH once.
 			continue
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
-			nxCount++
-			// NXDOMAIN is authoritative evidence that this address has no PTR.
-			// Do not waste the remaining fallback slots on the same negative answer.
-			continue
+			// NXDOMAIN is a valid negative response for the reverse name.
+			return nil, ErrDNSNXDomain
 		}
 		lastErr = fmt.Errorf("%s: %w", resolver, err)
 		if ctx.Err() != nil {
@@ -1251,11 +1251,75 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		}
 	}
 
-	if nxCount == len(ordered) || (nxCount > 0 && emptyCount+nxCount == len(ordered)) {
-		return nil, ErrDNSNXDomain
+	if dohNames, dohErr := resolvePTRDoH(ctx, rev, PTRDoHTimeout); dohErr == nil && len(dohNames) > 0 {
+		return dohNames, nil
+	} else if dohErr != nil {
+		lastErr = dohErr
 	}
+
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all DNS resolvers returned no PTR")
+	}
+	return nil, lastErr
+}
+
+func resolvePTRDoH(ctx context.Context, rev string, timeout time.Duration) ([]string, error) {
+	endpoints := []string{
+		"https://dns.google/resolve?name=" + url.QueryEscape(rev) + "&type=PTR",
+		"https://cloudflare-dns.com/dns-query?name=" + url.QueryEscape(rev) + "&type=PTR",
+	}
+	client := &http.Client{Timeout: timeout}
+	var lastErr error
+	for _, endpoint := range endpoints {
+		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			cancel()
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Accept", "application/dns-json")
+		req.Header.Set("User-Agent", "reality-scanner/1.0")
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = err
+			continue
+		}
+		var payload struct {
+			Status int `json:"Status"`
+			Answer []struct {
+				Type int    `json:"type"`
+				Data string `json:"data"`
+			} `json:"Answer"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
+		resp.Body.Close()
+		cancel()
+		if decodeErr != nil {
+			lastErr = decodeErr
+			continue
+		}
+		if payload.Status == 3 {
+			return nil, ErrDNSNXDomain
+		}
+		if payload.Status != 0 {
+			lastErr = fmt.Errorf("DoH DNS status=%d", payload.Status)
+			continue
+		}
+		var names []string
+		for _, answer := range payload.Answer {
+			if answer.Type != 12 {
+				continue
+			}
+			if d := CleanDomain(strings.TrimSuffix(strings.TrimSpace(answer.Data), ".")); d != "" {
+				names = append(names, d)
+			}
+		}
+		return uniqueStrings(names), nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("PTR DoH fallback failed")
 	}
 	return nil, lastErr
 }
@@ -1460,12 +1524,14 @@ type SNIProvider interface {
 
 type ProviderRunner struct {
 	SNIProvider
-	Config      ProviderConfig
-	sem         chan struct{}
-	mu          sync.Mutex
-	nextAllowed time.Time
-	cbFailures  int
-	cbUntil     time.Time
+	Config        ProviderConfig
+	sem           chan struct{}
+	mu            sync.Mutex
+	nextAllowed   time.Time
+	cbFailures    int
+	cbUntil       time.Time
+	disabled      bool
+	disableReason string
 }
 
 func NewRunner(p SNIProvider, cfg ProviderConfig) *ProviderRunner {
@@ -1493,7 +1559,40 @@ func (r *ProviderRunner) StatsKey() string {
 func isProviderBlocked(p *ProviderRunner) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.disabled {
+		return true
+	}
 	return !p.cbUntil.IsZero() && time.Now().Before(p.cbUntil)
+}
+
+func providerDisabled(p *ProviderRunner) (bool, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.disabled {
+		return true, p.disableReason
+	}
+	if !p.cbUntil.IsZero() && time.Now().Before(p.cbUntil) {
+		return true, fmt.Sprintf("circuit-open until %s", p.cbUntil.Format(time.RFC3339))
+	}
+	return false, ""
+}
+
+func providerShouldDisableForRun(err error) bool {
+	var httpErr *ProviderHTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	body := strings.ToLower(httpErr.Body)
+	switch httpErr.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusPaymentRequired:
+		return true
+	}
+	for _, marker := range []string{"quota exceeded", "rate limit", "rate_limited", "api count exceeded", "authenticate", "api key required", "anonymous access", "quota for 'search' exceeded"} {
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *ProviderRunner) waitRate(ctx context.Context) error {
@@ -1560,6 +1659,14 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			return ExecResult{nil, StatWaitCanceled}, nil
 		}
 
+		// Re-check after waiting: a queued job may have been admitted before the
+		// provider returned 401/403/429. Never let stale queued work hit a provider
+		// that has already declared itself unavailable for this run.
+		if blocked, reason := providerDisabled(r); blocked {
+			pipeStats.recordProviderStat(statName, r.Category(), StatSkipped, false, 0, 0, 0, 0, 0, 0, reason, 0)
+			return ExecResult{nil, StatSkipped}, nil
+		}
+
 		if r.sem != nil {
 			select {
 			case r.sem <- struct{}{}:
@@ -1619,17 +1726,24 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			}
 
 			if !errors.Is(err, context.Canceled) {
-				cooldown, hardBlock := providerCooldown(err)
-				r.mu.Lock()
-				if hardBlock {
-					r.cbUntil = time.Now().Add(cooldown)
+				if providerShouldDisableForRun(err) {
+					r.mu.Lock()
+					r.disabled = true
+					r.disableReason = err.Error()
+					r.mu.Unlock()
 				} else {
-					r.cbFailures++
-					if r.cbFailures >= providerCBThreshold {
-						r.cbUntil = time.Now().Add(providerCBCooldown)
+					cooldown, hardBlock := providerCooldown(err)
+					r.mu.Lock()
+					if hardBlock {
+						r.cbUntil = time.Now().Add(cooldown)
+					} else {
+						r.cbFailures++
+						if r.cbFailures >= providerCBThreshold {
+							r.cbUntil = time.Now().Add(providerCBCooldown)
+						}
 					}
+					r.mu.Unlock()
 				}
-				r.mu.Unlock()
 			} else {
 				r.mu.Lock()
 				r.cbFailures = 0
@@ -1647,8 +1761,10 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		}
 
 		r.mu.Lock()
-		r.cbFailures = 0
-		r.cbUntil = time.Time{}
+		if !r.disabled {
+			r.cbFailures = 0
+			r.cbUntil = time.Time{}
+		}
 		r.mu.Unlock()
 
 		if len(cleanRes) == 0 {
@@ -1711,7 +1827,7 @@ func (p *anubisProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
 func (p *anubisProvider) QueryType() ProviderQueryType { return QueryDomain }
 func (p *anubisProvider) SourceBit() DomainSource      { return SourceAnubis }
 func (p *anubisProvider) Fetch(ctx context.Context, query string, client *http.Client, cfg ProviderConfig) ([]string, error) {
-	u := fmt.Sprintf("https://jldc.me/anubis/subdomains/%s", url.QueryEscape(query))
+	u := fmt.Sprintf("https://anubisdb.com/subdomains/%s", url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -2291,6 +2407,7 @@ func (p *chaosProvider) Fetch(ctx context.Context, query string, client *http.Cl
 	}
 	setBrowserHeaders(req)
 	req.Header.Add("Authorization", p.Key)
+	req.Header.Set("Connection", "close")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -2926,6 +3043,16 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Println("===================================================================================================================")
 	fmt.Printf("[*] IP отобрано для пула:      %d\n", pSampled)
 	fmt.Printf("[*] IP с чистым PTR (Hosts):   %d\n\n", pWithPTR)
+
+	rtCaches.DNSStatsMu.Lock()
+	ptrDoH := 0
+	for _, st := range rtCaches.DNSResolverStats {
+		if st != nil {
+			ptrDoH += 0
+		}
+	}
+	rtCaches.DNSStatsMu.Unlock()
+	_ = ptrDoH
 
 	if droppedGlobal > 0 {
 		fmt.Printf("[!] Доменов отброшено глобальным лимитом (MaxDiscoveredDomains=%d): %d\n", MaxDiscoveredDomains, droppedGlobal)
@@ -3844,9 +3971,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 	if !cfg.NoPassive {
 		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 10000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 100, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 7 * time.Second, MaxConcurrent: 3, MinInterval: 500 * time.Millisecond, MaxNames: 6000, MaxRoots: 100, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 1500, MaxRoots: 150, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 80, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
 	}
 	if !cfg.NoReverseIP {
@@ -3854,15 +3981,15 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		extProviders = append(extProviders, NewRunner(&shodanInternetDBProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 10, MinInterval: 50 * time.Millisecond, MaxNames: 1000, MaxPages: 1}))
 	}
 	if cfg.VTKey != "" {
-		extProviders = append(extProviders, NewRunner(&vtDomainProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 2000, MaxRoots: 100, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&vtDomainProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 1500, MaxRoots: 75, MaxPages: 2}))
 		extProviders = append(extProviders, NewRunner(&vtIPProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 2000, MaxPages: 3}))
 	}
 	if cfg.URLScanKey != "" {
-		extProviders = append(extProviders, NewRunner(&urlScanDomainProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxRoots: 100, MaxPages: 5}))
+		extProviders = append(extProviders, NewRunner(&urlScanDomainProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MaxNames: 8000, MaxRoots: 100, MaxPages: 3}))
 		extProviders = append(extProviders, NewRunner(&urlScanIPProvider{Key: cfg.URLScanKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MaxNames: 10000, MaxPages: 5}))
 	}
 	if cfg.ChaosKey != "" {
-		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 2000, MaxRoots: 100, MaxPages: 1}))
+		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 750, MaxRoots: 100, MaxPages: 1}))
 	}
 
 	var ipProviders []*ProviderRunner
