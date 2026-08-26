@@ -4267,7 +4267,7 @@ ReadLoop:
 		return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("no valid H2 SETTINGS exchange received")}
 	}
 
-	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertValidTime
+	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertChainValid && cand.CertValidTime
 
 	return cand, nil
 }
@@ -4436,7 +4436,7 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 		scorePenalty += 10.0
 	}
 
-	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertValidTime
+	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertChainValid && cand.CertValidTime
 	cand.RealityScore = rs
 	cand.DomainPenalty = scorePenalty
 	cand.Score = rs.Total - scorePenalty
@@ -4887,6 +4887,16 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				}
 				pipeStats.H2StatusOK++
 
+				// Final candidates must have a system-trusted certificate chain that
+				// is valid for the probed SNI and currently within its validity window.
+				// A mere hostname match is not enough: 3x-ui correctly rejects
+				// untrusted/default/wrong-host certificates as unsuitable Reality targets.
+				if !cand.CertChainValid || !cand.CertSNIMatch || !cand.CertValidTime {
+					pipeStats.TLSValidationFailures++
+					pipeStats.mu.Unlock()
+					continue
+				}
+
 				if cand.EndStreamSeen {
 					pipeStats.EndStreamOK++
 				}
@@ -4936,6 +4946,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 
 	// Technical eligibility always outranks the heuristic Score.
+	// A candidate with an untrusted/invalid certificate chain is never eligible
+	// for the final Reality target list, even if the leaf certificate matches SNI.
 	// Score is intentionally only a tie-breaker among technically comparable
 	// candidates; this prevents a high heuristic score from selecting an SNI
 	// with an unsuitable certificate when another SNI on the same IP is
@@ -5315,8 +5327,8 @@ func main() {
 			cert = "-"
 		}
 		certState := "INVALID"
-		if r.CertSNIMatch && r.CertValidTime {
-			certState = "valid"
+		if r.CertSNIMatch && r.CertChainValid && r.CertValidTime {
+			certState = "trusted"
 		}
 		certCol := fmt.Sprintf("%s [%s]", limitStr(cert, 21), certState)
 		rtt := r.Timings.TCP + r.Timings.TLS + r.Timings.H2Headers
@@ -5331,8 +5343,8 @@ func main() {
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
 	fmt.Printf("Подробности лучшего кандидата:\n")
-	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate: %s | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
-		best.HTTPStatus, best.RealityScore.TLSQuality, best.CertSubject, best.CertSNIMatch, best.RealityFeasible,
+	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate: %s | trusted: %t | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
+		best.HTTPStatus, best.RealityScore.TLSQuality, best.CertSubject, best.CertChainValid, best.CertSNIMatch, best.RealityFeasible,
 		(best.Timings.TCP + best.Timings.TLS + best.Timings.H2Headers).Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
 	fmt.Printf("RANK: RealityFeasible=%t | BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n", best.RealityFeasible,
