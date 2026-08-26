@@ -72,8 +72,8 @@ const (
 	PTRQueryTimeoutDefault = 1000 * time.Millisecond
 	DNSCooldownBase        = 500 * time.Millisecond
 	DNSCooldownMax         = 4 * time.Second
-	DNSMaxAttemptsA        = 3
-	DNSMaxAttemptsPTR      = 4
+	DNSMaxAttemptsA        = 4
+	DNSMaxAttemptsPTR      = 6
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	// Broad anycast/public DNS fallback set. Keep a mix of independent operators:
@@ -450,22 +450,27 @@ type PipelineStats struct {
 	TLSOtherErrs          int
 
 	// H2
-	H2NoALPN          int
-	H2ProtocolOK      int
-	H2TimeoutNoFrames int
-	H2ConnectionReset int
-	H2BrokenPipe      int
-	H2BadRequest      int
-	H2GoAway          int
-	H2EOF             int
-	H2TLSAlerts       int
-	H2OtherErrs       int
-	H2HeadersOK       int
-	H2Timeouts        int
-	H2HPACKErrors     int
-	H2StatusOK        int
-	H2InvalidStatus   int
-	EndStreamOK       int
+	H2NoALPN               int
+	H2ProtocolOK           int
+	H2TimeoutNoFrames      int
+	H2ConnectionReset      int
+	H2BrokenPipe           int
+	H2BadRequest           int
+	H2GoAway               int
+	H2EOF                  int
+	H2TLSAlerts            int
+	H2OtherErrs            int
+	H2InvalidFrame         int
+	H2BadContinuation      int
+	H2HPACKDecode          int
+	H2MissingSettings      int
+	H2HeadersWithoutStatus int
+	H2HeadersOK            int
+	H2Timeouts             int
+	H2HPACKErrors          int
+	H2StatusOK             int
+	H2InvalidStatus        int
+	EndStreamOK            int
 
 	// Final
 	ScoreRejected      int
@@ -484,6 +489,24 @@ type PipelineStats struct {
 func NewPipelineStats() *PipelineStats {
 	return &PipelineStats{
 		ProviderStats: make(map[string]*ProviderStats),
+	}
+}
+
+func (s *PipelineStats) incH2Reason(kind string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.H2OtherErrs++
+	switch kind {
+	case "invalid-frame":
+		s.H2InvalidFrame++
+	case "bad-continuation":
+		s.H2BadContinuation++
+	case "hpack-decode":
+		s.H2HPACKDecode++
+	case "missing-settings":
+		s.H2MissingSettings++
+	case "headers-without-status":
+		s.H2HeadersWithoutStatus++
 	}
 }
 
@@ -599,49 +622,31 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	if start < 0 {
 		start = 0
 	}
+	// Advance the cursor once per logical lookup. The returned order is a
+	// cyclic walk, not a health-sorted list. This prevents the healthiest
+	// resolver from becoming a permanent hot spot.
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	type candidate struct {
-		resolver string
-		score    float64
-		order    int
-	}
-	cands := make([]candidate, 0, len(resolvers))
+	order := make([]string, 0, len(resolvers))
+	var earliest string
+	var earliestUntil time.Time
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
-		if until := r.DNSCooldownUntil[resolver]; !until.IsZero() && now.Before(until) {
+		until := r.DNSCooldownUntil[resolver]
+		if until.IsZero() || !now.Before(until) {
+			order = append(order, resolver)
 			continue
 		}
-		st := r.DNSResolverStats[resolver]
-		score := 0.0
-		if st != nil && st.Attempts > 0 {
-			failureRate := float64(st.Failures) / float64(st.Attempts)
-			score += failureRate * 1000.0
-			if st.RTTMs > 0 {
-				score += math.Min(st.RTTMs, 1000)
-			}
+		if earliest == "" || until.Before(earliestUntil) {
+			earliest = resolver
+			earliestUntil = until
 		}
-		cands = append(cands, candidate{resolver: resolver, score: score, order: i})
-	}
-	if len(cands) == 0 {
-		// All are cooling down: probe the next resolver in strict RR rather than
-		// waiting for the whole pool to become available.
-		resolver := resolvers[start]
-		return []string{resolver}
 	}
 
-	// Stable sort: health is primary, RR position breaks ties. This avoids
-	// repeatedly selecting a resolver with a rising timeout rate while still
-	// rotating traffic among healthy providers.
-	sort.SliceStable(cands, func(i, j int) bool {
-		if cands[i].score != cands[j].score {
-			return cands[i].score < cands[j].score
-		}
-		return cands[i].order < cands[j].order
-	})
-	order := make([]string, 0, len(cands))
-	for _, c := range cands {
-		order = append(order, c.resolver)
+	// If every resolver is cooling, probe the one whose cooldown expires first;
+	// never pin the scan to a fixed resolver.
+	if len(order) == 0 && earliest != "" {
+		order = append(order, earliest)
 	}
 	return order
 }
@@ -3365,6 +3370,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", pStatus, s.H2InvalidStatus)
 	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d, Ниже нуля=%d)\n", pFinal, s.ScoreRejected, pLowScore)
 	fmt.Printf("    8. После кластеризации по IP:  %d (оставлен лучший SNI на IP)\n", clustered)
+	fmt.Printf("    H2 причины Other: InvalidFrame=%d, BadContinuation=%d, HPACK=%d, MissingSettings=%d, HeadersWithoutStatus=%d\n", s.H2InvalidFrame, s.H2BadContinuation, s.H2HPACKDecode, s.H2MissingSettings, s.H2HeadersWithoutStatus)
 	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
 	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
 	fmt.Printf("    * Уникальных IP-кластеров:    %d (дедупликация финального списка по IP)\n", clustered)
@@ -3740,8 +3746,10 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 
 	if state.NegotiatedProtocol == "h2" {
 		cand.ALPN = "h2"
+	} else if state.NegotiatedProtocol == "" {
+		cand.ALPN = "no ALPN"
 	} else {
-		cand.ALPN = "h2 (no ALPN)"
+		cand.ALPN = state.NegotiatedProtocol
 	}
 
 	if len(state.PeerCertificates) == 0 {
@@ -3830,12 +3838,8 @@ ReadLoop:
 			payload := data[9 : 9+length]
 			recvBuf.Next(int(9 + length))
 
-			if frameType == FrameSettings || frameType == FrameHeaders || frameType == FrameData || frameType == FrameWindowUpdate || frameType == FrameGoAway {
-				cand.H2ProtocolConfirmed = true
-			}
-
 			if expectingContinuation && frameType != FrameContinuation {
-				continue
+				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2: expected CONTINUATION, got frame type %d", frameType)}
 			}
 
 			switch frameType {
@@ -3879,6 +3883,7 @@ ReadLoop:
 					cand.InitialPeerSettings = prof
 					cand.LatestPeerSettings = prof
 					cand.H2SettingsReceived = true
+					cand.H2ProtocolConfirmed = true
 				} else {
 					if prof != cand.LatestPeerSettings {
 						cand.SettingsChanges++
@@ -3917,6 +3922,7 @@ ReadLoop:
 						headers, errDecode := decoder.DecodeFull(headerBlocks.Bytes())
 						if errDecode != nil {
 							cand.HPACKErrors = true
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("HPACK decode: %w", errDecode)}
 						}
 
 						if !cand.ResponseHeadersParsed && !isTrailers {
@@ -3943,6 +3949,7 @@ ReadLoop:
 					headers, errDecode := decoder.DecodeFull(headerBlocks.Bytes())
 					if errDecode != nil {
 						cand.HPACKErrors = true
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("HPACK decode: %w", errDecode)}
 					}
 
 					if !cand.ResponseHeadersParsed {
@@ -4005,8 +4012,8 @@ ReadLoop:
 		}
 	}
 
-	if !cand.H2ProtocolConfirmed {
-		return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("no valid H2 frames received")}
+	if !cand.H2SettingsReceived || !cand.H2ProtocolConfirmed {
+		return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("no valid H2 SETTINGS exchange received")}
 	}
 
 	return cand, nil
@@ -4597,6 +4604,15 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 						pipeStats.H2EOF++
 					case strings.Contains(lowerErr, "tls:"):
 						pipeStats.H2TLSAlerts++
+					case strings.Contains(lowerErr, "expected continuation"):
+						pipeStats.H2OtherErrs++
+						pipeStats.H2BadContinuation++
+					case strings.Contains(lowerErr, "invalid h2"):
+						pipeStats.H2OtherErrs++
+						pipeStats.H2InvalidFrame++
+					case strings.Contains(lowerErr, "hpack decode") || strings.Contains(lowerErr, "hpack"):
+						pipeStats.H2OtherErrs++
+						pipeStats.H2HPACKDecode++
 					default:
 						pipeStats.H2OtherErrs++
 					}
@@ -4605,8 +4621,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				}
 
 				if cand == nil || !cand.H2ProtocolConfirmed {
-					pipeStats.H2OtherErrs++
 					pipeStats.mu.Unlock()
+					pipeStats.incH2Reason("missing-settings")
 					continue
 				}
 				pipeStats.H2ProtocolOK++
@@ -4618,7 +4634,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					} else if cand.HPACKErrors {
 						pipeStats.H2HPACKErrors++
 					} else {
-						pipeStats.H2OtherErrs++
+						pipeStats.mu.Unlock()
+						pipeStats.incH2Reason("headers-without-status")
+						continue
 					}
 					pipeStats.mu.Unlock()
 					continue
