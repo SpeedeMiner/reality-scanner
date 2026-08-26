@@ -82,7 +82,7 @@ const (
 	MaxH2BufferedBytes      = 9 + 16384
 	MaxH2HeaderBlockBytes   = 64 * 1024
 	// Broad public DNS set: Cloudflare, Google, Quad9, OpenDNS, AdGuard, DNS.WATCH and ControlD (unfiltered).
-	DefaultDNSResolvers = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,94.140.14.140,94.140.14.141,84.200.69.80,84.200.70.40,77.88.8.8,77.88.8.1,9.9.9.10,149.112.112.10,76.76.2.0,76.76.10.0"
+	DefaultDNSResolvers = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,94.140.14.140,94.140.14.141,84.200.69.80,84.200.70.40,77.88.8.8,77.88.8.1,9.9.9.10,149.112.112.10"
 )
 
 var (
@@ -591,6 +591,7 @@ type RuntimeCaches struct {
 	DNSRoundRobinCursor    int
 	DNSCooldownUntil       map[string]time.Time
 	DNSConsecutiveFailures map[string]int
+	DNSDisabledForRun      map[string]bool
 
 	// PTR fallback telemetry. Access under DNSStatsMu.
 	PTRSystemFallbacks     int
@@ -612,6 +613,7 @@ func NewRuntimeCaches() *RuntimeCaches {
 		PTRNegativeIPs:         make(map[string]struct{}),
 		DNSCooldownUntil:       make(map[string]time.Time),
 		DNSConsecutiveFailures: make(map[string]int),
+		DNSDisabledForRun:      make(map[string]bool),
 	}
 }
 
@@ -640,12 +642,20 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	order := make([]string, 0, len(resolvers))
+	type candidate struct {
+		resolver string
+		weight   int
+		until    time.Time
+	}
+	available := make([]candidate, 0, len(resolvers))
 	var earliest string
 	var earliestUntil time.Time
 
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
+		if r.DNSDisabledForRun[resolver] {
+			continue
+		}
 		until := r.DNSCooldownUntil[resolver]
 		if !until.IsZero() && now.Before(until) {
 			if earliest == "" || until.Before(earliestUntil) {
@@ -655,27 +665,46 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 			continue
 		}
 
-		// Re-entry is health-aware: a resolver with a persistently high timeout
-		// rate is temporarily quarantined even if it occasionally succeeds.
-		if st := r.DNSResolverStats[resolver]; st != nil && st.Attempts >= DNSHealthSampleMin {
+		weight := 4
+		if st := r.DNSResolverStats[resolver]; st != nil && st.Attempts >= 3 {
 			timeoutRate := float64(st.Timeouts) / float64(st.Attempts)
-			if timeoutRate >= DNSHealthBadTimeoutRate {
-				r.DNSCooldownUntil[resolver] = now.Add(DNSHealthBadCooldown)
-				if earliest == "" || r.DNSCooldownUntil[resolver].Before(earliestUntil) {
-					earliest = resolver
-					earliestUntil = r.DNSCooldownUntil[resolver]
+			failureRate := float64(st.Failures) / float64(st.Attempts)
+			switch {
+			case timeoutRate >= 0.50 || failureRate >= 0.50:
+				weight = 1
+			case timeoutRate >= 0.25 || failureRate >= 0.25:
+				weight = 2
+			case timeoutRate >= 0.10 || failureRate >= 0.10:
+				weight = 3
+			}
+			if st.RTTMs >= 500 {
+				if weight > 1 {
+					weight--
 				}
-				continue
 			}
 		}
-
-		order = append(order, resolver)
+		available = append(available, candidate{resolver: resolver, weight: weight, until: until})
 	}
 
-	// If all resolvers are quarantined, probe only the one nearest to recovery.
-	// This prevents a synchronized timeout storm across the whole pool.
-	if len(order) == 0 && earliest != "" {
-		order = append(order, earliest)
+	if len(available) == 0 {
+		// Only temporarily cooled resolvers may be reused. A resolver disabled
+		// for this run is never resurrected by the fallback path.
+		if earliest != "" && !r.DNSDisabledForRun[earliest] {
+			return []string{earliest}
+		}
+		return nil
+	}
+
+	// Health-aware round-robin: preserve the rotating starting point while
+	// preferring healthier/faster resolvers. Each resolver appears at most once
+	// in a single lookup attempt set, so a bad resolver cannot consume the
+	// bounded retry budget by being duplicated.
+	sort.SliceStable(available, func(i, j int) bool {
+		return available[i].weight > available[j].weight
+	})
+	order := make([]string, 0, len(available))
+	for _, c := range available {
+		order = append(order, c.resolver)
 	}
 	return order
 }
@@ -721,6 +750,11 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 
 	n := r.DNSConsecutiveFailures[resolver] + 1
 	r.DNSConsecutiveFailures[resolver] = n
+	if n >= 3 {
+		r.DNSDisabledForRun[resolver] = true
+		delete(r.DNSCooldownUntil, resolver)
+		return
+	}
 
 	// Quarantine immediately after the first transport failure. Subsequent
 	// failures increase the cooldown exponentially, capped at 30s. NXDOMAIN
@@ -1002,7 +1036,7 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 	}
 	type result struct {
 		resolver string
-		err      error
+		healthy  bool
 	}
 	results := make(chan result, len(resolvers))
 	var wg sync.WaitGroup
@@ -1011,12 +1045,47 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Warm-up validates both a positive answer and a negative answer.
+			// A resolver that cannot reliably answer both is removed from this run.
+			healthy := true
+
 			qctx, cancel := context.WithTimeout(ctx, DNSWarmupTimeout)
-			defer cancel()
 			started := time.Now()
 			ips, err := dnsExchangeUDP(qctx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
+			if errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+				tcpIPs, tcpErr := dnsExchangeTCP(qctx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
+				if tcpErr == nil {
+					ips, err = tcpIPs, nil
+				} else {
+					err = tcpErr
+				}
+			}
 			rtCaches.recordDNSResult(resolver, err, time.Since(started), len(ips))
-			results <- result{resolver: resolver, err: err}
+			cancel()
+			if err != nil || len(ips) == 0 {
+				healthy = false
+			}
+
+			qctx2, cancel2 := context.WithTimeout(ctx, DNSWarmupTimeout)
+			started = time.Now()
+			_, negErr := dnsExchangeUDP(qctx2, resolver, "this-name-should-not-exist.invalid", mdns.TypeA, "", 0, DNSWarmupTimeout)
+			if errors.Is(negErr, ErrDNSTruncated) || errors.Is(negErr, context.DeadlineExceeded) || os.IsTimeout(negErr) {
+				_, tcpErr := dnsExchangeTCP(qctx2, resolver, "this-name-should-not-exist.invalid", mdns.TypeA, "", 0, DNSWarmupTimeout)
+				negErr = tcpErr
+			}
+			rtCaches.recordDNSResult(resolver, negErr, time.Since(started), 0)
+			cancel2()
+			if !errors.Is(negErr, ErrDNSNXDomain) {
+				healthy = false
+			}
+
+			if !healthy {
+				rtCaches.DNSStatsMu.Lock()
+				rtCaches.DNSDisabledForRun[resolver] = true
+				delete(rtCaches.DNSCooldownUntil, resolver)
+				rtCaches.DNSStatsMu.Unlock()
+			}
+			results <- result{resolver: resolver, healthy: healthy}
 		}()
 	}
 	wg.Wait()
@@ -1024,11 +1093,11 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 
 	healthy := 0
 	for res := range results {
-		if res.err == nil {
+		if res.healthy {
 			healthy++
 		}
 	}
-	fmt.Printf("[DNS] Warm-up: %d/%d resolvers answered\n", healthy, len(resolvers))
+	fmt.Printf("[DNS] Warm-up: %d/%d resolvers healthy for this run\n", healthy, len(resolvers))
 }
 
 func (r *RuntimeCaches) dnsResolverTimeout(resolver string, fallback time.Duration) time.Duration {
@@ -3413,6 +3482,15 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 
 	fmt.Printf("\n[*] ECS: %s/%d\n", cfg.ECSIP, cfg.ECSPrefix)
 	fmt.Printf("[*] Raw UDP DNS pool: %s\n", strings.Join(cfg.DNSResolvers, ", "))
+	rtCaches.DNSStatsMu.Lock()
+	healthyRun := 0
+	for _, resolver := range cfg.DNSResolvers {
+		if !rtCaches.DNSDisabledForRun[resolver] {
+			healthyRun++
+		}
+	}
+	rtCaches.DNSStatsMu.Unlock()
+	fmt.Printf("[*] DNS healthy for run: %d/%d\n", healthyRun, len(cfg.DNSResolvers))
 	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", qDNS, qDNSSuc, qDNSFail)
 	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", qResolved, qNX, qNoV4)
 	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", qTimeout, qTemp, qOther)
@@ -3453,8 +3531,12 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 		if stat == nil {
 			continue
 		}
-		fmt.Printf("    %-15s attempts=%d answers=%d ipv4=%d nxdomain=%d failures=%d timeouts=%d\n",
-			resolver, stat.Attempts, stat.Answers, stat.IPv4s, stat.NXDomain, stat.Failures, stat.Timeouts)
+		status := "active"
+		if rtCaches.DNSDisabledForRun[resolver] {
+			status = "disabled-run"
+		}
+		fmt.Printf("    %-15s attempts=%d answers=%d ipv4=%d nxdomain=%d failures=%d timeouts=%d status=%s\n",
+			resolver, stat.Attempts, stat.Answers, stat.IPv4s, stat.NXDomain, stat.Failures, stat.Timeouts, status)
 	}
 	rtCaches.DNSStatsMu.Unlock()
 }
