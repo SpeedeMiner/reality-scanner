@@ -477,9 +477,10 @@ type PipelineStats struct {
 	EndStreamOK            int
 
 	// Final
-	ScoreRejected      int
-	LowScoreCandidates int
-	CandidatesAccepted int
+	ScoreRejected             int
+	LowScoreCandidates        int
+	CandidatesAccepted        int
+	RealityFeasibleCandidates int
 
 	ASNFiltered     int
 	CountryFiltered int
@@ -3262,6 +3263,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	pH2Head := s.H2HeadersOK
 	pStatus := s.H2StatusOK
 	pFinal := s.CandidatesAccepted
+	pReality := s.RealityFeasibleCandidates
 	pLowScore := s.LowScoreCandidates
 
 	localStats := make(map[string]ProviderStats)
@@ -3386,8 +3388,9 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 		pH2, s.H2TimeoutNoFrames, s.H2ConnectionReset, s.H2BrokenPipe, s.H2BadRequest, s.H2GoAway, s.H2EOF, s.H2TLSAlerts, s.H2OtherErrs)
 	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", pH2Head, s.H2Timeouts, s.H2HPACKErrors)
 	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", pStatus, s.H2InvalidStatus)
-	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d, Ниже нуля=%d)\n", pFinal, s.ScoreRejected, pLowScore)
+	fmt.Printf("    7. Финальные Кандидаты:        %d (Score gate: отключён, LowScore=%d)\n", pFinal, pLowScore)
 	fmt.Printf("    8. После кластеризации по IP:  %d (оставлен лучший SNI на IP)\n", clustered)
+	fmt.Printf("    Reality-feasible из принятых:      %d\n", pReality)
 	fmt.Printf("    H2 причины Other: InvalidFrame=%d, BadContinuation=%d, HPACK=%d, MissingSettings=%d, HeadersWithoutStatus=%d\n", s.H2InvalidFrame, s.H2BadContinuation, s.H2HPACKDecode, s.H2MissingSettings, s.H2HeadersWithoutStatus)
 	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
 	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
@@ -4723,28 +4726,72 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		ipClusters[c.IP] = append(ipClusters[c.IP], c)
 	}
 
+	// Technical eligibility always outranks the heuristic Score.
+	// Score is intentionally only a tie-breaker among technically comparable
+	// candidates; this prevents a high heuristic score from selecting an SNI
+	// with an unsuitable certificate when another SNI on the same IP is
+	// Reality-feasible.
+	candidateLess := func(a, b Candidate) bool {
+		boolRank := func(v bool) int {
+			if v {
+				return 1
+			}
+			return 0
+		}
+
+		if boolRank(a.RealityFeasible) != boolRank(b.RealityFeasible) {
+			return boolRank(a.RealityFeasible) > boolRank(b.RealityFeasible)
+		}
+		if boolRank(a.CertSNIMatch) != boolRank(b.CertSNIMatch) {
+			return boolRank(a.CertSNIMatch) > boolRank(b.CertSNIMatch)
+		}
+		if boolRank(a.CertValidTime) != boolRank(b.CertValidTime) {
+			return boolRank(a.CertValidTime) > boolRank(b.CertValidTime)
+		}
+		if boolRank(a.H2ProtocolConfirmed) != boolRank(b.H2ProtocolConfirmed) {
+			return boolRank(a.H2ProtocolConfirmed) > boolRank(b.H2ProtocolConfirmed)
+		}
+		if boolRank(a.H2HeadersReceived) != boolRank(b.H2HeadersReceived) {
+			return boolRank(a.H2HeadersReceived) > boolRank(b.H2HeadersReceived)
+		}
+
+		statusClass := func(status int) int {
+			switch {
+			case status >= 200 && status < 300:
+				return 3
+			case status >= 300 && status < 400:
+				return 2
+			case status >= 400 && status < 500:
+				return 1
+			default:
+				return 0
+			}
+		}
+		if statusClass(a.HTTPStatus) != statusClass(b.HTTPStatus) {
+			return statusClass(a.HTTPStatus) > statusClass(b.HTTPStatus)
+		}
+
+		ar := a.Timings.TotalProbeLatency()
+		br := b.Timings.TotalProbeLatency()
+		if ar != br {
+			return ar < br
+		}
+		if a.Score != b.Score {
+			return a.Score > b.Score
+		}
+		return a.SNI < b.SNI
+	}
+
 	var clusteredCandidates []Candidate
 	for _, cluster := range ipClusters {
-		sort.Slice(cluster, func(i, j int) bool {
-			if cluster[i].Score != cluster[j].Score {
-				return cluster[i].Score > cluster[j].Score
-			}
-			if cluster[i].Timings.TotalProbeLatency() != cluster[j].Timings.TotalProbeLatency() {
-				return cluster[i].Timings.TotalProbeLatency() < cluster[j].Timings.TotalProbeLatency()
-			}
-			return cluster[i].SNI < cluster[j].SNI
+		sort.SliceStable(cluster, func(i, j int) bool {
+			return candidateLess(cluster[i], cluster[j])
 		})
 		clusteredCandidates = append(clusteredCandidates, cluster[0])
 	}
 
-	sort.Slice(clusteredCandidates, func(i, j int) bool {
-		if clusteredCandidates[i].Score != clusteredCandidates[j].Score {
-			return clusteredCandidates[i].Score > clusteredCandidates[j].Score
-		}
-		if clusteredCandidates[i].Timings.TotalProbeLatency() != clusteredCandidates[j].Timings.TotalProbeLatency() {
-			return clusteredCandidates[i].Timings.TotalProbeLatency() < clusteredCandidates[j].Timings.TotalProbeLatency()
-		}
-		return clusteredCandidates[i].SNI < clusteredCandidates[j].SNI
+	sort.SliceStable(clusteredCandidates, func(i, j int) bool {
+		return candidateLess(clusteredCandidates[i], clusteredCandidates[j])
 	})
 
 	pipeStats.SnapshotAndPrint(rtCaches, cfg, len(clusteredCandidates), ds)
@@ -5040,6 +5087,6 @@ func main() {
 		best.HTTPStatus, best.RealityScore.TLSQuality, best.TLSCurve, best.X25519, best.CertSubject, best.CertSNIMatch, best.RealityFeasible,
 		(best.Timings.TCP + best.Timings.TLS + best.Timings.H2Headers).Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
-	fmt.Printf("BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n",
+	fmt.Printf("RANK: RealityFeasible=%t | BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n", best.RealityFeasible,
 		best.RealityScore.Total, best.DomainPenalty, best.Score, best.HTTPStatus, best.Timings.TotalProbeLatency().Milliseconds())
 }
