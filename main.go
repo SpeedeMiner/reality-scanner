@@ -73,7 +73,7 @@ const (
 	DNSCooldownBase        = 500 * time.Millisecond
 	DNSCooldownMax         = 4 * time.Second
 	DNSMaxAttemptsA        = 3
-	DNSMaxAttemptsPTR      = 2
+	DNSMaxAttemptsPTR      = 4
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	// Broad anycast/public DNS fallback set. Keep a mix of independent operators:
@@ -1703,11 +1703,8 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 	}
 
 	v, _, _ := rtCaches.ProvGroup.Do(cacheKey, func() (interface{}, error) {
-		if isProviderBlocked(r) {
-			r.mu.Lock()
-			cbUntil := r.cbUntil
-			r.mu.Unlock()
-			pipeStats.recordProviderStat(statName, r.Category(), StatSkipped, false, 0, 0, 0, 0, 0, 0, fmt.Sprintf("circuit-open until %s", cbUntil.Format(time.RFC3339)), 0)
+		if blocked, reason := providerDisabled(r); blocked {
+			pipeStats.recordProviderStat(statName, r.Category(), StatSkipped, false, 0, 0, 0, 0, 0, 0, reason, 0)
 			return ExecResult{nil, StatSkipped}, nil
 		}
 
@@ -3106,6 +3103,12 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	ptrDoHFallbacks := rtCaches.PTRDoHFallbacks
 	ptrNegative := rtCaches.PTRNegativeResponses
 	rtCaches.DNSStatsMu.Unlock()
+	s.mu.Lock()
+	s.PTRSystemFallbacks = ptrSystem
+	s.PTRDoHFallbacks = ptrDoHFallbacks
+	s.PTRNegativeResponses = ptrNegative
+	s.PTRFound = pWithPTR
+	s.mu.Unlock()
 	fmt.Printf("[*] PTR system fallback:         %d\n", ptrSystem)
 	fmt.Printf("[*] PTR DoH fallback:            %d\n", ptrDoHFallbacks)
 	fmt.Printf("[*] PTR NXDOMAIN responses:      %d\n\n", ptrNegative)
@@ -3196,8 +3199,9 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", pH2Head, s.H2Timeouts, s.H2HPACKErrors)
 	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", pStatus, s.H2InvalidStatus)
 	fmt.Printf("    7. Финальные Кандидаты:        %d (Отклонено по Score=%d, Ниже нуля=%d)\n", pFinal, s.ScoreRejected, pLowScore)
+	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
 	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
-	fmt.Printf("    * Уникальных IP-кластеров:    %d\n", clustered)
+	fmt.Printf("    * Уникальных IP-кластеров:    %d (дедупликация финального списка по IP)\n", clustered)
 
 	fmt.Printf("\n[*] DNS resolver telemetry:\n")
 	rtCaches.DNSStatsMu.Lock()
