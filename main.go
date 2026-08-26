@@ -697,6 +697,9 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 		if ipv4Count > 0 {
 			stat.IPv4s += ipv4Count
 		}
+		// Any successfully received DNS response proves the transport is alive.
+		// Reset the consecutive transport-failure streak, including responses
+		// which contain no A records.
 		r.DNSConsecutiveFailures[resolver] = 0
 		delete(r.DNSCooldownUntil, resolver)
 		return
@@ -704,6 +707,10 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 	if errors.Is(err, ErrDNSNXDomain) {
 		stat.NXDomain++
 		// NXDOMAIN is a valid DNS response, not a transport/provider failure.
+		// It also proves that the resolver answered, so it MUST reset the
+		// transport failure streak and clear a temporary cooldown.
+		r.DNSConsecutiveFailures[resolver] = 0
+		delete(r.DNSCooldownUntil, resolver)
 		return
 	}
 
@@ -715,15 +722,19 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 
 	n := r.DNSConsecutiveFailures[resolver] + 1
 	r.DNSConsecutiveFailures[resolver] = n
-	if n >= 3 {
+
+	// Transport failures trigger short cooldowns first. A resolver is disabled
+	// for the rest of this run only after a sustained failure pattern, not after
+	// a few isolated timeouts. This prevents the pool from collapsing to a
+	// single resolver during a large scan.
+	statAttempts := stat.Attempts
+	statFailures := stat.Failures
+	if n >= 6 && statAttempts >= 12 && statFailures >= 8 && statFailures*100 >= statAttempts*90 {
 		r.DNSDisabledForRun[resolver] = true
 		delete(r.DNSCooldownUntil, resolver)
 		return
 	}
 
-	// Quarantine immediately after the first transport failure. Subsequent
-	// failures increase the cooldown exponentially, capped at 30s. NXDOMAIN
-	// never reaches this path because it is a valid DNS response.
 	cooldown := DNSCooldownBase
 	for i := 1; i < n; i++ {
 		cooldown *= 2
