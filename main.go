@@ -1600,6 +1600,8 @@ type ProviderRunner struct {
 	disabled        bool
 	disableReason   string
 	globalNamesUsed int
+	runCtx          context.Context
+	runCancel       context.CancelFunc
 }
 
 func NewRunner(p SNIProvider, cfg ProviderConfig) *ProviderRunner {
@@ -1611,6 +1613,53 @@ func NewRunner(p SNIProvider, cfg ProviderConfig) *ProviderRunner {
 		r.sem = make(chan struct{}, cfg.MaxConcurrent)
 	}
 	return r
+}
+
+// PrepareRun resets provider health state for one pipeline execution and gives
+// the provider a shared cancellation context. Disabling a provider therefore
+// cancels all already-running requests for that provider immediately.
+func (r *ProviderRunner) PrepareRun(parent context.Context) {
+	r.mu.Lock()
+	if r.runCancel != nil {
+		r.runCancel()
+	}
+	r.runCtx, r.runCancel = context.WithCancel(parent)
+	r.nextAllowed = time.Time{}
+	r.cbFailures = 0
+	r.cbUntil = time.Time{}
+	r.everResponded = false
+	r.disabled = false
+	r.disableReason = ""
+	r.globalNamesUsed = 0
+	r.mu.Unlock()
+}
+
+func (r *ProviderRunner) disableForRun(reason string) {
+	r.mu.Lock()
+	if !r.disabled {
+		r.disabled = true
+		r.disableReason = reason
+	}
+	cancel := r.runCancel
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (r *ProviderRunner) currentRunContext(parent context.Context) context.Context {
+	r.mu.Lock()
+	providerCtx := r.runCtx
+	r.mu.Unlock()
+	if providerCtx == nil {
+		r.PrepareRun(parent)
+		r.mu.Lock()
+		providerCtx = r.runCtx
+		r.mu.Unlock()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	context.AfterFunc(providerCtx, cancel)
+	return ctx
 }
 
 func (r *ProviderRunner) StatsKey() string {
@@ -1737,7 +1786,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		return ExecResult{Names: cached, Status: status}
 	}
 
-	v, _, _ := rtCaches.ProvGroup.Do(cacheKey, func() (interface{}, error) {
+	ch := rtCaches.ProvGroup.DoChan(cacheKey, func() (interface{}, error) {
 		if blocked, reason := providerDisabled(r); blocked {
 			pipeStats.recordProviderStat(statName, r.Category(), StatSkipped, false, 0, 0, 0, 0, 0, 0, reason, 0)
 			return ExecResult{nil, StatSkipped}, nil
@@ -1764,7 +1813,8 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			}
 		}
 
-		reqCtx, cancel := context.WithTimeout(ctx, r.Config.Timeout)
+		providerCtx := r.currentRunContext(ctx)
+		reqCtx, cancel := context.WithTimeout(providerCtx, r.Config.Timeout)
 		rawRes, err := r.Fetch(reqCtx, query, client, r.Config)
 		cancel()
 
@@ -1826,24 +1876,25 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 
 			if !errors.Is(err, context.Canceled) {
 				if providerShouldDisableForRun(err) {
-					r.mu.Lock()
-					r.disabled = true
-					r.disableReason = fmt.Sprintf("disabled for run: %v", err)
-					r.cbUntil = time.Time{}
-					r.mu.Unlock()
+					r.disableForRun(fmt.Sprintf("disabled for run: %v", err))
 				} else {
-					// A provider that has never produced any response in this run is
-					// effectively dead for the current pass: do not keep waiting on it.
-					// Providers that have already answered at least once stay eligible
-					// and only accumulate consecutive-failure telemetry.
+					// A provider that has not produced even one usable response in
+					// this run is considered dead for this pass after its first
+					// transport/timeout failure. Do not spend N roots waiting for
+					// the same dead endpoint to time out repeatedly.
 					r.mu.Lock()
 					r.cbFailures++
-					if !r.everResponded && r.cbFailures >= providerCBThreshold {
-						r.disabled = true
-						r.disableReason = fmt.Sprintf("disabled for run after %d transient failures with no response: %v", r.cbFailures, err)
-						r.cbUntil = time.Time{}
-					}
+					neverResponded := !r.everResponded
 					r.mu.Unlock()
+					if neverResponded {
+						r.disableForRun(fmt.Sprintf("disabled for run after first transient failure with no response: %v", err))
+					} else {
+						r.mu.Lock()
+						if r.cbFailures >= providerCBThreshold {
+							r.cbUntil = time.Now().Add(providerCBCooldown)
+						}
+						r.mu.Unlock()
+					}
 				}
 			} else {
 				r.mu.Lock()
@@ -1883,10 +1934,15 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		return ExecResult{cleanRes, StatSuccess}, nil
 	})
 
-	if v != nil {
-		return v.(ExecResult)
+	select {
+	case res := <-ch:
+		if res.Err != nil || res.Val == nil {
+			return ExecResult{nil, StatFailed}
+		}
+		return res.Val.(ExecResult)
+	case <-ctx.Done():
+		return ExecResult{nil, StatWaitCanceled}
 	}
-	return ExecResult{nil, StatFailed}
 }
 
 // -------------------------------------------------
@@ -4297,6 +4353,10 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	}
 	if cfg.ChaosKey != "" {
 		extProviders = append(extProviders, NewRunner(&chaosProvider{Key: cfg.ChaosKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 750, MaxRoots: 100, MaxPages: 1, GlobalMaxNames: 10000}))
+	}
+
+	for _, p := range extProviders {
+		p.PrepareRun(ctx)
 	}
 
 	var ipProviders []*ProviderRunner
