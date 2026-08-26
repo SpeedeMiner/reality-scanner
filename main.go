@@ -67,17 +67,17 @@ const (
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
 	PTRQueryTimeoutDefault = 1000 * time.Millisecond
 	DNSCooldownBase        = 400 * time.Millisecond
-	DNSCooldownMax         = 6 * time.Second
-	DNSMaxAttemptsA        = 4
-	DNSMaxAttemptsPTR      = 6
+	DNSCooldownMax         = 10 * time.Second
+	DNSMaxAttemptsA        = 5
+	DNSMaxAttemptsPTR      = 8
+	DNSWarmupTimeout       = 900 * time.Millisecond
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	MaxPairEvidenceEntries = LimitValidPairs * 8
 	MaxH2BufferedBytes     = 9 + 16384
 	MaxH2HeaderBlockBytes  = 64 * 1024
-	// Broad anycast/public DNS fallback set. Keep a mix of independent operators:
-	// Cloudflare, Google, Quad9, OpenDNS, AdGuard and DNS.WATCH.
-	DefaultDNSResolvers = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,94.140.14.140,94.140.14.141,84.200.69.80,84.200.70.40,77.88.8.8,77.88.8.1,9.9.9.10,149.112.112.10"
+	// Broad public DNS set: Cloudflare, Google, Quad9, OpenDNS, AdGuard, DNS.WATCH and ControlD (unfiltered).
+	DefaultDNSResolvers = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,94.140.14.140,94.140.14.141,84.200.69.80,84.200.70.40,77.88.8.8,77.88.8.1,9.9.9.10,149.112.112.10,76.76.2.0,76.76.10.0"
 )
 
 var (
@@ -635,66 +635,36 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	type item struct {
-		resolver            string
-		consecutiveFailures int
-		timeoutRate         float64
-		rtt                 float64
-		idx                 int
-	}
-	ready := make([]item, 0, len(resolvers))
-	var earliest string
-	var earliestUntil time.Time
-
+	// True round-robin over currently healthy resolvers. Health only decides
+	// eligibility; it does not reorder healthy resolvers by RTT, so traffic
+	// keeps rotating instead of concentrating on the fastest endpoint.
+	order := make([]string, 0, len(resolvers))
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
 		if until := r.DNSCooldownUntil[resolver]; !until.IsZero() && now.Before(until) {
+			continue
+		}
+		order = append(order, resolver)
+	}
+
+	// Never return an empty ring while there is a cooled resolver available:
+	// choose the one with the earliest expiry as the final rescue attempt.
+	if len(order) == 0 {
+		var earliest string
+		var earliestUntil time.Time
+		for _, resolver := range resolvers {
+			until := r.DNSCooldownUntil[resolver]
+			if until.IsZero() || !now.Before(until) {
+				continue
+			}
 			if earliest == "" || until.Before(earliestUntil) {
 				earliest = resolver
 				earliestUntil = until
 			}
-			continue
 		}
-		st := r.DNSResolverStats[resolver]
-		var timeouts int
-		var rtt float64
-		if st != nil {
-			timeouts = st.Timeouts
-			rtt = st.RTTMs
+		if earliest != "" {
+			order = append(order, earliest)
 		}
-		attempts := 1
-		if st != nil && st.Attempts > 0 {
-			attempts = st.Attempts
-		}
-		ready = append(ready, item{
-			resolver:            resolver,
-			consecutiveFailures: r.DNSConsecutiveFailures[resolver],
-			timeoutRate:         float64(timeouts) / float64(attempts),
-			rtt:                 rtt,
-			idx:                 i,
-		})
-	}
-
-	// Health first, round-robin second. NXDOMAIN does not affect this ordering.
-	sort.SliceStable(ready, func(i, j int) bool {
-		if ready[i].consecutiveFailures != ready[j].consecutiveFailures {
-			return ready[i].consecutiveFailures < ready[j].consecutiveFailures
-		}
-		if ready[i].timeoutRate != ready[j].timeoutRate {
-			return ready[i].timeoutRate < ready[j].timeoutRate
-		}
-		if ready[i].rtt != ready[j].rtt {
-			return ready[i].rtt < ready[j].rtt
-		}
-		return ready[i].idx < ready[j].idx
-	})
-
-	order := make([]string, 0, len(ready)+1)
-	for _, it := range ready {
-		order = append(order, it.resolver)
-	}
-	if len(order) == 0 && earliest != "" {
-		order = append(order, earliest)
 	}
 	return order
 }
@@ -749,10 +719,8 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 			break
 		}
 	}
-	if !isTimeout {
-		if cooldown > 2*time.Second {
-			cooldown = 2 * time.Second
-		}
+	if !isTimeout && cooldown > 2*time.Second {
+		cooldown = 2 * time.Second
 	}
 	if cooldown > DNSCooldownMax {
 		cooldown = DNSCooldownMax
@@ -992,6 +960,7 @@ func dnsExchangeTCP(ctx context.Context, resolver, domain string, qtype uint16, 
 }
 
 func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
+	// Build the DNS message exactly once and reuse it for the UDP exchange.
 	msg, err := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
 	if err != nil {
 		return nil, err
@@ -1011,6 +980,41 @@ func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, 
 		return parseDNSPTRResponse(resp)
 	}
 	return parseDNSAResponse(resp)
+}
+
+func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecsPrefix int, rtCaches *RuntimeCaches) {
+	if len(resolvers) == 0 {
+		return
+	}
+	type result struct {
+		resolver string
+		err      error
+	}
+	results := make(chan result, len(resolvers))
+	var wg sync.WaitGroup
+	for _, resolver := range resolvers {
+		resolver := resolver
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			qctx, cancel := context.WithTimeout(ctx, DNSWarmupTimeout)
+			defer cancel()
+			started := time.Now()
+			ips, err := dnsExchangeUDP(qctx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
+			rtCaches.recordDNSResult(resolver, err, time.Since(started), len(ips))
+			results <- result{resolver: resolver, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	healthy := 0
+	for res := range results {
+		if res.err == nil {
+			healthy++
+		}
+	}
+	fmt.Printf("[DNS] Warm-up: %d/%d resolvers answered\n", healthy, len(resolvers))
 }
 
 func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
@@ -1048,6 +1052,7 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 			if tcpErr == nil {
 				ips, err = tcpIPs, nil
 			} else {
+				err = tcpErr
 				lastErr = tcpErr
 			}
 		}
@@ -1160,6 +1165,8 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		if err != nil && (errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)) {
 			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, timeout); tcpErr == nil {
 				names, err = tcpNames, nil
+			} else {
+				err = tcpErr
 			}
 		}
 		rtCaches.recordDNSResult(resolver, err, time.Since(started), 0)
@@ -1227,6 +1234,8 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 	endpoints := []string{
 		"https://dns.google/resolve",
 		"https://cloudflare-dns.com/dns-query",
+		"https://dns.mullvad.net/dns-query",
+		"https://freedns.controld.com/p0",
 	}
 	var lastErr error
 	for _, endpoint := range endpoints {
@@ -2778,12 +2787,11 @@ func RunStageC(
 		if workers <= 0 {
 			workers = 1
 		}
-		// Keep enough queue capacity to decouple the scheduler from slow provider rate limits.
-		// Stale work is still rejected by Execute() after a provider is disabled.
-		queueSize := providerLimits[p] * 2
-		minimumQueue := workers * 4
-		if queueSize < minimumQueue {
-			queueSize = minimumQueue
+		// Keep a bounded queue: enough to decouple scheduler/worker timing,
+		// but do not allocate huge per-provider buffers on large root sets.
+		queueSize := workers * 4
+		if queueSize > providerLimits[p] {
+			queueSize = providerLimits[p]
 		}
 		if queueSize < 4 {
 			queueSize = 4
@@ -3141,13 +3149,41 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	qValidPairs := s.DNSValidPairs
 
 	pTCP := s.TCPConnected
+	pTCPTimeouts := s.TCPTimeouts
+	pTCPRefused := s.TCPRefused
+	pTCPOther := s.TCPOtherErrs
 	pTLS := s.TLSHandshake
+	pTLSTimeouts := s.TLSTimeouts
+	pTLSHandshakeFailure := s.TLSHandshakeFailure
+	pTLSUnrecognizedName := s.TLSUnrecognizedName
+	pTLSReset := s.TLSConnectionReset
+	pTLSEOF := s.TLSEOF
+	pNoCert := s.NoPeerCertificates
+	pTLSValidation := s.TLSValidationFailures
+	pTLSOther := s.TLSOtherErrs
 	pH2 := s.H2ProtocolOK
+	pH2TimeoutNoFrames := s.H2TimeoutNoFrames
+	pH2Reset := s.H2ConnectionReset
+	pH2BrokenPipe := s.H2BrokenPipe
+	pH2BadRequest := s.H2BadRequest
+	pH2GoAway := s.H2GoAway
+	pH2EOF := s.H2EOF
+	pH2TLSAlerts := s.H2TLSAlerts
+	pH2Other := s.H2OtherErrs
+	pH2InvalidFrame := s.H2InvalidFrame
+	pH2BadContinuation := s.H2BadContinuation
+	pH2HPACKDecode := s.H2HPACKDecode
+	pH2MissingSettings := s.H2MissingSettings
+	pH2HeadersWithoutStatus := s.H2HeadersWithoutStatus
 	pH2Head := s.H2HeadersOK
+	pH2Timeouts := s.H2Timeouts
+	pH2HPACK := s.H2HPACKErrors
 	pStatus := s.H2StatusOK
+	pInvalidStatus := s.H2InvalidStatus
 	pFinal := s.CandidatesAccepted
 	pReality := s.RealityFeasibleCandidates
 	pLowScore := s.LowScoreCandidates
+	pH2NoALPN := s.H2NoALPN
 
 	localStats := make(map[string]ProviderStats)
 	for k, v := range s.ProviderStats {
@@ -3264,19 +3300,19 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 
 	fmt.Printf("\n[*] Анализ Stage E (Строгая Воронка):\n")
 	fmt.Printf("    1. Целей на входе (DNS):       %d\n", qValidPairs)
-	fmt.Printf("    2. Успешный TCP коннект:       %d (Потери: Timeouts=%d, Refused=%d, Other=%d)\n", pTCP, s.TCPTimeouts, s.TCPRefused, s.TCPOtherErrs)
+	fmt.Printf("    2. Успешный TCP коннект:       %d (Потери: Timeouts=%d, Refused=%d, Other=%d)\n", pTCP, pTCPTimeouts, pTCPRefused, pTCPOther)
 	fmt.Printf("    3. Успешный TLS хэндшейк:      %d (Потери: Timeouts=%d, HandshakeFail=%d, UnrecName=%d, ConnReset=%d, EOF=%d, NoCert=%d, CertFail=%d, Other=%d)\n",
-		pTLS, s.TLSTimeouts, s.TLSHandshakeFailure, s.TLSUnrecognizedName, s.TLSConnectionReset, s.TLSEOF, s.NoPeerCertificates, s.TLSValidationFailures, s.TLSOtherErrs)
+		pTLS, pTLSTimeouts, pTLSHandshakeFailure, pTLSUnrecognizedName, pTLSReset, pTLSEOF, pNoCert, pTLSValidation, pTLSOther)
 	fmt.Printf("    4. Подтверждён H2 протокол:    %d (Потери: TimeoutNoFrames=%d, ConnReset=%d, BrokenPipe=%d, BadRequest/HTTP1=%d, GoAway=%d, EOF=%d, TLSAlerts=%d, Other=%d)\n",
-		pH2, s.H2TimeoutNoFrames, s.H2ConnectionReset, s.H2BrokenPipe, s.H2BadRequest, s.H2GoAway, s.H2EOF, s.H2TLSAlerts, s.H2OtherErrs)
-	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", pH2Head, s.H2Timeouts, s.H2HPACKErrors)
-	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", pStatus, s.H2InvalidStatus)
+		pH2, pH2TimeoutNoFrames, pH2Reset, pH2BrokenPipe, pH2BadRequest, pH2GoAway, pH2EOF, pH2TLSAlerts, pH2Other)
+	fmt.Printf("    5. Получены H2 Headers:        %d (Потери: TimeoutsNoHeaders=%d, HPACK_Err=%d)\n", pH2Head, pH2Timeouts, pH2HPACK)
+	fmt.Printf("    6. Валидный HTTP Status:       %d (Потери: Invalid/Zero Status=%d)\n", pStatus, pInvalidStatus)
 	fmt.Printf("    7. Финальные Кандидаты:        %d (Score gate: отключён, LowScore=%d)\n", pFinal, pLowScore)
 	fmt.Printf("    8. После кластеризации по IP:  %d (оставлен лучший SNI на IP)\n", clustered)
 	fmt.Printf("    Reality-feasible из принятых:      %d\n", pReality)
-	fmt.Printf("    H2 причины Other: InvalidFrame=%d, BadContinuation=%d, HPACK=%d, MissingSettings=%d, HeadersWithoutStatus=%d\n", s.H2InvalidFrame, s.H2BadContinuation, s.H2HPACKDecode, s.H2MissingSettings, s.H2HeadersWithoutStatus)
+	fmt.Printf("    H2 причины Other: InvalidFrame=%d, BadContinuation=%d, HPACK=%d, MissingSettings=%d, HeadersWithoutStatus=%d\n", pH2InvalidFrame, pH2BadContinuation, pH2HPACKDecode, pH2MissingSettings, pH2HeadersWithoutStatus)
 	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
-	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", s.H2NoALPN)
+	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", pH2NoALPN)
 	fmt.Printf("    * Уникальных IP-кластеров:    %d (дедупликация финального списка по IP)\n", clustered)
 
 	fmt.Printf("\n[*] DNS resolver telemetry:\n")
@@ -3516,18 +3552,31 @@ func buildWindowUpdateFrame(streamID uint32, increment uint32) []byte {
 	return buildH2Frame(FrameWindowUpdate, 0, streamID, payload)
 }
 
-func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) {
+func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) error {
 	weakCount := 0
 	hasStatus := false
 
 	for _, h := range headers {
 		hName := strings.ToLower(strings.TrimSpace(h.Name))
 
+		if strings.HasPrefix(hName, ":") && hName != ":status" {
+			return fmt.Errorf("unexpected response pseudo-header %q", h.Name)
+		}
+
 		if hName == ":status" {
-			if n, err := strconv.Atoi(strings.TrimSpace(h.Value)); err == nil && n > 0 {
-				cand.HTTPStatus = n
+			if hasStatus {
+				return fmt.Errorf("duplicate :status header")
 			}
+			n, err := strconv.Atoi(strings.TrimSpace(h.Value))
+			if err != nil || n < 100 || n > 599 {
+				return fmt.Errorf("invalid :status value %q", h.Value)
+			}
+			cand.HTTPStatus = n
 			hasStatus = true
+			if n >= 100 && n < 200 {
+				// Informational response: keep reading until the final response HEADERS.
+				continue
+			}
 			continue
 		}
 
@@ -3566,19 +3615,24 @@ func parseResponseHeaders(cand *Candidate, headers []hpack.HeaderField) {
 		}
 	}
 
-	if !hasStatus {
-		cand.MissingStatus = true
-	}
-
+	cand.MissingStatus = !hasStatus
 	if cand.CDNStatus == CDNStatusUnknown && weakCount > 0 {
 		cand.CDNStatus = CDNLikely
 	}
-
-	cand.ResponseHeadersParsed = true
+	if cand.HTTPStatus >= 200 {
+		cand.ResponseHeadersParsed = true
+	}
+	return nil
 }
 
-func parseTrailers(cand *Candidate, headers []hpack.HeaderField) {
+func parseTrailers(cand *Candidate, headers []hpack.HeaderField) error {
 	cand.ResponseTrailersSeen = true
+	for _, h := range headers {
+		if strings.HasPrefix(strings.TrimSpace(h.Name), ":") {
+			return fmt.Errorf("pseudo-header %q found in trailers", h.Name)
+		}
+	}
+	return nil
 }
 
 type ProbeStage int
@@ -3758,13 +3812,33 @@ ReadLoop:
 			if expectingContinuation && frameType != FrameContinuation {
 				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2: expected CONTINUATION, got frame type %d", frameType)}
 			}
+			if !expectingContinuation && frameType == FrameContinuation {
+				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("unexpected CONTINUATION frame")}
+			}
+
+			switch frameType {
+			case FrameSettings, FrameGoAway, FrameWindowUpdate:
+				if streamID != 0 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
+				}
+			case FrameHeaders, FrameData, FrameRSTStream, FrameContinuation:
+				if streamID == 0 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use non-zero stream", frameType)}
+				}
+			}
 
 			switch frameType {
 			case FrameSettings:
 				if length%6 != 0 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length: %d", length)}
 				}
+				if flags&^FlagAck != 0 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS flags: 0x%x", flags)}
+				}
 				if flags&FlagAck != 0 {
+					if length != 0 {
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("SETTINGS ACK with non-zero payload")}
+					}
 					cand.H2SettingsAckReceived = true
 					cand.SettingsAckCount++
 					break
@@ -3774,21 +3848,34 @@ ReadLoop:
 				if cand.H2SettingsReceived {
 					prof = cand.LatestPeerSettings
 				}
+				seenSettings := make(map[uint16]bool)
 				for i := 0; i+6 <= int(length); i += 6 {
 					id := binary.BigEndian.Uint16(payload[i : i+2])
 					val := binary.BigEndian.Uint32(payload[i+2 : i+6])
+					if seenSettings[id] {
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("duplicate SETTINGS identifier: %d", id)}
+					}
+					seenSettings[id] = true
 					switch id {
 					case 1:
 						prof.HeaderTableSize = val
 						prof.HasHeaderTableSize = true
 						decoder.SetMaxDynamicTableSize(val)
+					case 2:
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("server sent SETTINGS_ENABLE_PUSH")}
 					case 3:
 						prof.MaxConcurrentStreams = val
 						prof.HasMaxConcurrentStreams = true
 					case 4:
+						if val > 0x7fffffff {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid INITIAL_WINDOW_SIZE: %d", val)}
+						}
 						prof.InitialWindowSize = val
 						prof.HasInitialWindowSize = true
 					case 5:
+						if val < 16384 || val > 16777215 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid MAX_FRAME_SIZE: %d", val)}
+						}
 						prof.MaxFrameSize = val
 						prof.HasMaxFrameSize = true
 					case 6:
@@ -3807,7 +3894,9 @@ ReadLoop:
 					}
 					cand.LatestPeerSettings = prof
 				}
-				_ = writeH2(uConn, buildH2Frame(FrameSettings, FlagAck, 0, nil), wTo)
+				if err := writeH2(uConn, buildH2Frame(FrameSettings, FlagAck, 0, nil), wTo); err != nil {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
+				}
 				cand.H2SettingsAckSent = true
 
 			case FrameHeaders:
@@ -3818,15 +3907,21 @@ ReadLoop:
 					}
 					actualPayload := payload
 					padLen := 0
-					if flags&FlagPadded != 0 && len(actualPayload) > 0 {
+					if flags&FlagPadded != 0 {
+						if len(actualPayload) < 1 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED HEADERS payload too short")}
+						}
 						padLen = int(actualPayload[0])
 						actualPayload = actualPayload[1:]
 					}
-					if flags&FlagPriority != 0 && len(actualPayload) >= 5 {
+					if flags&FlagPriority != 0 {
+						if len(actualPayload) < 5 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PRIORITY HEADERS payload too short")}
+						}
 						actualPayload = actualPayload[5:]
 					}
 					if padLen > len(actualPayload) {
-						padLen = len(actualPayload)
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("HEADERS padding exceeds payload")}
 					}
 					actualPayload = actualPayload[:len(actualPayload)-padLen]
 
@@ -3846,15 +3941,20 @@ ReadLoop:
 						}
 
 						if !cand.ResponseHeadersParsed && !isTrailers {
-							parseResponseHeaders(cand, headers)
+							if errHeaders := parseResponseHeaders(cand, headers); errHeaders != nil {
+								return cand, &ProbeError{Stage: ProbeStageH2, Err: errHeaders}
+							}
 							headerBlocks.Reset()
 
-							cand.Timings.H2Headers = time.Since(requestSent)
-							cand.H2HeadersReceived = true
-
-							break ReadLoop
+							if cand.ResponseHeadersParsed {
+								cand.Timings.H2Headers = time.Since(requestSent)
+								cand.H2HeadersReceived = true
+								break ReadLoop
+							}
 						} else if isTrailers {
-							parseTrailers(cand, headers)
+							if errTrailers := parseTrailers(cand, headers); errTrailers != nil {
+								return cand, &ProbeError{Stage: ProbeStageH2, Err: errTrailers}
+							}
 						}
 						headerBlocks.Reset()
 					}
@@ -3873,15 +3973,20 @@ ReadLoop:
 					}
 
 					if !cand.ResponseHeadersParsed {
-						parseResponseHeaders(cand, headers)
+						if errHeaders := parseResponseHeaders(cand, headers); errHeaders != nil {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: errHeaders}
+						}
 						headerBlocks.Reset()
 
-						cand.Timings.H2Headers = time.Since(requestSent)
-						cand.H2HeadersReceived = true
-
-						break ReadLoop
+						if cand.ResponseHeadersParsed {
+							cand.Timings.H2Headers = time.Since(requestSent)
+							cand.H2HeadersReceived = true
+							break ReadLoop
+						}
 					} else {
-						parseTrailers(cand, headers)
+						if errTrailers := parseTrailers(cand, headers); errTrailers != nil {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: errTrailers}
+						}
 					}
 					headerBlocks.Reset()
 				}
@@ -3893,28 +3998,48 @@ ReadLoop:
 					}
 					actualPayload := payload
 					padLen := 0
-					if flags&FlagPadded != 0 && len(actualPayload) > 0 {
+					if flags&FlagPadded != 0 {
+						if len(actualPayload) < 1 {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED DATA payload too short")}
+						}
 						padLen = int(actualPayload[0])
 						actualPayload = actualPayload[1:]
 					}
 					if padLen > len(actualPayload) {
-						padLen = len(actualPayload)
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("DATA padding exceeds payload")}
 					}
 					actualPayload = actualPayload[:len(actualPayload)-padLen]
 
 					cand.BodyBytes += len(actualPayload)
 					inc := length
 					if inc > 0 {
-						_ = writeH2(uConn, buildWindowUpdateFrame(1, inc), wTo)
-						_ = writeH2(uConn, buildWindowUpdateFrame(0, inc), wTo)
+						if err := writeH2(uConn, buildWindowUpdateFrame(1, inc), wTo); err != nil {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
+						}
+						if err := writeH2(uConn, buildWindowUpdateFrame(0, inc), wTo); err != nil {
+							return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
+						}
 					}
 				}
+			case FrameWindowUpdate:
+				if length != 4 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid WINDOW_UPDATE length: %d", length)}
+				}
+				if binary.BigEndian.Uint32(payload)&0x7fffffff == 0 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("WINDOW_UPDATE increment is zero")}
+				}
 			case FrameRSTStream:
+				if length != 4 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid RST_STREAM length: %d", length)}
+				}
 				if streamID == 1 {
 					cand.StreamReset = true
 					break ReadLoop
 				}
 			case FrameGoAway:
+				if length < 8 {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid GOAWAY length: %d", length)}
+				}
 				cand.GoAwaySeen = true
 			}
 
@@ -4138,6 +4263,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 	ds := NewDiscoveryState()
 	rtCaches := NewRuntimeCaches()
+	warmDNSResolvers(ctx, cfg.DNSResolvers, cfg.ECSIP, cfg.ECSPrefix, rtCaches)
 
 	for _, d := range cfg.Domains {
 		if cleaned := CleanDomain(d); cleaned != "" {
