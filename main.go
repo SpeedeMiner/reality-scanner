@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	mdns "github.com/miekg/dns"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/publicsuffix"
@@ -76,6 +77,9 @@ const (
 	DNSMaxAttemptsPTR      = 6
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
+	MaxPairEvidenceEntries = LimitValidPairs * 8
+	MaxH2BufferedBytes     = 9 + 16384
+	MaxH2HeaderBlockBytes  = 64 * 1024
 	// Broad anycast/public DNS fallback set. Keep a mix of independent operators:
 	// Cloudflare, Google, Quad9, OpenDNS, AdGuard and DNS.WATCH.
 	DefaultDNSResolvers = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,208.67.222.222,208.67.220.220,94.140.14.140,94.140.14.141,84.200.69.80,84.200.70.40,77.88.8.8,77.88.8.1,9.9.9.10,149.112.112.10"
@@ -213,6 +217,7 @@ type DiscoveryState struct {
 	domainsCount                int
 	droppedDomainsByGlobalLimit int
 	droppedValidPairs           int
+	droppedPairEvidence         int
 }
 
 func NewDiscoveryState() *DiscoveryState {
@@ -256,6 +261,10 @@ func (s *DiscoveryState) AddPairSource(ip, d string, src DomainSource) {
 	}
 
 	key := ip + "\x00" + d
+	if _, exists := s.pairEvidence[key]; !exists && len(s.pairEvidence) >= MaxPairEvidenceEntries {
+		s.droppedPairEvidence++
+		return
+	}
 	evP := s.pairEvidence[key]
 	evP.Direct |= src
 	s.pairEvidence[key] = evP
@@ -847,359 +856,128 @@ func normalizeDNSResolvers(values []string) []string {
 	return out
 }
 
-func randomDNSID() uint16 {
-	uaMu.Lock()
-	defer uaMu.Unlock()
-	if uaRng == nil {
-		uaRng = rand.New(rand.NewSource(time.Now().UnixNano()))
+func buildMiekgDNSMessage(domain string, qtype uint16, ecsIP string, ecsPrefix int) (*mdns.Msg, error) {
+	m := new(mdns.Msg)
+	m.SetQuestion(mdns.Fqdn(domain), qtype)
+	m.RecursionDesired = true
+	// Keep UDP payload conservative; fall back to TCP on truncation.
+	m.SetEdns0(1232, true)
+	if qtype == mdns.TypeA && ecsIP != "" {
+		ip := net.ParseIP(ecsIP)
+		if ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("invalid ECS IPv4: %q", ecsIP)
+		}
+		if ecsPrefix < 0 || ecsPrefix > 32 {
+			return nil, fmt.Errorf("invalid ECS IPv4 prefix length: %d", ecsPrefix)
+		}
+		ip4 := ip.To4()
+		subnet := &mdns.EDNS0_SUBNET{
+			Code:          mdns.EDNS0SUBNET,
+			Family:        1,
+			SourceNetmask: uint8(ecsPrefix),
+			SourceScope:   0,
+			Address:       ip4,
+		}
+		opt := m.IsEdns0()
+		if opt == nil {
+			return nil, fmt.Errorf("failed to create EDNS0 OPT")
+		}
+		opt.Option = append(opt.Option, subnet)
 	}
-	return uint16(uaRng.Intn(1 << 16))
+	return m, nil
 }
 
-func encodeDNSName(name string) ([]byte, error) {
-	name = strings.TrimSuffix(strings.TrimSpace(name), ".")
-	if name == "" {
-		return []byte{0}, nil
+func parseDNSAResponse(msg *mdns.Msg) ([]string, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("nil DNS response")
 	}
-	var out []byte
-	for _, label := range strings.Split(name, ".") {
-		if label == "" || len(label) > 63 {
-			return nil, fmt.Errorf("invalid DNS label in %q", name)
-		}
-		if len(out)+1+len(label)+1 > 255 {
-			return nil, fmt.Errorf("DNS name too long: %q", name)
-		}
-		out = append(out, byte(len(label)))
-		out = append(out, label...)
-	}
-	out = append(out, 0)
-	return out, nil
-}
-
-func buildECSOption(clientIP string, prefixLen int) ([]byte, error) {
-	ip := net.ParseIP(clientIP)
-	if ip == nil || ip.To4() == nil {
-		return nil, fmt.Errorf("invalid ECS IPv4: %q", clientIP)
-	}
-	if prefixLen < 0 || prefixLen > 32 {
-		return nil, fmt.Errorf("invalid ECS IPv4 prefix length: %d", prefixLen)
-	}
-	ip4 := append([]byte(nil), ip.To4()...)
-	usedBytes := (prefixLen + 7) / 8
-	if usedBytes > 0 && prefixLen%8 != 0 {
-		ip4[usedBytes-1] &= byte(0xFF << uint(8-(prefixLen%8)))
-	}
-	ip4 = ip4[:usedBytes]
-
-	payloadLen := 4 + len(ip4)
-	option := make([]byte, 4+payloadLen)
-	binary.BigEndian.PutUint16(option[0:2], 8)
-	binary.BigEndian.PutUint16(option[2:4], uint16(payloadLen))
-	binary.BigEndian.PutUint16(option[4:6], 1) // IPv4
-	option[6] = byte(prefixLen)
-	option[7] = 0 // scope
-	copy(option[8:], ip4)
-	return option, nil
-}
-
-func buildDNSQuery(domain string, qtype uint16, ecsIP string, ecsPrefix int) ([]byte, uint16, error) {
-	name, err := encodeDNSName(domain)
-	if err != nil {
-		return nil, 0, err
-	}
-	id := randomDNSID()
-
-	buf := make([]byte, 12)
-	binary.BigEndian.PutUint16(buf[0:2], id)
-	binary.BigEndian.PutUint16(buf[2:4], 0x0100) // RD
-	binary.BigEndian.PutUint16(buf[4:6], 1)      // QDCOUNT
-
-	buf = append(buf, name...)
-	buf = append(buf, byte(qtype>>8), byte(qtype))
-	buf = append(buf, 0x00, 0x01) // IN
-
-	// A lookups use ECS. PTR lookups intentionally do not.
-	if qtype == 1 {
-		ecs, err := buildECSOption(ecsIP, ecsPrefix)
-		if err != nil {
-			return nil, 0, err
-		}
-		binary.BigEndian.PutUint16(buf[10:12], 1) // ARCOUNT
-		opt := make([]byte, 11)
-		binary.BigEndian.PutUint16(opt[1:3], 41)
-		binary.BigEndian.PutUint16(opt[3:5], 1232)
-		binary.BigEndian.PutUint16(opt[9:11], uint16(len(ecs)))
-		buf = append(buf, opt...)
-		buf = append(buf, ecs...)
-	}
-	return buf, id, nil
-}
-
-func readDNSName(msg []byte, off int) (string, int, error) {
-	if off < 0 || off >= len(msg) {
-		return "", off, fmt.Errorf("DNS name offset out of bounds")
-	}
-	var labels []string
-	pos := off
-	jumped := false
-	returnPos := off
-	jumps := 0
-	for {
-		if pos >= len(msg) {
-			return "", off, fmt.Errorf("DNS name truncated")
-		}
-		l := msg[pos]
-		if l == 0 {
-			pos++
-			if !jumped {
-				returnPos = pos
-			}
-			return strings.Join(labels, "."), returnPos, nil
-		}
-		if l&0xC0 == 0xC0 {
-			if pos+1 >= len(msg) {
-				return "", off, fmt.Errorf("DNS compression pointer truncated")
-			}
-			ptr := int(l&0x3F)<<8 | int(msg[pos+1])
-			if ptr >= len(msg) {
-				return "", off, fmt.Errorf("DNS compression pointer out of bounds")
-			}
-			if !jumped {
-				returnPos = pos + 2
-				jumped = true
-			}
-			pos = ptr
-			jumps++
-			if jumps > 32 {
-				return "", off, fmt.Errorf("DNS compression loop")
-			}
-			continue
-		}
-		if l > 63 {
-			return "", off, fmt.Errorf("invalid DNS label length")
-		}
-		pos++
-		if pos+int(l) > len(msg) {
-			return "", off, fmt.Errorf("DNS label truncated")
-		}
-		labels = append(labels, string(msg[pos:pos+int(l)]))
-		pos += int(l)
-		if !jumped {
-			returnPos = pos
-		}
-	}
-}
-
-func dnsRcode(msg []byte, wantID uint16) (int, int, int, int, int, error) {
-	if len(msg) < 12 {
-		return 0, 0, 0, 0, 0, fmt.Errorf("short DNS response")
-	}
-	id := binary.BigEndian.Uint16(msg[0:2])
-	if id != wantID {
-		return 0, 0, 0, 0, 0, fmt.Errorf("DNS transaction ID mismatch")
-	}
-	flags := binary.BigEndian.Uint16(msg[2:4])
-	if flags&0x8000 == 0 {
-		return 0, 0, 0, 0, 0, fmt.Errorf("not a DNS response")
-	}
-	return int(flags & 0x000F),
-		int(binary.BigEndian.Uint16(msg[4:6])),
-		int(binary.BigEndian.Uint16(msg[6:8])),
-		int(binary.BigEndian.Uint16(msg[8:10])),
-		int(binary.BigEndian.Uint16(msg[10:12])),
-		nil
-}
-
-func parseDNSAResponse(msg []byte, wantID uint16) ([]string, error) {
-	rcode, qd, an, ns, ar, err := dnsRcode(msg, wantID)
-	if err != nil {
-		return nil, err
-	}
-	if rcode == 3 {
+	if msg.Rcode == mdns.RcodeNameError {
 		return nil, ErrDNSNXDomain
 	}
-	if rcode != 0 {
-		return nil, fmt.Errorf("DNS server returned RCODE=%d", rcode)
+	if msg.Rcode != mdns.RcodeSuccess {
+		return nil, fmt.Errorf("DNS server returned RCODE=%s", mdns.RcodeToString[msg.Rcode])
 	}
-	off := 12
-	for i := 0; i < qd; i++ {
-		_, next, err := readDNSName(msg, off)
-		if err != nil {
-			return nil, err
+	ips := make([]string, 0, len(msg.Answer))
+	for _, rr := range msg.Answer {
+		a, ok := rr.(*mdns.A)
+		if !ok || a == nil || a.A == nil {
+			continue
 		}
-		off = next
-		if off+4 > len(msg) {
-			return nil, fmt.Errorf("truncated DNS question")
-		}
-		off += 4
-	}
-	var ips []string
-	parseRR := func() error {
-		_, next, err := readDNSName(msg, off)
-		if err != nil {
-			return err
-		}
-		off = next
-		if off+10 > len(msg) {
-			return fmt.Errorf("truncated DNS RR header")
-		}
-		qtype := binary.BigEndian.Uint16(msg[off : off+2])
-		qclass := binary.BigEndian.Uint16(msg[off+2 : off+4])
-		rdlen := int(binary.BigEndian.Uint16(msg[off+8 : off+10]))
-		off += 10
-		if off+rdlen > len(msg) {
-			return fmt.Errorf("truncated DNS RDATA")
-		}
-		if qtype == 1 && qclass == 1 && rdlen == 4 {
-			ips = append(ips, net.IPv4(msg[off], msg[off+1], msg[off+2], msg[off+3]).String())
-		}
-		off += rdlen
-		return nil
-	}
-	for i := 0; i < an+ns+ar; i++ {
-		if err := parseRR(); err != nil {
-			return nil, err
+		ip := a.A.To4()
+		if ip != nil {
+			ips = append(ips, ip.String())
 		}
 	}
 	return uniqueStrings(ips), nil
 }
 
-func parseDNSPTRResponse(msg []byte, wantID uint16) ([]string, error) {
-	rcode, qd, an, ns, ar, err := dnsRcode(msg, wantID)
-	if err != nil {
-		return nil, err
+func parseDNSPTRResponse(msg *mdns.Msg) ([]string, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("nil DNS response")
 	}
-	if rcode == 3 {
+	if msg.Rcode == mdns.RcodeNameError {
 		return nil, ErrDNSNXDomain
 	}
-	if rcode != 0 {
-		return nil, fmt.Errorf("DNS server returned RCODE=%d", rcode)
+	if msg.Rcode != mdns.RcodeSuccess {
+		return nil, fmt.Errorf("DNS server returned RCODE=%s", mdns.RcodeToString[msg.Rcode])
 	}
-	off := 12
-	for i := 0; i < qd; i++ {
-		_, next, err := readDNSName(msg, off)
-		if err != nil {
-			return nil, err
+	names := make([]string, 0, len(msg.Answer))
+	for _, rr := range msg.Answer {
+		ptr, ok := rr.(*mdns.PTR)
+		if !ok || ptr == nil {
+			continue
 		}
-		off = next
-		if off+4 > len(msg) {
-			return nil, fmt.Errorf("truncated DNS question")
-		}
-		off += 4
-	}
-	var names []string
-	parseRR := func() error {
-		_, next, err := readDNSName(msg, off)
-		if err != nil {
-			return err
-		}
-		off = next
-		if off+10 > len(msg) {
-			return fmt.Errorf("truncated DNS RR header")
-		}
-		qtype := binary.BigEndian.Uint16(msg[off : off+2])
-		qclass := binary.BigEndian.Uint16(msg[off+2 : off+4])
-		rdlen := int(binary.BigEndian.Uint16(msg[off+8 : off+10]))
-		off += 10
-		if off+rdlen > len(msg) {
-			return fmt.Errorf("truncated DNS RDATA")
-		}
-		if qtype == 12 && qclass == 1 {
-			name, _, err := readDNSName(msg, off)
-			if err != nil {
-				return err
-			}
-			if d := CleanDomain(name); d != "" {
-				names = append(names, d)
-			}
-		}
-		off += rdlen
-		return nil
-	}
-	for i := 0; i < an+ns+ar; i++ {
-		if err := parseRR(); err != nil {
-			return nil, err
+		if d := CleanDomain(ptr.Ptr); d != "" {
+			names = append(names, d)
 		}
 	}
 	return uniqueStrings(names), nil
 }
 
+func dnsExchange(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration, network string) ([]string, error) {
+	msg, err := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
+	if err != nil {
+		return nil, err
+	}
+	client := &mdns.Client{Net: network, Timeout: timeout}
+	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(resolver, "53"))
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nil DNS response")
+	}
+	if qtype == mdns.TypePTR {
+		return parseDNSPTRResponse(resp)
+	}
+	return parseDNSAResponse(resp)
+}
+
 func dnsExchangeTCP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
-	query, id, err := buildDNSQuery(domain, qtype, ecsIP, ecsPrefix)
-	if err != nil {
-		return nil, err
-	}
-	addr := net.JoinHostPort(resolver, "53")
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	deadline := time.Now().Add(timeout)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-		deadline = dl
-	}
-	_ = conn.SetDeadline(deadline)
-	frame := make([]byte, 2+len(query))
-	binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
-	copy(frame[2:], query)
-	if _, err := conn.Write(frame); err != nil {
-		return nil, err
-	}
-	var hdr [2]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-		return nil, err
-	}
-	length := int(binary.BigEndian.Uint16(hdr[:]))
-	if length < 12 || length > 65535 {
-		return nil, fmt.Errorf("invalid TCP DNS response length: %d", length)
-	}
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, err
-	}
-	if qtype == 12 {
-		return parseDNSPTRResponse(buf, id)
-	}
-	return parseDNSAResponse(buf, id)
+	return dnsExchange(ctx, resolver, domain, qtype, ecsIP, ecsPrefix, timeout, "tcp")
 }
 
 func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
-	query, id, err := buildDNSQuery(domain, qtype, ecsIP, ecsPrefix)
+	_, err := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
 	if err != nil {
 		return nil, err
 	}
-	addr := net.JoinHostPort(resolver, "53")
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "udp", addr)
+	msg, _ := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
+	client := &mdns.Client{Net: "udp", Timeout: timeout}
+	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(resolver, "53"))
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	deadline := time.Now().Add(timeout)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-		deadline = dl
+	if resp == nil {
+		return nil, fmt.Errorf("nil DNS response")
 	}
-	_ = conn.SetDeadline(deadline)
-	if _, err := conn.Write(query); err != nil {
-		return nil, err
+	if resp.Truncated {
+		return nil, ErrDNSTruncated
 	}
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
+	if qtype == mdns.TypePTR {
+		return parseDNSPTRResponse(resp)
 	}
-	if n >= 4 {
-		flags := binary.BigEndian.Uint16(buf[2:4])
-		if flags&0x0200 != 0 {
-			return nil, ErrDNSTruncated
-		}
-	}
-	if qtype == 12 {
-		return parseDNSPTRResponse(buf[:n], id)
-	}
-	return parseDNSAResponse(buf[:n], id)
+	return parseDNSAResponse(resp)
 }
 
 func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
@@ -3277,6 +3055,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	ds.mu.RLock()
 	droppedGlobal := ds.droppedDomainsByGlobalLimit
 	droppedPairs := ds.droppedValidPairs
+	droppedEvidence := ds.droppedPairEvidence
 	ds.mu.RUnlock()
 
 	fmt.Println("\n===================================================================================================================")
@@ -3377,6 +3156,9 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", qValidPairs)
 	if droppedPairs > 0 {
 		fmt.Printf("[!] DNS-пар отброшено лимитом (LimitValidPairs=%d): %d\n", LimitValidPairs, droppedPairs)
+	}
+	if droppedEvidence > 0 {
+		fmt.Printf("[!] Pair evidence отброшено memory safety лимитом (MaxPairEvidenceEntries=%d): %d\n", MaxPairEvidenceEntries, droppedEvidence)
 	}
 
 	fmt.Printf("\n[*] Анализ Stage E (Строгая Воронка):\n")
@@ -3844,13 +3626,16 @@ ReadLoop:
 		n, err := uConn.Read(buf)
 		if n > 0 {
 			recvBuf.Write(buf[:n])
+			if recvBuf.Len() > MaxH2BufferedBytes {
+				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("H2 receive buffer exceeded %d bytes", MaxH2BufferedBytes)}
+			}
 		}
 
 		for recvBuf.Len() >= 9 {
 			data := recvBuf.Bytes()
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
 			if length > maxInboundFrameSize {
-				break ReadLoop
+				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("inbound frame exceeds limit: %d", length)}
 			}
 			if uint32(recvBuf.Len()) < 9+length {
 				break
@@ -3864,6 +3649,10 @@ ReadLoop:
 			streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
 			payload := data[9 : 9+length]
 			recvBuf.Next(int(9 + length))
+
+			if !firstFrameSeen && frameType != FrameSettings {
+				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2 connection preface sequence: first server frame is type %d, want SETTINGS", frameType)}
+			}
 
 			if expectingContinuation && frameType != FrameContinuation {
 				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2: expected CONTINUATION, got frame type %d", frameType)}
@@ -3941,6 +3730,9 @@ ReadLoop:
 					actualPayload = actualPayload[:len(actualPayload)-padLen]
 
 					headerBlocks.Write(actualPayload)
+					if headerBlocks.Len() > MaxH2HeaderBlockBytes {
+						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("H2 header block exceeded %d bytes", MaxH2HeaderBlockBytes)}
+					}
 					if (flags & FlagEndHeaders) == 0 {
 						expectingContinuation = true
 						activeStreamID = streamID
@@ -4031,9 +3823,16 @@ ReadLoop:
 		}
 
 		if err != nil {
-			if cand.H2ProtocolConfirmed {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				cand.ReadTimeout = true
+				if !cand.H2ProtocolConfirmed {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("H2 read timeout before protocol confirmation: %w", err)}
+				}
 				break ReadLoop
+			}
+			if errors.Is(err, io.EOF) {
+				return cand, &ProbeError{Stage: ProbeStageH2, Err: io.EOF}
 			}
 			return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 		}
@@ -4701,6 +4500,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 				pipeStats.mu.Lock()
 				pipeStats.CandidatesAccepted++
+				if cand.RealityFeasible {
+					pipeStats.RealityFeasibleCandidates++
+				}
 				pipeStats.mu.Unlock()
 
 				candMu.Lock()
@@ -4801,6 +4603,39 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 // ================= API HELPERS (ACTIVE-SCANNER STYLE) =================
 
+func isUsableGlobalIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() || ip4.IsPrivate() || ip4.IsUnspecified() {
+		return false
+	}
+	// Exclude multicast/reserved ranges that can appear on unusual hosts.
+	v := binary.BigEndian.Uint32(ip4)
+	if v >= 0xE0000000 || v == 0xFFFFFFFF {
+		return false
+	}
+	return true
+}
+
+func getLocalGlobalIPv4() (string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch a := addr.(type) {
+		case *net.IPNet:
+			ip = a.IP
+		case *net.IPAddr:
+			ip = a.IP
+		}
+		if isUsableGlobalIPv4(ip) {
+			return ip.To4().String(), nil
+		}
+	}
+	return "", fmt.Errorf("no usable global IPv4 found on local interfaces")
+}
+
 func getPublicIP(targetIP string) (string, error) {
 	if strings.TrimSpace(targetIP) != "" {
 		ip := net.ParseIP(strings.TrimSpace(targetIP))
@@ -4809,6 +4644,7 @@ func getPublicIP(targetIP string) (string, error) {
 		}
 		return ip.To4().String(), nil
 	}
+
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, endpoint := range []string{
 		"https://api.ipify.org",
@@ -4826,11 +4662,17 @@ func getPublicIP(targetIP string) (string, error) {
 			continue
 		}
 		ip := net.ParseIP(strings.TrimSpace(string(body)))
-		if ip != nil && ip.To4() != nil {
+		if isUsableGlobalIPv4(ip) {
 			return ip.To4().String(), nil
 		}
 	}
-	return "", fmt.Errorf("could not determine public IPv4")
+
+	// Last resort for VPS/local execution: use a globally routable IPv4
+	// already assigned to a local interface, without depending on an external API.
+	if ip, err := getLocalGlobalIPv4(); err == nil {
+		return ip, nil
+	}
+	return "", fmt.Errorf("could not determine public IPv4 from external services or local interfaces")
 }
 
 func getPrefixes(asn string) []string {
