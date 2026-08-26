@@ -57,7 +57,7 @@ const (
 	LimitValidPairs      = 10000
 
 	providerMaxAttempts    = 3
-	providerCBThreshold    = 10
+	providerCBThreshold    = 3
 	providerCBCooldown     = 2 * time.Minute
 	provider429CBCooldown  = 5 * time.Minute
 	providerBackoffInitial = 1 * time.Second
@@ -1817,18 +1817,20 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 				if providerShouldDisableForRun(err) {
 					r.mu.Lock()
 					r.disabled = true
-					r.disableReason = err.Error()
+					r.disableReason = fmt.Sprintf("disabled for run: %v", err)
+					r.cbUntil = time.Time{}
 					r.mu.Unlock()
 				} else {
-					cooldown, hardBlock := providerCooldown(err)
+					// Transient transport/server failures are retried only a few times.
+					// Once the provider has failed repeatedly in this run, disable it
+					// for the remainder of the run instead of keeping a long cooldown
+					// window that only creates Deferred roots.
 					r.mu.Lock()
-					if hardBlock {
-						r.cbUntil = time.Now().Add(cooldown)
-					} else {
-						r.cbFailures++
-						if r.cbFailures >= providerCBThreshold {
-							r.cbUntil = time.Now().Add(providerCBCooldown)
-						}
+					r.cbFailures++
+					if r.cbFailures >= providerCBThreshold {
+						r.disabled = true
+						r.disableReason = fmt.Sprintf("disabled for run after %d transient failures: %v", r.cbFailures, err)
+						r.cbUntil = time.Time{}
 					}
 					r.mu.Unlock()
 				}
