@@ -2883,16 +2883,43 @@ func RunStageC(
 		if workers <= 0 {
 			workers = 1
 		}
-		// Keep a bounded queue: enough to decouple scheduler/worker timing,
-		// but do not allocate huge per-provider buffers on large root sets.
+		// Keep the provider queue small. Stage-C scheduling never performs a
+		// blocking send anymore; excess jobs stay in pendingJobs and are flushed
+		// by the scheduler as workers free capacity.
 		queueSize := workers * 4
-		if queueSize > providerLimits[p] {
-			queueSize = providerLimits[p]
-		}
 		if queueSize < 4 {
 			queueSize = 4
 		}
+		if queueSize > providerLimits[p] {
+			queueSize = providerLimits[p]
+		}
 		jobQueues[p] = make(chan RootJob, queueSize)
+	}
+
+	// Pending jobs decouple the Stage-C dispatcher from provider workers. A
+	// provider can be stuck in its own HTTP call without blocking the global
+	// scheduler while another provider continues to make progress.
+	pendingJobs := make(map[*ProviderRunner][]RootJob, len(providers))
+	for _, p := range providers {
+		pendingJobs[p] = nil
+	}
+
+	flushPending := func() {
+		for _, p := range providers {
+			q := jobQueues[p]
+			pending := pendingJobs[p]
+			for len(pending) > 0 {
+				select {
+				case q <- pending[0]:
+					pending = pending[1:]
+				default:
+					pendingJobs[p] = pending
+					goto nextProvider
+				}
+			}
+			pendingJobs[p] = pending
+		nextProvider:
+		}
 	}
 
 	type stageResult struct {
@@ -3041,6 +3068,9 @@ func RunStageC(
 			if providerUsed[p] >= providerLimits[p]*2 {
 				continue
 			}
+			if ctx.Err() != nil {
+				return false
+			}
 
 			scheduled[root.Domain][p] = true
 			providerUsed[p]++
@@ -3049,14 +3079,10 @@ func RunStageC(
 				Ctx:    rootCtx[root.Domain],
 				Cancel: rootCancel[root.Domain],
 			}
-			select {
-			case jobQueues[p] <- job:
-				return true
-			case <-ctx.Done():
-				delete(scheduled[root.Domain], p)
-				providerUsed[p]--
-				return false
-			}
+			// Non-blocking enqueue: the scheduler records the job as in-flight
+			// and flushes it later when the worker queue has capacity.
+			pendingJobs[p] = append(pendingJobs[p], job)
+			return true
 		}
 		return false
 	}
@@ -3117,8 +3143,12 @@ func RunStageC(
 		return nil, openFound
 	}
 
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
 SchedulerLoop:
 	for inFlight > 0 {
+		flushPending()
 		select {
 		case <-ctx.Done():
 			for _, root := range roots {
@@ -3128,6 +3158,9 @@ SchedulerLoop:
 			}
 			break SchedulerLoop
 
+		case <-ticker.C:
+			// Retry only queue admission; no provider call is started by the ticker.
+			flushPending()
 		case item := <-resultsCh:
 			inFlight--
 
@@ -3206,14 +3239,16 @@ SchedulerLoop:
 				Ctx:    rootCtx[root.Domain],
 				Cancel: rootCancel[root.Domain],
 			}
-			select {
-			case jobQueues[nextP] <- job:
-				inFlight++
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				markCanceled(root.Domain)
+				continue
 			}
+			pendingJobs[nextP] = append(pendingJobs[nextP], job)
+			inFlight++
 		}
 	}
+
+	flushPending()
 
 	for _, root := range roots {
 		if cancel, ok := rootCancel[root.Domain]; ok {
@@ -4753,6 +4788,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 
 				if cand == nil || !cand.H2ProtocolConfirmed {
 					pipeStats.mu.Unlock()
+					// incH2Reason owns the H2OtherErrs increment. Do not increment
+					// H2OtherErrs separately here or telemetry will double-count.
 					pipeStats.incH2Reason("missing-settings")
 					continue
 				}
