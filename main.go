@@ -71,8 +71,8 @@ const (
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
 	PTRQueryTimeoutDefault = 1000 * time.Millisecond
-	DNSCooldownBase        = 500 * time.Millisecond
-	DNSCooldownMax         = 4 * time.Second
+	DNSCooldownBase        = 400 * time.Millisecond
+	DNSCooldownMax         = 6 * time.Second
 	DNSMaxAttemptsA        = 4
 	DNSMaxAttemptsPTR      = 6
 	PTRDoHTimeout          = 1200 * time.Millisecond
@@ -218,6 +218,7 @@ type DiscoveryState struct {
 	droppedDomainsByGlobalLimit int
 	droppedValidPairs           int
 	droppedPairEvidence         int
+	droppedDomainEvidence       int
 }
 
 func NewDiscoveryState() *DiscoveryState {
@@ -235,12 +236,12 @@ func (s *DiscoveryState) AddDomainSource(d string, direct, inherited DomainSourc
 	if _, exists := s.domainsToResolve[d]; !exists {
 		if s.domainsCount >= MaxDiscoveredDomains {
 			s.droppedDomainsByGlobalLimit++
+			s.droppedDomainEvidence++
 			return
 		}
 		s.domainsToResolve[d] = struct{}{}
 		s.domainsCount++
 	}
-
 	ev := s.domainEvidence[d]
 	ev.Direct |= direct
 	ev.Inherited |= inherited
@@ -636,29 +637,43 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	if start < 0 {
 		start = 0
 	}
-	// Advance the cursor once per logical lookup. The returned order is a
-	// cyclic walk, not a health-sorted list. This prevents the healthiest
-	// resolver from becoming a permanent hot spot.
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	order := make([]string, 0, len(resolvers))
+	type item struct {
+		resolver string
+		failures int
+		idx      int
+	}
+	ready := make([]item, 0, len(resolvers))
 	var earliest string
 	var earliestUntil time.Time
+
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
-		until := r.DNSCooldownUntil[resolver]
-		if until.IsZero() || !now.Before(until) {
-			order = append(order, resolver)
+		if until := r.DNSCooldownUntil[resolver]; !until.IsZero() && now.Before(until) {
+			if earliest == "" || until.Before(earliestUntil) {
+				earliest = resolver
+				earliestUntil = until
+			}
 			continue
 		}
-		if earliest == "" || until.Before(earliestUntil) {
-			earliest = resolver
-			earliestUntil = until
-		}
+		ready = append(ready, item{resolver: resolver, failures: r.DNSConsecutiveFailures[resolver], idx: i})
 	}
 
-	// If every resolver is cooling, probe the one whose cooldown expires first;
-	// never pin the scan to a fixed resolver.
+	// Round-robin remains the primary policy. Inside one cycle, move resolvers
+	// with repeated failures toward the end so healthy resolvers get first chance
+	// without creating a permanent fastest-resolver hotspot.
+	sort.SliceStable(ready, func(i, j int) bool {
+		if ready[i].failures != ready[j].failures {
+			return ready[i].failures < ready[j].failures
+		}
+		return ready[i].idx < ready[j].idx
+	})
+
+	order := make([]string, 0, len(ready)+1)
+	for _, it := range ready {
+		order = append(order, it.resolver)
+	}
 	if len(order) == 0 && earliest != "" {
 		order = append(order, earliest)
 	}
@@ -1010,7 +1025,7 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		// UDP can fail because the answer was truncated. For transport timeouts
 		// and truncation, retry the same resolver over TCP before consuming the
 		// next resolver. This mirrors the behavior of a full recursive pool.
-		if err != nil && (errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)) {
+		if errors.Is(err, ErrDNSTruncated) {
 			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, timeout)
 			if tcpErr == nil {
 				ips, err = tcpIPs, nil
@@ -2847,12 +2862,17 @@ func RunStageC(
 
 			scheduled[root.Domain][p] = true
 			providerUsed[p]++
-			jobQueues[p] <- RootJob{
+			job := RootJob{
 				Root:   root,
 				Ctx:    rootCtx[root.Domain],
 				Cancel: rootCancel[root.Domain],
 			}
-			return true
+			select {
+			case jobQueues[p] <- job:
+				return true
+			case <-ctx.Done():
+				return false
+			}
 		}
 		return false
 	}
@@ -2997,12 +3017,17 @@ SchedulerLoop:
 			pipeStats.StageC.Reassigned++
 			pipeStats.mu.Unlock()
 
-			jobQueues[nextP] <- RootJob{
+			job := RootJob{
 				Root:   root,
 				Ctx:    rootCtx[root.Domain],
 				Cancel: rootCancel[root.Domain],
 			}
-			inFlight++
+			select {
+			case jobQueues[nextP] <- job:
+				inFlight++
+			case <-ctx.Done():
+				markCanceled(root.Domain)
+			}
 		}
 	}
 
@@ -3056,6 +3081,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	droppedGlobal := ds.droppedDomainsByGlobalLimit
 	droppedPairs := ds.droppedValidPairs
 	droppedEvidence := ds.droppedPairEvidence
+	droppedDomainEvidence := ds.droppedDomainEvidence
 	ds.mu.RUnlock()
 
 	fmt.Println("\n===================================================================================================================")
@@ -3159,6 +3185,9 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	}
 	if droppedEvidence > 0 {
 		fmt.Printf("[!] Pair evidence отброшено memory safety лимитом (MaxPairEvidenceEntries=%d): %d\n", MaxPairEvidenceEntries, droppedEvidence)
+	}
+	if droppedDomainEvidence > 0 {
+		fmt.Printf("[!] Domain evidence отброшено после global domain limit: %d\n", droppedDomainEvidence)
 	}
 
 	fmt.Printf("\n[*] Анализ Stage E (Строгая Воронка):\n")
@@ -3640,19 +3669,18 @@ ReadLoop:
 			if uint32(recvBuf.Len()) < 9+length {
 				break
 			}
+			frameType, flags := data[3], data[4]
 			if !firstFrameSeen {
 				cand.Timings.H2FirstFrame = time.Since(requestSent)
+				if frameType != FrameSettings {
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2 preface sequence: first server frame is type %d, want SETTINGS", frameType)}
+				}
 				firstFrameSeen = true
 			}
 
-			frameType, flags := data[3], data[4]
 			streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
 			payload := data[9 : 9+length]
 			recvBuf.Next(int(9 + length))
-
-			if !firstFrameSeen && frameType != FrameSettings {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2 connection preface sequence: first server frame is type %d, want SETTINGS", frameType)}
-			}
 
 			if expectingContinuation && frameType != FrameContinuation {
 				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2: expected CONTINUATION, got frame type %d", frameType)}
@@ -3661,7 +3689,7 @@ ReadLoop:
 			switch frameType {
 			case FrameSettings:
 				if length%6 != 0 {
-					continue
+					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length: %d", length)}
 				}
 				if flags&FlagAck != 0 {
 					cand.H2SettingsAckReceived = true
