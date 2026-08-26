@@ -646,7 +646,7 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	return order
 }
 
-func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time.Duration) {
+func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time.Duration, ipv4Count int) {
 	r.DNSStatsMu.Lock()
 	defer r.DNSStatsMu.Unlock()
 
@@ -666,6 +666,9 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 
 	if err == nil {
 		stat.Answers++
+		if ipv4Count > 0 {
+			stat.IPv4s += ipv4Count
+		}
 		r.DNSConsecutiveFailures[resolver] = 0
 		delete(r.DNSCooldownUntil, resolver)
 		return
@@ -1227,7 +1230,7 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 				lastErr = tcpErr
 			}
 		}
-		rtCaches.recordDNSResult(resolver, err, time.Since(started))
+		rtCaches.recordDNSResult(resolver, err, time.Since(started), len(ips))
 
 		if err == nil {
 			if len(ips) > 0 {
@@ -1338,7 +1341,7 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 				names, err = tcpNames, nil
 			}
 		}
-		rtCaches.recordDNSResult(resolver, err, time.Since(started))
+		rtCaches.recordDNSResult(resolver, err, time.Since(started), 0)
 
 		if err == nil {
 			if len(names) > 0 {
