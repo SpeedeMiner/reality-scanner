@@ -37,12 +37,7 @@ import (
 
 // ================= CONFIG & CONSTANTS =================
 
-type Mode string
-
 const (
-	ModeDirect Mode = "direct"
-	ModeAuto   Mode = "autonomous"
-
 	FrameData         = 0x00
 	FrameHeaders      = 0x01
 	FrameRSTStream    = 0x03
@@ -102,7 +97,6 @@ var (
 )
 
 type Config struct {
-	Mode              Mode
 	Workers           int
 	MaxIPs            int
 	IPOSINTLimit      int
@@ -120,7 +114,6 @@ type Config struct {
 	TargetASN         string
 	TargetCountry     string
 	TargetIP          string
-	DirectSNI         string
 	ScanEntireASN     bool
 	CIDRs             []string
 	Domains           []string
@@ -999,11 +992,10 @@ func dnsExchangeTCP(ctx context.Context, resolver, domain string, qtype uint16, 
 }
 
 func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
-	_, err := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
+	msg, err := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
 	if err != nil {
 		return nil, err
 	}
-	msg, _ := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
 	client := &mdns.Client{Net: "udp", Timeout: timeout}
 	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(resolver, "53"))
 	if err != nil {
@@ -2778,12 +2770,15 @@ func RunStageC(
 		if workers <= 0 {
 			workers = 1
 		}
-		// Keep only a tiny amount of queued work. This is important when a provider
-		// returns 429/403/quota errors: stale jobs are not allowed to pile up behind
-		// a provider that has just become unavailable.
-		queueSize := workers * 2
-		if queueSize < 2 {
-			queueSize = 2
+		// Keep enough queue capacity to decouple the scheduler from slow provider rate limits.
+		// Stale work is still rejected by Execute() after a provider is disabled.
+		queueSize := providerLimits[p] * 2
+		minimumQueue := workers * 4
+		if queueSize < minimumQueue {
+			queueSize = minimumQueue
+		}
+		if queueSize < 4 {
+			queueSize = 4
 		}
 		jobQueues[p] = make(chan RootJob, queueSize)
 	}
@@ -2946,6 +2941,8 @@ func RunStageC(
 			case jobQueues[p] <- job:
 				return true
 			case <-ctx.Done():
+				delete(scheduled[root.Domain], p)
+				providerUsed[p]--
 				return false
 			}
 		}
@@ -3184,16 +3181,6 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("[*] DNS A system fallback:       %d\n", dnsSystem)
 	fmt.Printf("[*] PTR unique NXDOMAIN IPs:     %d\n", ptrNegative)
 	fmt.Printf("[*] PTR resolver NXDOMAIN replies:%d\n\n", ptrResolverNegative)
-
-	rtCaches.DNSStatsMu.Lock()
-	ptrDoH := 0
-	for _, st := range rtCaches.DNSResolverStats {
-		if st != nil {
-			ptrDoH += 0
-		}
-	}
-	rtCaches.DNSStatsMu.Unlock()
-	_ = ptrDoH
 
 	if droppedGlobal > 0 {
 		fmt.Printf("[!] Доменов отброшено глобальным лимитом (MaxDiscoveredDomains=%d): %d\n", MaxDiscoveredDomains, droppedGlobal)
@@ -3494,15 +3481,16 @@ func resolveIPv4Cached(ctx context.Context, domain string, rtCaches *RuntimeCach
 }
 
 func buildH2HeadersEncoder(sni string) []byte {
-	var payload []byte
-	payload = append(payload, 0x82, 0x87, 0x84)
-	sniBytes := []byte(sni)
-	payload = append(payload, 0x01, byte(len(sniBytes)))
-	payload = append(payload, sniBytes...)
-	ua := []byte("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
-	payload = append(payload, 0x0F, 0x2B, byte(len(ua)))
-	payload = append(payload, ua...)
-	return payload
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	_ = enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":path", Value: "/"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":authority", Value: sni})
+	_ = enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"})
+	_ = enc.WriteField(hpack.HeaderField{Name: "accept", Value: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
+	_ = enc.WriteField(hpack.HeaderField{Name: "accept-encoding", Value: "gzip, deflate, br"})
+	return buf.Bytes()
 }
 
 func buildH2Frame(frameType, flags byte, streamId uint32, payload []byte) []byte {
@@ -4298,28 +4286,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	var validPairs []TargetPair
 	var pairSeen sync.Map
 
-	if cfg.Mode == ModeDirect && cfg.DirectSNI != "" {
-		sni := CleanDomain(cfg.DirectSNI)
-		if sni != "" {
-			for _, ip := range sampledIPs {
-				key := ip + "\x00" + sni
-				if _, loaded := pairSeen.LoadOrStore(key, true); !loaded {
-					ds.mu.Lock()
-					if len(validPairs) < LimitValidPairs {
-						validPairs = append(validPairs, TargetPair{
-							IP:       ip,
-							SNI:      sni,
-							Evidence: Evidence{Direct: SourceSeed},
-						})
-					} else {
-						ds.droppedValidPairs++
-					}
-					ds.mu.Unlock()
-				}
-			}
-		}
-	}
-
 	fmt.Printf("[*] STAGE D: DNS Validation (%d Domains)...\n", len(allDomains))
 	var uniqueResolvedIPs sync.Map
 	var uniqueTargetIPs sync.Map
@@ -4327,9 +4293,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	gD, gCtxD := errgroup.WithContext(ctx)
 	gD.SetLimit(cfg.DNSWorkers)
 	for _, dom := range allDomains {
-		if cfg.Mode == ModeDirect && dom == CleanDomain(cfg.DirectSNI) {
-			continue
-		}
 		dom := dom
 		gD.Go(func() error {
 			if gCtxD.Err() != nil {
@@ -4900,7 +4863,6 @@ func main() {
 	uaRng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	cfg := Config{
-		Mode:              ModeAuto,
 		Workers:           30,
 		DNSWorkers:        64,
 		MaxIPs:            -1, // full announced ASN scan, capped by LimitMaxIPs
