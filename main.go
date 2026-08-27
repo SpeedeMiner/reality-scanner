@@ -479,37 +479,38 @@ type PipelineStats struct {
 	TLSOtherErrs          int
 
 	// H2
-	H2NoALPN                int
-	H2ProtocolOK            int
-	H2TimeoutNoFrames       int
-	H2ConnectionReset       int
-	H2BrokenPipe            int
-	H2BadRequest            int
-	H2GoAway                int
-	H2EOF                   int
-	H2TLSAlerts             int
-	H2OtherErrs             int
-	H2InvalidFrame          int
-	H2InvalidFrameLength    int
-	H2InvalidFrameRSTLength int
-	H2InvalidFrameStreamID  int
-	H2InvalidFramePadding   int
-	H2InvalidFramePreface   int
-	H2FrameSizeHeaders      int
-	H2FrameSizeData         int
-	H2FrameSizeContinuation int
-	H2FrameSizeSettings     int
-	H2FrameSizeOther        int
-	H2BadContinuation       int
-	H2HPACKDecode           int
-	H2MissingSettings       int
-	H2HeadersWithoutStatus  int
-	H2HeadersOK             int
-	H2Timeouts              int
-	H2HPACKErrors           int
-	H2StatusOK              int
-	H2InvalidStatus         int
-	EndStreamOK             int
+	H2NoALPN                 int
+	H2ProtocolOK             int
+	H2TimeoutNoFrames        int
+	H2ConnectionReset        int
+	H2BrokenPipe             int
+	H2BadRequest             int
+	H2GoAway                 int
+	H2EOF                    int
+	H2TLSAlerts              int
+	H2OtherErrs              int
+	H2InvalidFrame           int
+	H2InvalidFrameLength     int
+	H2FrameHeaderImplausible int
+	H2InvalidFrameRSTLength  int
+	H2InvalidFrameStreamID   int
+	H2InvalidFramePadding    int
+	H2InvalidFramePreface    int
+	H2FrameSizeHeaders       int
+	H2FrameSizeData          int
+	H2FrameSizeContinuation  int
+	H2FrameSizeSettings      int
+	H2FrameSizeOther         int
+	H2BadContinuation        int
+	H2HPACKDecode            int
+	H2MissingSettings        int
+	H2HeadersWithoutStatus   int
+	H2HeadersOK              int
+	H2Timeouts               int
+	H2HPACKErrors            int
+	H2StatusOK               int
+	H2InvalidStatus          int
+	EndStreamOK              int
 
 	// Final
 	ScoreRejected             int
@@ -572,7 +573,7 @@ func (s *PipelineStats) recordProviderStat(name string, cat DiscoveryCategory, r
 	}
 
 	if result != StatSuccess {
-		debugf("[PROVIDER] name=%s category=%d result=%d timeout=%t raw=%d unique=%d invalid=%d limited=%d accepted=%d status=%d err=%s retries=%d", name, cat, result, isTimeout, raw, unique, invalid, limited, accepted, httpStatus, errText, retries)
+		debugf("[PROVIDER] name=%s category=%s result=%d timeout=%t raw=%d unique=%d invalid=%d limited=%d accepted=%d status=%d err=%s retries=%d", name, string(cat), result, isTimeout, raw, unique, invalid, limited, accepted, httpStatus, errText, retries)
 	}
 
 	switch result {
@@ -665,6 +666,9 @@ func (d *DebugLogger) Printf(format string, args ...interface{}) {
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
 	}
+	if debugRunID != "" {
+		line = fmt.Sprintf("[run_id=%s] %s", debugRunID, line)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.f == nil || d.dropped {
@@ -682,6 +686,7 @@ func (d *DebugLogger) Printf(format string, args ...interface{}) {
 }
 
 var (
+	debugRunID  string
 	debugMu     sync.RWMutex
 	debugLogger *DebugLogger
 )
@@ -921,10 +926,13 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 		if healthFailureRate >= DNSHealthHardBadRate {
 			r.DNSDisabledForRun[resolver] = true
 			delete(r.DNSCooldownUntil, resolver)
+			debugf("[DNS][HEALTH] resolver=%s transition=disabled reason=health_window rate=%.3f samples=%d", resolver, healthFailureRate, hw.Count)
 			return
 		}
 		if healthFailureRate >= DNSHealthWindowBadRate {
-			r.DNSCooldownUntil[resolver] = time.Now().Add(DNSHealthBadCooldown)
+			cooldownUntil := time.Now().Add(DNSHealthBadCooldown)
+			r.DNSCooldownUntil[resolver] = cooldownUntil
+			debugf("[DNS][HEALTH] resolver=%s transition=cooldown reason=health_window rate=%.3f samples=%d until=%s", resolver, healthFailureRate, hw.Count, cooldownUntil.Format(time.RFC3339Nano))
 			return
 		}
 	}
@@ -943,7 +951,9 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 	if cooldown > DNSCooldownMax {
 		cooldown = DNSCooldownMax
 	}
-	r.DNSCooldownUntil[resolver] = time.Now().Add(cooldown)
+	cooldownUntil := time.Now().Add(cooldown)
+	r.DNSCooldownUntil[resolver] = cooldownUntil
+	debugf("[DNS][HEALTH] resolver=%s transition=cooldown reason=consecutive_failure failures=%d timeout=%t until=%s", resolver, n, isTimeout, cooldownUntil.Format(time.RFC3339Nano))
 }
 
 type DNSCacheEntry struct {
@@ -1185,6 +1195,29 @@ func dnsExchangeTCP(ctx context.Context, resolver, domain string, qtype uint16, 
 	return dnsExchange(ctx, resolver, domain, qtype, ecsIP, ecsPrefix, timeout, "tcp")
 }
 
+func dnsDebugResult(err error, answerCount int) string {
+	if err == nil && answerCount > 0 {
+		return "success"
+	}
+	if errors.Is(err, ErrDNSNXDomain) {
+		return "nxdomain"
+	}
+	var rcodeErr *DNSRCODEError
+	if errors.As(err, &rcodeErr) {
+		return "rcode"
+	}
+	if errors.Is(err, ErrDNSTruncated) {
+		return "truncated"
+	}
+	if err == nil {
+		return "no-data"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return "timeout"
+	}
+	return classifyDNSOtherError(err)
+}
+
 func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
 	// Build the DNS message exactly once and reuse it for the UDP exchange.
 	msg, err := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
@@ -1194,22 +1227,26 @@ func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, 
 	client := &mdns.Client{Net: "udp", Timeout: timeout}
 	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(resolver, "53"))
 	if err != nil {
-		debugf("[DNS][UDP] resolver=%s q=%s qtype=%d err=%v", resolver, domain, qtype, err)
+		debugf("[DNS][UDP] transport=UDP resolver=%s q=%s qtype=%d result=error err=%v", resolver, domain, qtype, err)
 		return nil, err
 	}
 	if resp == nil {
 		err = fmt.Errorf("nil DNS response")
-		debugf("[DNS][UDP] resolver=%s q=%s qtype=%d err=%v", resolver, domain, qtype, err)
+		debugf("[DNS][UDP] transport=UDP resolver=%s q=%s qtype=%d result=error err=%v", resolver, domain, qtype, err)
 		return nil, err
 	}
 	if resp.Truncated {
-		debugf("[DNS][UDP] resolver=%s q=%s qtype=%d result=truncated", resolver, domain, qtype)
+		debugf("[DNS][UDP] transport=UDP resolver=%s q=%s qtype=%d result=truncated rcode=%d", resolver, domain, qtype, resp.Rcode)
 		return nil, ErrDNSTruncated
 	}
+	var out []string
 	if qtype == mdns.TypePTR {
-		return parseDNSPTRResponse(resp)
+		out, err = parseDNSPTRResponse(resp)
+	} else {
+		out, err = parseDNSAResponse(resp)
 	}
-	return parseDNSAResponse(resp)
+	debugf("[DNS][UDP] transport=UDP resolver=%s q=%s qtype=%d result=%s rcode=%d answers=%d err=%v", resolver, domain, qtype, dnsDebugResult(err, len(out)), resp.Rcode, len(out), err)
+	return out, err
 }
 
 func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecsPrefix int, rtCaches *RuntimeCaches) {
@@ -1360,14 +1397,16 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		lastErr = err
 	}
 
-	for _, resolver := range ordered {
+	for attempt, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
+		debugf("[DNS][ATTEMPT] transport=UDP resolver=%s q=%s qtype=A attempt=%d/%d timeout_ms=%d", resolver, domain, attempt+1, len(ordered), resolverTimeout.Milliseconds())
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 
 		// TCP is only a truncation fallback. A UDP timeout must not spend another
 		// synchronous timeout budget against the same resolver.
 		if errors.Is(err, ErrDNSTruncated) {
+			debugf("[DNS][ATTEMPT] transport=TCP resolver=%s q=%s qtype=A reason=udp-truncated", resolver, domain)
 			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 			if tcpErr == nil {
 				ips, err = tcpIPs, nil
@@ -1460,9 +1499,11 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	// the local/system resolver still has working access to the reverse zone.
 	// Try the system resolver first: it is the fastest compatibility path and
 	// preserves the old scanner's PTR behavior without giving up raw DNS.
+	lookupStarted := time.Now()
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	names, lookupErr := net.DefaultResolver.LookupAddr(lookupCtx, ip)
 	cancel()
+	debugf("[DNS][System] transport=System resolver=default q=%s qtype=PTR result=%s answers=%d elapsed_ms=%.1f err=%v", ip, dnsDebugResult(lookupErr, len(names)), len(names), time.Since(lookupStarted).Seconds()*1000, lookupErr)
 	if lookupErr == nil && len(names) > 0 {
 		clean := make([]string, 0, len(names))
 		for _, n := range names {
@@ -1495,11 +1536,13 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	var lastErr error
 	nxCount := 0
 	emptyCount := 0
-	for _, resolver := range ordered {
+	for attempt, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
+		debugf("[DNS][ATTEMPT] transport=UDP resolver=%s q=%s qtype=PTR attempt=%d/%d timeout_ms=%d", resolver, rev, attempt+1, len(ordered), resolverTimeout.Milliseconds())
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, resolverTimeout)
 		if errors.Is(err, ErrDNSTruncated) {
+			debugf("[DNS][ATTEMPT] transport=TCP resolver=%s q=%s qtype=PTR reason=udp-truncated", resolver, rev)
 			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, resolverTimeout); tcpErr == nil {
 				names, err = tcpNames, nil
 			} else {
@@ -1579,10 +1622,11 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		"https://freedns.controld.com/p0",
 	}
 	var lastErr error
-	for _, endpoint := range endpoints {
+	for attempt, endpoint := range endpoints {
 		if err := budgetCtx.Err(); err != nil {
 			break
 		}
+		started := time.Now()
 		values := url.Values{}
 		values.Set("name", domain)
 		values.Set("type", "A")
@@ -1596,9 +1640,11 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		}
 		req.Header.Set("Accept", "application/dns-json")
 		req.Header.Set("User-Agent", "reality-scanner/1.0")
+		debugf("[DNS][ATTEMPT] transport=DoH endpoint=%s q=%s qtype=A attempt=%d/%d", endpoint, domain, attempt+1, len(endpoints))
 		resp, err := dnsDoHHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
+			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=error elapsed_ms=%.1f err=%v", endpoint, domain, time.Since(started).Seconds()*1000, err)
 			continue
 		}
 
@@ -1613,6 +1659,7 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			lastErr = fmt.Errorf("DoH HTTP status=%d", resp.StatusCode)
+			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=http-error status=%d elapsed_ms=%.1f", endpoint, domain, resp.StatusCode, time.Since(started).Seconds()*1000)
 			continue
 		}
 		decodeErr := func() error {
@@ -1621,13 +1668,16 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		}()
 		if decodeErr != nil {
 			lastErr = decodeErr
+			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=decode-error elapsed_ms=%.1f err=%v", endpoint, domain, time.Since(started).Seconds()*1000, decodeErr)
 			continue
 		}
 		if payload.Status == 3 {
+			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=nxdomain elapsed_ms=%.1f", endpoint, domain, time.Since(started).Seconds()*1000)
 			return nil, ErrDNSNXDomain
 		}
 		if payload.Status != 0 {
 			lastErr = fmt.Errorf("DoH DNS status=%d", payload.Status)
+			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=rcode status=%d elapsed_ms=%.1f", endpoint, domain, payload.Status, time.Since(started).Seconds()*1000)
 			continue
 		}
 		ips := make([]string, 0, len(payload.Answer))
@@ -1639,7 +1689,9 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 				ips = append(ips, ip.To4().String())
 			}
 		}
-		return uniqueStrings(ips), nil
+		cleanIPs := uniqueStrings(ips)
+		debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=%s answers=%d elapsed_ms=%.1f", endpoint, domain, dnsDebugResult(nil, len(cleanIPs)), len(cleanIPs), time.Since(started).Seconds()*1000)
+		return cleanIPs, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("DNS A DoH fallback failed")
@@ -1648,10 +1700,12 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 }
 
 func resolveASystem(ctx context.Context, domain string) ([]string, error) {
+	started := time.Now()
 	lookupCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, domain)
 	if err != nil {
+		debugf("[DNS][System] transport=System resolver=default q=%s qtype=A result=error elapsed_ms=%.1f err=%v", domain, time.Since(started).Seconds()*1000, err)
 		return nil, err
 	}
 	ips := make([]string, 0, len(addrs))
@@ -1660,7 +1714,9 @@ func resolveASystem(ctx context.Context, domain string) ([]string, error) {
 			ips = append(ips, ip.String())
 		}
 	}
-	return uniqueStrings(ips), nil
+	cleanIPs := uniqueStrings(ips)
+	debugf("[DNS][System] transport=System resolver=default q=%s qtype=A result=%s answers=%d elapsed_ms=%.1f", domain, dnsDebugResult(nil, len(cleanIPs)), len(cleanIPs), time.Since(started).Seconds()*1000)
+	return cleanIPs, nil
 }
 
 func resolvePTRDoH(ctx context.Context, rev string, timeout time.Duration) ([]string, error) {
@@ -3805,6 +3861,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	pH2Other := s.H2OtherErrs
 	pH2InvalidFrame := s.H2InvalidFrame
 	pH2InvalidFrameLength := s.H2InvalidFrameLength
+	pH2FrameHeaderImplausible := s.H2FrameHeaderImplausible
 	pH2InvalidFrameRSTLength := s.H2InvalidFrameRSTLength
 	pH2InvalidFrameStreamID := s.H2InvalidFrameStreamID
 	pH2InvalidFramePadding := s.H2InvalidFramePadding
@@ -3981,7 +4038,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("    8. После кластеризации по IP:  %d (оставлен лучший SNI на IP)\n", clustered)
 	fmt.Printf("    Reality-feasible из принятых:      %d\n", pReality)
 	fmt.Printf("    H2 причины Other: InvalidFrame=%d, BadContinuation=%d, HPACK=%d, MissingSettings=%d, HeadersWithoutStatus=%d\n", pH2InvalidFrame, pH2BadContinuation, pH2HPACKDecode, pH2MissingSettings, pH2HeadersWithoutStatus)
-	fmt.Printf("    H2 InvalidFrame detail: FrameSize=%d, RSTStreamLength=%d, StreamID=%d, Padding=%d, Preface=%d, Generic=%d\n", pH2InvalidFrameLength, pH2InvalidFrameRSTLength, pH2InvalidFrameStreamID, pH2InvalidFramePadding, pH2InvalidFramePreface, pH2InvalidFrame-pH2InvalidFrameLength-pH2InvalidFrameRSTLength-pH2InvalidFrameStreamID-pH2InvalidFramePadding-pH2InvalidFramePreface)
+	fmt.Printf("    H2 InvalidFrame detail: FrameSize=%d, HeaderImplausible=%d, RSTStreamLength=%d, StreamID=%d, Padding=%d, Preface=%d, Generic=%d\n", pH2InvalidFrameLength, pH2FrameHeaderImplausible, pH2InvalidFrameRSTLength, pH2InvalidFrameStreamID, pH2InvalidFramePadding, pH2InvalidFramePreface, pH2InvalidFrame-pH2InvalidFrameLength-pH2FrameHeaderImplausible-pH2InvalidFrameRSTLength-pH2InvalidFrameStreamID-pH2InvalidFramePadding-pH2InvalidFramePreface)
 	fmt.Printf("    H2 FrameSize by type: HEADERS=%d, DATA=%d, CONTINUATION=%d, SETTINGS=%d, Other=%d\n", pH2FrameSizeHeaders, pH2FrameSizeData, pH2FrameSizeContinuation, pH2FrameSizeSettings, pH2FrameSizeOther)
 	fmt.Printf("    H2 note: FrameSize is an inbound payload larger than the local/default 16384-byte receive limit; peer SETTINGS_MAX_FRAME_SIZE controls frames sent by this client.\n")
 	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
@@ -4336,6 +4393,7 @@ const (
 	H2ErrUnknown H2ErrorCode = iota
 	H2ErrInvalidFrame
 	H2ErrInvalidFrameLength
+	H2ErrFrameHeaderImplausible
 	H2ErrInvalidFrameStreamID
 	H2ErrInvalidFramePadding
 	H2ErrInvalidFramePreface
@@ -4355,10 +4413,59 @@ const (
 )
 
 type ProbeError struct {
-	Stage     ProbeStage
-	Code      H2ErrorCode
-	Err       error
-	FrameType byte
+	Stage        ProbeStage
+	Code         H2ErrorCode
+	Err          error
+	FrameType    byte
+	Flags        byte
+	StreamID     uint32
+	Length       uint32
+	RawHeaderHex string
+}
+
+func (c H2ErrorCode) String() string {
+	switch c {
+	case H2ErrInvalidFrame:
+		return "invalid-frame"
+	case H2ErrInvalidFrameLength:
+		return "frame-size"
+	case H2ErrFrameHeaderImplausible:
+		return "frame-header-implausible"
+	case H2ErrInvalidFrameStreamID:
+		return "frame-stream-id"
+	case H2ErrInvalidFramePadding:
+		return "frame-padding"
+	case H2ErrInvalidFramePreface:
+		return "frame-preface"
+	case H2ErrBadContinuation:
+		return "bad-continuation"
+	case H2ErrHPACK:
+		return "hpack"
+	case H2ErrSettings:
+		return "settings"
+	case H2ErrFlowControl:
+		return "flow-control"
+	case H2ErrHeaders:
+		return "headers"
+	case H2ErrTimeout:
+		return "timeout"
+	case H2ErrConnectionReset:
+		return "connection-reset"
+	case H2ErrBrokenPipe:
+		return "broken-pipe"
+	case H2ErrBadRequest:
+		return "bad-request"
+	case H2ErrGoAway:
+		return "goaway"
+	case H2ErrEOF:
+		return "eof"
+	case H2ErrTLSAlert:
+		return "tls-alert"
+	case H2ErrRSTStreamLength:
+		return "rst-stream-length"
+	default:
+		return "unknown"
+	}
 }
 
 func normalizeProbeError(pe *ProbeError) *ProbeError {
@@ -4386,6 +4493,34 @@ func (e *ProbeError) Error() string {
 	return e.Err.Error()
 }
 
+func h2FrameTypeName(t byte) string {
+	switch t {
+	case FrameData:
+		return "DATA"
+	case FrameHeaders:
+		return "HEADERS"
+	case FrameRSTStream:
+		return "RST_STREAM"
+	case FrameSettings:
+		return "SETTINGS"
+	case FrameGoAway:
+		return "GOAWAY"
+	case FrameWindowUpdate:
+		return "WINDOW_UPDATE"
+	case FrameContinuation:
+		return "CONTINUATION"
+	default:
+		return fmt.Sprintf("0x%02x", t)
+	}
+}
+
+func looksLikeHTTP1ResponseHeader(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	return bytes.HasPrefix(data, []byte("HTTP/")) || bytes.HasPrefix(data, []byte("HTT"))
+}
+
 func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (cand *Candidate, pErr *ProbeError) {
 	cand = &Candidate{
 		IP:            ip,
@@ -4396,11 +4531,12 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (cand
 		HTTPStatus:    0,
 	}
 
+	debugf("[H2][START] ip=%s sni=%s", ip, sni)
 	defer func() {
 		if pErr != nil {
-			debugf("[H2][ERROR] ip=%s sni=%s code=%d frame_type=%d err=%s tcp_ms=%d tls_ms=%d", ip, sni, pErr.Code, pErr.FrameType, pErr.Error(), cand.Timings.TCP.Milliseconds(), cand.Timings.TLS.Milliseconds())
+			debugf("[H2][REJECT] ip=%s sni=%s code=%s code_id=%d frame_type=%s frame_type_id=%d length=%d flags=0x%02x stream_id=%d raw_header_hex=%s err=%s tcp_ms=%d tls_ms=%d", ip, sni, pErr.Code.String(), pErr.Code, h2FrameTypeName(pErr.FrameType), pErr.FrameType, pErr.Length, pErr.Flags, pErr.StreamID, pErr.RawHeaderHex, pErr.Error(), cand.Timings.TCP.Milliseconds(), cand.Timings.TLS.Milliseconds())
 		} else {
-			debugf("[H2][OK] ip=%s sni=%s status=%d alpn=%s cert_sni=%t cert_chain=%t cert_time=%t h2_settings=%t h2_headers=%t body=%d", ip, sni, cand.HTTPStatus, cand.ALPN, cand.CertSNIMatch, cand.CertChainValid, cand.CertValidTime, cand.H2SettingsReceived, cand.H2HeadersReceived, cand.BodyBytes)
+			debugf("[H2][PROBE] ip=%s sni=%s status=%d alpn=%s cert_sni=%t cert_chain=%t cert_time=%t h2_settings=%t h2_headers=%t body=%d", ip, sni, cand.HTTPStatus, cand.ALPN, cand.CertSNIMatch, cand.CertChainValid, cand.CertValidTime, cand.H2SettingsReceived, cand.H2HeadersReceived, cand.BodyBytes)
 		}
 	}()
 
@@ -4523,19 +4659,23 @@ ReadLoop:
 		for recvBuf.Len() >= 9 {
 			data := recvBuf.Bytes()
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
+			frameType, flags := data[3], data[4]
+			streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7fffffff
 			if length > localMaxInboundFrameSize {
-				frameType := data[3]
-				streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7fffffff
-				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameLength, FrameType: frameType, Err: fmt.Errorf("inbound frame exceeds local limit: type=%d length=%d max=%d stream=%d", frameType, length, localMaxInboundFrameSize, streamID)}
+				hexHeader := fmt.Sprintf("%x", data[:9])
+				if looksLikeHTTP1ResponseHeader(data) {
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrFrameHeaderImplausible, FrameType: frameType, Flags: flags, StreamID: streamID, Length: length, RawHeaderHex: hexHeader, Err: fmt.Errorf("implausible H2 frame header: looks like HTTP/1.x or plaintext: type=%s length=%d max=%d stream=%d raw_header=%s", h2FrameTypeName(frameType), length, localMaxInboundFrameSize, streamID, hexHeader)}
+				}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameLength, FrameType: frameType, Flags: flags, StreamID: streamID, Length: length, RawHeaderHex: hexHeader, Err: fmt.Errorf("inbound frame exceeds local limit: type=%s length=%d max=%d stream=%d raw_header=%s", h2FrameTypeName(frameType), length, localMaxInboundFrameSize, streamID, hexHeader)}
 			}
 			if uint32(recvBuf.Len()) < 9+length {
 				break
 			}
-			frameType, flags := data[3], data[4]
+
 			if !firstFrameSeen {
 				cand.Timings.H2FirstFrame = time.Since(requestSent)
 				if frameType != FrameSettings {
-					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFramePreface, Err: fmt.Errorf("invalid H2 preface sequence: first server frame is type %d, want SETTINGS", frameType)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFramePreface, FrameType: frameType, Flags: flags, StreamID: streamID, Length: length, RawHeaderHex: fmt.Sprintf("%x", data[:9]), Err: fmt.Errorf("invalid H2 preface sequence: first server frame is type %d, want SETTINGS", frameType)}
 				}
 				firstFrameSeen = true
 			}
@@ -4545,10 +4685,10 @@ ReadLoop:
 			recvBuf.Next(int(9 + length))
 
 			if expectingContinuation && frameType != FrameContinuation {
-				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, Err: fmt.Errorf("invalid H2: expected CONTINUATION, got frame type %d", frameType)}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, FrameType: frameType, Flags: flags, StreamID: streamID, Length: length, RawHeaderHex: fmt.Sprintf("%x", data[:9]), Err: fmt.Errorf("invalid H2: expected CONTINUATION, got frame type %d", frameType)}
 			}
 			if !expectingContinuation && frameType == FrameContinuation {
-				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, Err: fmt.Errorf("unexpected CONTINUATION frame")}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, FrameType: frameType, Flags: flags, StreamID: streamID, Length: length, RawHeaderHex: fmt.Sprintf("%x", data[:9]), Err: fmt.Errorf("unexpected CONTINUATION frame")}
 			}
 
 			switch frameType {
@@ -4691,10 +4831,10 @@ ReadLoop:
 				}
 			case FrameContinuation:
 				if !expectingContinuation {
-					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, Err: fmt.Errorf("unexpected CONTINUATION frame")}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, FrameType: frameType, Flags: flags, StreamID: streamID, Length: length, RawHeaderHex: fmt.Sprintf("%x", data[:9]), Err: fmt.Errorf("unexpected CONTINUATION frame")}
 				}
 				if streamID != activeStreamID {
-					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, Err: fmt.Errorf("CONTINUATION stream mismatch: got %d want %d", streamID, activeStreamID)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, FrameType: frameType, Flags: flags, StreamID: streamID, Length: length, RawHeaderHex: fmt.Sprintf("%x", data[:9]), Err: fmt.Errorf("CONTINUATION stream mismatch: got %d want %d", streamID, activeStreamID)}
 				}
 				headerBlocks.Write(payload)
 				if (flags & FlagEndHeaders) != 0 {
@@ -5376,10 +5516,12 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 						pipeStats.H2OtherErrs++
 						pipeStats.H2InvalidFrame++
 						pipeStats.H2InvalidFrameRSTLength++
-					case H2ErrInvalidFrame, H2ErrInvalidFrameLength, H2ErrInvalidFrameStreamID, H2ErrInvalidFramePadding, H2ErrInvalidFramePreface:
+					case H2ErrInvalidFrame, H2ErrInvalidFrameLength, H2ErrFrameHeaderImplausible, H2ErrInvalidFrameStreamID, H2ErrInvalidFramePadding, H2ErrInvalidFramePreface:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2InvalidFrame++
 						switch pErr.Code {
+						case H2ErrFrameHeaderImplausible:
+							pipeStats.H2FrameHeaderImplausible++
 						case H2ErrInvalidFrameLength:
 							pipeStats.H2InvalidFrameLength++
 							switch pErr.FrameType {
@@ -5476,6 +5618,8 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				if !cand.RealityFeasible {
 					continue
 				}
+
+				debugf("[H2][ACCEPT] ip=%s sni=%s status=%d alpn=%s score=%.2f reality_feasible=%t cert_sni=%t cert_chain=%t cert_time=%t", cand.IP, cand.SNI, cand.HTTPStatus, cand.ALPN, cand.Score, cand.RealityFeasible, cand.CertSNIMatch, cand.CertChainValid, cand.CertValidTime)
 
 				pipeStats.mu.Lock()
 				pipeStats.CandidatesAccepted++
@@ -5893,6 +6037,8 @@ func main() {
 	flag.StringVar(&cfg.DebugFile, "debug-file", "/tmp/reality-scanner-debug.log", "Путь debug trace файла")
 	flag.Parse()
 
+	debugRunID = fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+
 	if cfg.Debug {
 		dbg, dbgErr := NewDebugLogger(cfg.DebugFile, DebugMaxBytes)
 		if dbgErr != nil {
@@ -5904,7 +6050,7 @@ func main() {
 					log.Printf("[!] Ошибка закрытия debug log: %v", err)
 				}
 			}()
-			debugf("[DEBUG] start version=v69 max_bytes=%d pid=%d", DebugMaxBytes, os.Getpid())
+			debugf("[DEBUG] start version=v70 max_bytes=%d pid=%d run_id=%s", DebugMaxBytes, os.Getpid(), debugRunID)
 		}
 	}
 
