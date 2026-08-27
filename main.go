@@ -1143,7 +1143,6 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 			// names, and that must not quarantine an otherwise healthy transport.
 			healthy := false
 			qctx, cancel := context.WithTimeout(ctx, DNSWarmupTimeout)
-			started := time.Now()
 			ips, err := dnsExchangeUDP(qctx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
 			if errors.Is(err, ErrDNSTruncated) {
 				tcpCtx, tcpCancel := context.WithTimeout(ctx, DNSWarmupTimeout)
@@ -1268,7 +1267,6 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	}
 
 	for _, resolver := range ordered {
-		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 
@@ -1403,7 +1401,6 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	nxCount := 0
 	emptyCount := 0
 	for _, resolver := range ordered {
-		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, resolverTimeout)
 		if errors.Is(err, ErrDNSTruncated) {
@@ -1490,7 +1487,6 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		if err := budgetCtx.Err(); err != nil {
 			break
 		}
-		started := time.Now()
 		values := url.Values{}
 		values.Set("name", domain)
 		values.Set("type", "A")
@@ -1557,7 +1553,6 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 }
 
 func resolveASystem(ctx context.Context, domain string) ([]string, error) {
-	started := time.Now()
 	lookupCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, domain)
