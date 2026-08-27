@@ -4259,9 +4259,6 @@ ReadLoop:
 		n, err := uConn.Read(buf)
 		if n > 0 {
 			recvBuf.Write(buf[:n])
-			if recvBuf.Len() > MaxH2BufferedBytes {
-				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("H2 receive buffer exceeded %d bytes", MaxH2BufferedBytes)}
-			}
 		}
 
 		for recvBuf.Len() >= 9 {
@@ -4522,6 +4519,13 @@ ReadLoop:
 			if cand.H2ProtocolConfirmed && cand.H2HeadersReceived && (cand.BodyBytes > 0 || cand.Server != "" || cand.EndStreamSeen) {
 				break ReadLoop
 			}
+		}
+
+		// TCP may coalesce multiple complete HTTP/2 frames into a single read.
+		// Only guard the bytes that remain unconsumed after parsing all complete
+		// frames; otherwise a valid frame train can trip the buffer limit.
+		if recvBuf.Len() > MaxH2BufferedBytes {
+			return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrUnknown, Err: fmt.Errorf("H2 incomplete receive buffer exceeded %d bytes", MaxH2BufferedBytes)}
 		}
 
 		if err != nil {
