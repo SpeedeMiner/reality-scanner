@@ -79,6 +79,8 @@ const (
 	DNSHealthWindowSize    = 32
 	DNSHealthWindowMin     = 8
 	DNSHealthWindowBadRate = 0.90
+	DNSHealthHardBadRate   = 1.0
+	DNSHealthBadCooldown   = 10 * time.Second
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	MaxPairEvidenceEntries = LimitValidPairs * 8
@@ -441,6 +443,12 @@ type PipelineStats struct {
 	DNSNoIPv4             int
 	DNSOtherErr           int
 	DNSRCODEErrors        int
+	DNSOtherNetworkErr    int
+	DNSOtherMalformed     int
+	DNSOtherShortResponse int
+	DNSOtherTxIDMismatch  int
+	DNSOtherUnsupported   int
+	DNSOtherUnknown       int
 	DNSResolvedIPs        int
 	DNSUniqueResolvedIPs  int
 	DNSUniqueTargetIPs    int
@@ -707,7 +715,7 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	return order
 }
 
-func (r *RuntimeCaches) recordDNSHealthLocked(resolver string, transportFailure bool) bool {
+func (r *RuntimeCaches) recordDNSHealthLocked(resolver string, transportFailure bool) float64 {
 	hw := r.DNSHealthWindows[resolver]
 	if hw == nil {
 		hw = &DNSHealthWindow{}
@@ -726,10 +734,9 @@ func (r *RuntimeCaches) recordDNSHealthLocked(resolver string, transportFailure 
 	}
 	hw.Head = (hw.Head + 1) % DNSHealthWindowSize
 	if hw.Count >= DNSHealthWindowMin {
-		rate := float64(hw.Failures) / float64(hw.Count)
-		return rate >= DNSHealthWindowBadRate
+		return float64(hw.Failures) / float64(hw.Count)
 	}
-	return false
+	return 0
 }
 
 func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time.Duration, ipv4Count int) {
@@ -792,11 +799,18 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 	// Use only a bounded recent transport-health window for run quarantine.
 	// Historical cumulative failure ratios must never re-quarantine a resolver
 	// immediately after its cooldown expires.
-	windowBad := r.recordDNSHealthLocked(resolver, true)
-	if windowBad {
-		r.DNSDisabledForRun[resolver] = true
-		delete(r.DNSCooldownUntil, resolver)
-		return
+	healthFailureRate := r.recordDNSHealthLocked(resolver, true)
+	hw := r.DNSHealthWindows[resolver]
+	if hw != nil && hw.Count >= DNSHealthWindowMin {
+		if healthFailureRate >= DNSHealthHardBadRate {
+			r.DNSDisabledForRun[resolver] = true
+			delete(r.DNSCooldownUntil, resolver)
+			return
+		}
+		if healthFailureRate >= DNSHealthWindowBadRate {
+			r.DNSCooldownUntil[resolver] = time.Now().Add(DNSHealthBadCooldown)
+			return
+		}
 	}
 
 	cooldown := DNSCooldownBase
@@ -1664,6 +1678,27 @@ func uniqueStrings(values []string) []string {
 		}
 	}
 	return result
+}
+
+func classifyDNSOtherError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	s := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(s, "txid"), strings.Contains(s, "id mismatch"):
+		return "txid-mismatch"
+	case strings.Contains(s, "short response"), strings.Contains(s, "too short"), strings.Contains(s, "short packet"):
+		return "short-response"
+	case strings.Contains(s, "invalid packet"), strings.Contains(s, "unpack"), strings.Contains(s, "malformed"), strings.Contains(s, "overflow"):
+		return "malformed"
+	case strings.Contains(s, "network"), strings.Contains(s, "connection refused"), strings.Contains(s, "no route"), strings.Contains(s, "broken pipe"), strings.Contains(s, "reset by peer"), strings.Contains(s, "connection reset"):
+		return "network"
+	case strings.Contains(s, "unsupported"):
+		return "unsupported"
+	default:
+		return "unknown"
+	}
 }
 
 func classifyDomainQuality(sni string) string {
@@ -3445,6 +3480,12 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	qTimeout := s.DNSTimeout
 	qTemp := s.DNSTemporary
 	qOther := s.DNSOtherErr
+	qOtherNetwork := s.DNSOtherNetworkErr
+	qOtherMalformed := s.DNSOtherMalformed
+	qOtherShort := s.DNSOtherShortResponse
+	qOtherTxID := s.DNSOtherTxIDMismatch
+	qOtherUnsupported := s.DNSOtherUnsupported
+	qOtherUnknown := s.DNSOtherUnknown
 	qRCODE := s.DNSRCODEErrors
 	qResolved := s.DNSResolvedIPs
 	qTargetMatches := s.DNSTargetRangeMatches
@@ -3600,6 +3641,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", qDNS, qDNSSuc, qDNSFail)
 	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", qResolved, qNX, qNoV4)
 	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, RCODE: %d, Other: %d\n", qTimeout, qTemp, qRCODE, qOther)
+	fmt.Printf("    DNS Other breakdown:       Network=%d, Malformed=%d, Short=%d, TXID=%d, Unsupported=%d, Unknown=%d\n", qOtherNetwork, qOtherMalformed, qOtherShort, qOtherTxID, qOtherUnsupported, qOtherUnknown)
 	fmt.Printf("[*] Target Range IP Matches:   %d\n", qTargetMatches)
 	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", qTargetDomains)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", qValidPairs)
@@ -4124,7 +4166,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	requestSent := time.Now()
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
 
-	const maxInboundFrameSize = uint32(16384)
+	maxInboundFrameSize := uint32(16384)
 	buf := make([]byte, 32768)
 	recvBuf := bytes.Buffer{}
 	headerBlocks := bytes.Buffer{}
@@ -4233,6 +4275,7 @@ ReadLoop:
 						}
 						prof.MaxFrameSize = val
 						prof.HasMaxFrameSize = true
+						maxInboundFrameSize = val
 					case 6:
 						prof.MaxHeaderListSize = val
 						prof.HasMaxHeaderListSize = true
@@ -4297,7 +4340,7 @@ ReadLoop:
 
 						if !cand.ResponseHeadersParsed && !isTrailers {
 							if errHeaders := parseResponseHeaders(cand, headers); errHeaders != nil {
-								return cand, &ProbeError{Stage: ProbeStageH2, Err: errHeaders}
+								return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHeaders, Err: errHeaders}
 							}
 							headerBlocks.Reset()
 
@@ -4308,7 +4351,7 @@ ReadLoop:
 							}
 						} else if isTrailers {
 							if errTrailers := parseTrailers(cand, headers); errTrailers != nil {
-								return cand, &ProbeError{Stage: ProbeStageH2, Err: errTrailers}
+								return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHeaders, Err: errTrailers}
 							}
 						}
 						headerBlocks.Reset()
@@ -4332,7 +4375,7 @@ ReadLoop:
 
 					if !cand.ResponseHeadersParsed {
 						if errHeaders := parseResponseHeaders(cand, headers); errHeaders != nil {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: errHeaders}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHeaders, Err: errHeaders}
 						}
 						headerBlocks.Reset()
 
@@ -4343,7 +4386,7 @@ ReadLoop:
 						}
 					} else {
 						if errTrailers := parseTrailers(cand, headers); errTrailers != nil {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: errTrailers}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHeaders, Err: errTrailers}
 						}
 					}
 					headerBlocks.Reset()
@@ -4416,7 +4459,7 @@ ReadLoop:
 				break ReadLoop
 			}
 			if errors.Is(err, io.EOF) {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: io.EOF}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrEOF, Err: io.EOF}
 			}
 			return cand, &ProbeError{Stage: ProbeStageH2, Err: err}
 		}
@@ -4805,9 +4848,37 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 								pipeStats.DNSTemporary++
 							} else {
 								pipeStats.DNSOtherErr++
+								switch classifyDNSOtherError(err) {
+								case "network":
+									pipeStats.DNSOtherNetworkErr++
+								case "malformed":
+									pipeStats.DNSOtherMalformed++
+								case "short-response":
+									pipeStats.DNSOtherShortResponse++
+								case "txid-mismatch":
+									pipeStats.DNSOtherTxIDMismatch++
+								case "unsupported":
+									pipeStats.DNSOtherUnsupported++
+								default:
+									pipeStats.DNSOtherUnknown++
+								}
 							}
 						} else {
 							pipeStats.DNSOtherErr++
+							switch classifyDNSOtherError(err) {
+							case "network":
+								pipeStats.DNSOtherNetworkErr++
+							case "malformed":
+								pipeStats.DNSOtherMalformed++
+							case "short-response":
+								pipeStats.DNSOtherShortResponse++
+							case "txid-mismatch":
+								pipeStats.DNSOtherTxIDMismatch++
+							case "unsupported":
+								pipeStats.DNSOtherUnsupported++
+							default:
+								pipeStats.DNSOtherUnknown++
+							}
 						}
 					}
 				}
@@ -4941,18 +5012,15 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		}()
 		allowed := make(map[string]bool, len(ipSet))
 		for res := range results {
-			if res.Country == "" || res.Country == "UNKNOWN" {
-				// Preserve historical behavior when the geolocation source cannot classify an IP.
+			if res.Country != "" && res.Country != "UNKNOWN" && strings.EqualFold(res.Country, cfg.TargetCountry) {
 				allowed[res.IP] = true
 				continue
 			}
-			if strings.EqualFold(res.Country, cfg.TargetCountry) {
-				allowed[res.IP] = true
-			} else {
-				pipeStats.mu.Lock()
-				pipeStats.CountryFiltered++
-				pipeStats.mu.Unlock()
-			}
+			// Country filtering is strict, matching the Windows/local-GeoIP behavior:
+			// an unclassified IP is not allowed to bypass the country gate.
+			pipeStats.mu.Lock()
+			pipeStats.CountryFiltered++
+			pipeStats.mu.Unlock()
 		}
 		filtered := validPairs[:0]
 		for _, pair := range validPairs {
@@ -5365,6 +5433,70 @@ func getPrefixes(asn string) []string {
 	return uniqueStrings(prefixes)
 }
 
+func filterPrefixesByCountry(prefixes []string, targetCountry string) []string {
+	if targetCountry == "" || targetCountry == "UNKNOWN" || len(prefixes) == 0 {
+		return append([]string(nil), prefixes...)
+	}
+	targetCountry = strings.ToUpper(strings.TrimSpace(targetCountry))
+
+	type QueryItem struct {
+		Query string `json:"query"`
+	}
+
+	queryToPrefix := make(map[string]string, len(prefixes))
+	queries := make([]QueryItem, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		ip, _, err := net.ParseCIDR(prefix)
+		if err != nil || ip.To4() == nil {
+			continue
+		}
+		ip = ip.To4()
+		q := ip.String()
+		queryToPrefix[q] = prefix
+		queries = append(queries, QueryItem{Query: q})
+	}
+
+	matched := make([]string, 0, len(queries))
+	const batchSize = 100
+	httpClient := &http.Client{Timeout: 4 * time.Second}
+	for i := 0; i < len(queries); i += batchSize {
+		end := i + batchSize
+		if end > len(queries) {
+			end = len(queries)
+		}
+		body, err := json.Marshal(queries[i:end])
+		if err != nil {
+			continue
+		}
+		resp, err := httpClient.Post("http://ip-api.com/batch?fields=query,countryCode,status", "application/json", bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+			var result []struct {
+				Query       string `json:"query"`
+				CountryCode string `json:"countryCode"`
+				Status      string `json:"status"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				return
+			}
+			for _, item := range result {
+				if item.Status == "success" && strings.EqualFold(item.CountryCode, targetCountry) {
+					if prefix, ok := queryToPrefix[item.Query]; ok {
+						matched = append(matched, prefix)
+					}
+				}
+			}
+		}()
+	}
+	return uniqueStrings(matched)
+}
+
 func getCountryCached(rt *RuntimeCaches, ip string) string {
 	if rt != nil {
 		rt.CountryCacheMu.Lock()
@@ -5541,11 +5673,33 @@ func main() {
 	var samplingCIDRs []string
 	if cfg.ScanEntireASN {
 		samplingCIDRs = cidrs
+		if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
+			countryCIDRs := filterPrefixesByCountry(cidrs, cfg.TargetCountry)
+			if len(countryCIDRs) > 0 {
+				samplingCIDRs = countryCIDRs
+				// Match the Windows scanner: always retain the local/target prefix
+				// even when the prefix geolocation service omits or misclassifies it.
+				foundLocal := false
+				for _, prefix := range samplingCIDRs {
+					if prefix == localPrefix {
+						foundLocal = true
+						break
+					}
+				}
+				if !foundLocal && localPrefix != "" {
+					samplingCIDRs = append([]string{localPrefix}, samplingCIDRs...)
+				}
+			} else {
+				log.Printf("[!] Не удалось отфильтровать ASN prefixes по стране %s; sampling оставлен по всем prefix", cfg.TargetCountry)
+			}
+		}
 	} else {
 		samplingCIDRs = []string{localPrefix}
 	}
 	samplingRanges := MergeCIDRs(samplingCIDRs)
 	sampledIPs := SampleIPs(samplingRanges, cfg.MaxIPs, cfg.Seed)
+	// DNS validation intentionally keeps the complete announced ASN, matching the Windows scanner:
+	// sampling is country-aware, while DNS expansion keeps full ASN coverage.
 	dnsRanges := MergeCIDRs(cidrs)
 
 	fmt.Printf("[*] ECS client IP:          %s/%d\n", cfg.ECSIP, cfg.ECSPrefix)
@@ -5553,7 +5707,12 @@ func main() {
 	fmt.Printf("[*] Целевой IP:             %s\n", cfg.TargetIP)
 	fmt.Printf("[*] Announcing ASN:         %s\n", cfg.TargetASN)
 	if cfg.ScanEntireASN {
-		fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN\n", len(cidrs))
+		if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
+			fmt.Printf("[*] Фокус на префиксы:       %d subnet ASN (с учетом страны)\n", len(samplingCIDRs))
+			fmt.Printf("[*] ВНИМАНИЕ: DNS валидация проверяет все %d префиксов ASN для расширения покрытия.\n", len(cidrs))
+		} else {
+			fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN\n", len(samplingCIDRs))
+		}
 	} else {
 		fmt.Printf("[*] Фокус на IPv4 prefix:   %s (DNS-валидация по всем %d префиксам ASN)\n", localPrefix, len(cidrs))
 	}
