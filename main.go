@@ -652,69 +652,58 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	type scoredResolver struct {
+	type candidate struct {
 		resolver string
-		score    float64
 		ord      int
-		until    time.Time
+		health   float64
 	}
-	eligible := make([]scoredResolver, 0, len(resolvers))
-	var earliest string
-	var earliestUntil time.Time
-
+	eligible := make([]candidate, 0, len(resolvers))
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
 		if r.DNSDisabledForRun[resolver] {
 			continue
 		}
-		until := r.DNSCooldownUntil[resolver]
-		if !until.IsZero() && now.Before(until) {
-			if earliest == "" || until.Before(earliestUntil) {
-				earliest = resolver
-				earliestUntil = until
-			}
+		if until := r.DNSCooldownUntil[resolver]; !until.IsZero() && now.Before(until) {
 			continue
 		}
-
-		// Health-aware ordering deliberately uses ONLY the recent sliding window.
-		// Historical Attempts/Failures never participate in the scheduling score.
-		score := 1.0
+		health := 1.0
 		if hw := r.DNSHealthWindows[resolver]; hw != nil && hw.Count > 0 {
 			failureRate := float64(hw.Failures) / float64(hw.Count)
-			score *= 1.0 - 0.75*failureRate
-			if score < 0.25 {
-				score = 0.25
+			health = 1.0 - 0.75*failureRate
+			if health < 0.25 {
+				health = 0.25
 			}
 		}
-		if st := r.DNSResolverStats[resolver]; st != nil && st.RTTMs > 0 {
-			// RTT influences preference gently; it cannot starve slower resolvers.
-			latencyFactor := 250.0 / math.Max(50.0, st.RTTMs)
-			if latencyFactor > 1.5 {
-				latencyFactor = 1.5
-			}
-			if latencyFactor < 0.5 {
-				latencyFactor = 0.5
-			}
-			score *= latencyFactor
-		}
-		eligible = append(eligible, scoredResolver{resolver: resolver, score: score, ord: i, until: until})
+		eligible = append(eligible, candidate{resolver: resolver, ord: i, health: health})
+	}
+	if len(eligible) == 0 {
+		return nil
 	}
 
-	// Stable health-aware round-robin: preserve rotation as the tie-breaker,
-	// while moving clearly healthier resolvers toward the front of each batch.
-	sort.SliceStable(eligible, func(i, j int) bool {
-		if math.Abs(eligible[i].score-eligible[j].score) > 0.05 {
-			return eligible[i].score > eligible[j].score
+	// Round-robin is the primary policy. Health is only a bounded local
+	// preference, so one healthy resolver cannot monopolize the whole run.
+	for i := 1; i < len(eligible); i++ {
+		best := i
+		for j := i - 1; j >= 0; j-- {
+			if eligible[j].health+0.20 < eligible[best].health {
+				break
+			}
+			if eligible[j].health < eligible[best].health+0.20 {
+				continue
+			}
+			best = j
 		}
-		return eligible[i].ord < eligible[j].ord
-	})
+		if best != i {
+			tmp := eligible[i]
+			copy(eligible[best+1:i+1], eligible[best:i])
+			eligible[best] = tmp
+		}
+	}
 
 	order := make([]string, 0, len(eligible))
 	for _, item := range eligible {
 		order = append(order, item.resolver)
 	}
-	// Never bypass an active cooldown. An all-cooldown pool falls through to
-	// DoH/system fallback instead of immediately retrying the same resolver.
 	return order
 }
 
@@ -1600,7 +1589,7 @@ func CleanDomain(d string) string {
 	if net.ParseIP(d) != nil {
 		return ""
 	}
-	if !domainRe.MatchString(d) {
+	if len(d) > 253 || !domainRe.MatchString(d) {
 		return ""
 	}
 	return d
@@ -3010,6 +2999,7 @@ type RootJob struct {
 	Cancel context.CancelFunc
 }
 
+// Stage C policy: a provider that has failed/been disabled for this run is never awaited again.
 func RunStageC(
 	ctx context.Context,
 	roots []RootCandidate,
@@ -4003,46 +3993,20 @@ type ProbeError struct {
 	Err   error
 }
 
-func classifyH2Error(err error) H2ErrorCode {
-	if err == nil {
-		return H2ErrUnknown
-	}
-	s := strings.ToLower(err.Error())
-	switch {
-	case errors.Is(err, io.EOF) || strings.Contains(s, "unexpected eof") || strings.HasSuffix(s, " eof"):
-		return H2ErrEOF
-	case os.IsTimeout(err) || strings.Contains(s, "deadline") || strings.Contains(s, "i/o timeout"):
-		return H2ErrTimeout
-	case strings.Contains(s, "connection reset"):
-		return H2ErrConnectionReset
-	case strings.Contains(s, "broken pipe"):
-		return H2ErrBrokenPipe
-	case strings.Contains(s, "400 bad request") || strings.Contains(s, "http/1.1"):
-		return H2ErrBadRequest
-	case strings.Contains(s, "goaway"):
-		return H2ErrGoAway
-	case strings.Contains(s, "tls:"):
-		return H2ErrTLSAlert
-	case strings.Contains(s, "continuation"):
-		return H2ErrBadContinuation
-	case strings.Contains(s, "hpack"):
-		return H2ErrHPACK
-	case strings.Contains(s, "settings"):
-		return H2ErrSettings
-	case strings.Contains(s, "window_update"), strings.Contains(s, "flow"):
-		return H2ErrFlowControl
-	case strings.Contains(s, "headers"):
-		return H2ErrHeaders
-	case strings.Contains(s, "invalid h2"), strings.Contains(s, "invalid frame"):
-		return H2ErrInvalidFrame
-	default:
-		return H2ErrUnknown
-	}
-}
-
 func normalizeProbeError(pe *ProbeError) *ProbeError {
-	if pe != nil && pe.Stage == ProbeStageH2 && pe.Code == H2ErrUnknown {
-		pe.Code = classifyH2Error(pe.Err)
+	if pe == nil || pe.Stage != ProbeStageH2 || pe.Code != H2ErrUnknown {
+		return pe
+	}
+	if errors.Is(pe.Err, io.EOF) {
+		pe.Code = H2ErrEOF
+	} else if errors.Is(pe.Err, context.DeadlineExceeded) || os.IsTimeout(pe.Err) {
+		pe.Code = H2ErrTimeout
+	} else if errors.Is(pe.Err, syscall.ECONNRESET) {
+		pe.Code = H2ErrConnectionReset
+	} else if errors.Is(pe.Err, syscall.EPIPE) {
+		pe.Code = H2ErrBrokenPipe
+	} else {
+		pe.Code = H2ErrUnknown
 	}
 	return pe
 }
@@ -4179,7 +4143,7 @@ ReadLoop:
 		if n > 0 {
 			recvBuf.Write(buf[:n])
 			if recvBuf.Len() > MaxH2BufferedBytes {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("H2 receive buffer exceeded %d bytes", MaxH2BufferedBytes)}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("H2 receive buffer exceeded %d bytes", MaxH2BufferedBytes)}
 			}
 		}
 
@@ -4187,7 +4151,7 @@ ReadLoop:
 			data := recvBuf.Bytes()
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
 			if length > maxInboundFrameSize {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("inbound frame exceeds limit: %d", length)}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("inbound frame exceeds limit: %d", length)}
 			}
 			if uint32(recvBuf.Len()) < 9+length {
 				break
@@ -4196,7 +4160,7 @@ ReadLoop:
 			if !firstFrameSeen {
 				cand.Timings.H2FirstFrame = time.Since(requestSent)
 				if frameType != FrameSettings {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2 preface sequence: first server frame is type %d, want SETTINGS", frameType)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("invalid H2 preface sequence: first server frame is type %d, want SETTINGS", frameType)}
 				}
 				firstFrameSeen = true
 			}
@@ -4206,34 +4170,34 @@ ReadLoop:
 			recvBuf.Next(int(9 + length))
 
 			if expectingContinuation && frameType != FrameContinuation {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid H2: expected CONTINUATION, got frame type %d", frameType)}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, Err: fmt.Errorf("invalid H2: expected CONTINUATION, got frame type %d", frameType)}
 			}
 			if !expectingContinuation && frameType == FrameContinuation {
-				return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("unexpected CONTINUATION frame")}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, Err: fmt.Errorf("unexpected CONTINUATION frame")}
 			}
 
 			switch frameType {
 			case FrameSettings, FrameGoAway, FrameWindowUpdate:
 				if streamID != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
 				}
 			case FrameHeaders, FrameData, FrameRSTStream, FrameContinuation:
 				if streamID == 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("frame type %d must use non-zero stream", frameType)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("frame type %d must use non-zero stream", frameType)}
 				}
 			}
 
 			switch frameType {
 			case FrameSettings:
 				if length%6 != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS length: %d", length)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrSettings, Err: fmt.Errorf("invalid SETTINGS length: %d", length)}
 				}
 				if flags&^FlagAck != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid SETTINGS flags: 0x%x", flags)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrSettings, Err: fmt.Errorf("invalid SETTINGS flags: 0x%x", flags)}
 				}
 				if flags&FlagAck != 0 {
 					if length != 0 {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("SETTINGS ACK with non-zero payload")}
+						return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrSettings, Err: fmt.Errorf("SETTINGS ACK with non-zero payload")}
 					}
 					cand.H2SettingsAckReceived = true
 					cand.SettingsAckCount++
@@ -4253,19 +4217,19 @@ ReadLoop:
 						prof.HasHeaderTableSize = true
 						decoder.SetMaxDynamicTableSize(val)
 					case 2:
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("server sent SETTINGS_ENABLE_PUSH")}
+						return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrSettings, Err: fmt.Errorf("server sent SETTINGS_ENABLE_PUSH")}
 					case 3:
 						prof.MaxConcurrentStreams = val
 						prof.HasMaxConcurrentStreams = true
 					case 4:
 						if val > 0x7fffffff {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid INITIAL_WINDOW_SIZE: %d", val)}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrSettings, Err: fmt.Errorf("invalid INITIAL_WINDOW_SIZE: %d", val)}
 						}
 						prof.InitialWindowSize = val
 						prof.HasInitialWindowSize = true
 					case 5:
 						if val < 16384 || val > 16777215 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid MAX_FRAME_SIZE: %d", val)}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrSettings, Err: fmt.Errorf("invalid MAX_FRAME_SIZE: %d", val)}
 						}
 						prof.MaxFrameSize = val
 						prof.HasMaxFrameSize = true
@@ -4300,25 +4264,25 @@ ReadLoop:
 					padLen := 0
 					if flags&FlagPadded != 0 {
 						if len(actualPayload) < 1 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED HEADERS payload too short")}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHeaders, Err: fmt.Errorf("PADDED HEADERS payload too short")}
 						}
 						padLen = int(actualPayload[0])
 						actualPayload = actualPayload[1:]
 					}
 					if flags&FlagPriority != 0 {
 						if len(actualPayload) < 5 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PRIORITY HEADERS payload too short")}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHeaders, Err: fmt.Errorf("PRIORITY HEADERS payload too short")}
 						}
 						actualPayload = actualPayload[5:]
 					}
 					if padLen > len(actualPayload) {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("HEADERS padding exceeds payload")}
+						return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHeaders, Err: fmt.Errorf("HEADERS padding exceeds payload")}
 					}
 					actualPayload = actualPayload[:len(actualPayload)-padLen]
 
 					headerBlocks.Write(actualPayload)
 					if headerBlocks.Len() > MaxH2HeaderBlockBytes {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("H2 header block exceeded %d bytes", MaxH2HeaderBlockBytes)}
+						return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHeaders, Err: fmt.Errorf("H2 header block exceeded %d bytes", MaxH2HeaderBlockBytes)}
 					}
 					if (flags & FlagEndHeaders) == 0 {
 						expectingContinuation = true
@@ -4328,7 +4292,7 @@ ReadLoop:
 						headers, errDecode := decoder.DecodeFull(headerBlocks.Bytes())
 						if errDecode != nil {
 							cand.HPACKErrors = true
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("HPACK decode: %w", errDecode)}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHPACK, Err: fmt.Errorf("HPACK decode: %w", errDecode)}
 						}
 
 						if !cand.ResponseHeadersParsed && !isTrailers {
@@ -4363,7 +4327,7 @@ ReadLoop:
 					headers, errDecode := decoder.DecodeFull(headerBlocks.Bytes())
 					if errDecode != nil {
 						cand.HPACKErrors = true
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("HPACK decode: %w", errDecode)}
+						return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrHPACK, Err: fmt.Errorf("HPACK decode: %w", errDecode)}
 					}
 
 					if !cand.ResponseHeadersParsed {
@@ -4394,13 +4358,13 @@ ReadLoop:
 					padLen := 0
 					if flags&FlagPadded != 0 {
 						if len(actualPayload) < 1 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("PADDED DATA payload too short")}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("PADDED DATA payload too short")}
 						}
 						padLen = int(actualPayload[0])
 						actualPayload = actualPayload[1:]
 					}
 					if padLen > len(actualPayload) {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("DATA padding exceeds payload")}
+						return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("DATA padding exceeds payload")}
 					}
 					actualPayload = actualPayload[:len(actualPayload)-padLen]
 
@@ -4417,14 +4381,14 @@ ReadLoop:
 				}
 			case FrameWindowUpdate:
 				if length != 4 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid WINDOW_UPDATE length: %d", length)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrFlowControl, Err: fmt.Errorf("invalid WINDOW_UPDATE length: %d", length)}
 				}
 				if binary.BigEndian.Uint32(payload)&0x7fffffff == 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("WINDOW_UPDATE increment is zero")}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrFlowControl, Err: fmt.Errorf("WINDOW_UPDATE increment is zero")}
 				}
 			case FrameRSTStream:
 				if length != 4 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid RST_STREAM length: %d", length)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("invalid RST_STREAM length: %d", length)}
 				}
 				if streamID == 1 {
 					cand.StreamReset = true
@@ -4432,7 +4396,7 @@ ReadLoop:
 				}
 			case FrameGoAway:
 				if length < 8 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("invalid GOAWAY length: %d", length)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrGoAway, Err: fmt.Errorf("invalid GOAWAY length: %d", length)}
 				}
 				cand.GoAwaySeen = true
 			}
@@ -4447,7 +4411,7 @@ ReadLoop:
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				cand.ReadTimeout = true
 				if !cand.H2ProtocolConfirmed {
-					return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("H2 read timeout before protocol confirmation: %w", err)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrTimeout, Err: fmt.Errorf("H2 read timeout before protocol confirmation: %w", err)}
 				}
 				break ReadLoop
 			}
@@ -4459,7 +4423,7 @@ ReadLoop:
 	}
 
 	if !cand.H2SettingsReceived || !cand.H2ProtocolConfirmed {
-		return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("no valid H2 SETTINGS exchange received")}
+		return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrSettings, Err: fmt.Errorf("no valid H2 SETTINGS exchange received")}
 	}
 
 	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertChainValid && cand.CertValidTime
@@ -4507,30 +4471,15 @@ func scoreH2Profile(c *Candidate) float64 {
 }
 
 func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bool {
-	if !cand.H2ProtocolConfirmed {
+	if cand == nil || !cand.H2ProtocolConfirmed || !cand.CertChainValid || !cand.CertSNIMatch || !cand.CertValidTime || !cand.TLS13 || cand.ALPN != "h2" {
 		return false
 	}
 
-	rs := RealityScore{}
-
-	if cand.TLS13 {
-		rs.TLSQuality += 10.0
+	rs := RealityScore{
+		TLSQuality:  20.0,
+		Certificate: 20.0,
+		H2Profile:   scoreH2Profile(cand),
 	}
-	if cand.ALPN == "h2" {
-		rs.TLSQuality += 10.0
-	}
-
-	if cand.CertValidTime {
-		rs.Certificate += 5.0
-	}
-	if cand.CertSNIMatch {
-		rs.Certificate += 10.0
-	}
-	if cand.CertChainValid {
-		rs.Certificate += 5.0
-	}
-
-	rs.H2Profile = scoreH2Profile(cand)
 
 	if cand.Server != "" && cand.Server != "-" {
 		srvLower := strings.ToLower(cand.Server)
@@ -4606,18 +4555,18 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 	rs.DiscoveryScore = math.Min(discovery, 10.0)
 
 	rtt := cand.Timings.TotalProbeLatency().Milliseconds()
-	if rtt <= 50 {
+	switch {
+	case rtt <= 50:
 		rs.Latency = 10
-	} else if rtt <= 150 {
+	case rtt <= 150:
 		rs.Latency = 7
-	} else if rtt <= 300 {
+	case rtt <= 300:
 		rs.Latency = 4
-	} else {
+	default:
 		rs.Latency = 1
 	}
 
-	rs.Total = rs.H2Profile + rs.ServerProfile + rs.HTTPBehavior + rs.DiscoveryScore + rs.Latency
-
+	rs.Total = rs.TLSQuality + rs.Certificate + rs.H2Profile + rs.ServerProfile + rs.HTTPBehavior + rs.DiscoveryScore + rs.Latency
 	scorePenalty := 0.0
 	switch cand.DomainQuality {
 	case "Numeric":
@@ -4631,14 +4580,10 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 		scorePenalty += 10.0
 	}
 
-	cand.RealityFeasible = cand.TLS13 && cand.ALPN == "h2" && cand.CertSNIMatch && cand.CertChainValid && cand.CertValidTime
+	cand.RealityFeasible = true
 	cand.RealityScore = rs
 	cand.DomainPenalty = scorePenalty
 	cand.Score = rs.Total - scorePenalty
-
-	// A confirmed H2 response with a valid HTTP status is already a working
-	// candidate. Score is for ranking only; it must never silently discard a
-	// technically valid target. Low scores remain visible in telemetry.
 	if cand.Score < 0 && pipeStats != nil {
 		pipeStats.mu.Lock()
 		pipeStats.LowScoreCandidates++
@@ -5486,15 +5431,17 @@ func getASNAndPrefix(ip string) (string, string) {
 	if asn == "" {
 		resp2, err2 := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=as", ip))
 		if err2 == nil {
-			var res2 struct {
-				AS string `json:"as"`
-			}
-			if err := json.NewDecoder(resp2.Body).Decode(&res2); err == nil && res2.AS != "" {
-				parts := strings.Split(res2.AS, " ")
-				if len(parts) > 0 {
-					asn = strings.ToUpper(parts[0])
-					if !strings.HasPrefix(asn, "AS") {
-						asn = "AS" + asn
+			if resp2.StatusCode == http.StatusOK {
+				var res2 struct {
+					AS string `json:"as"`
+				}
+				if err := json.NewDecoder(resp2.Body).Decode(&res2); err == nil && res2.AS != "" {
+					parts := strings.Split(res2.AS, " ")
+					if len(parts) > 0 {
+						asn = strings.ToUpper(parts[0])
+						if !strings.HasPrefix(asn, "AS") {
+							asn = "AS" + asn
+						}
 					}
 				}
 			}
