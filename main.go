@@ -68,8 +68,10 @@ const (
 	PTRQueryTimeoutDefault = 1000 * time.Millisecond
 	DNSCooldownBase        = 2 * time.Second
 	DNSCooldownMax         = 30 * time.Second
-	DNSMaxAttemptsA        = 5
-	DNSMaxAttemptsPTR      = 8
+	DNSMaxAttemptsA        = 4
+	DNSMaxAttemptsPTR      = 6
+	DNSResolutionBudgetA   = 4500 * time.Millisecond
+	DNSResolutionBudgetPTR = 6000 * time.Millisecond
 	DNSWarmupTimeout       = 900 * time.Millisecond
 	DNSAdaptiveTimeoutMin  = 700 * time.Millisecond
 	DNSAdaptiveTimeoutMax  = 1500 * time.Millisecond
@@ -99,6 +101,14 @@ var (
 
 	uaRng *rand.Rand
 	uaMu  sync.Mutex
+
+	dnsDoHHTTPClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        32,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
 )
 
 type Config struct {
@@ -1175,6 +1185,9 @@ func (r *RuntimeCaches) dnsResolverTimeout(resolver string, fallback time.Durati
 }
 
 func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
+	resolutionCtx, resolutionCancel := context.WithTimeout(ctx, DNSResolutionBudgetA)
+	defer resolutionCancel()
+	ctx = resolutionCtx
 	domain = CleanDomain(domain)
 	if domain == "" {
 		return nil, fmt.Errorf("invalid domain")
@@ -1202,9 +1215,10 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, resolverTimeout)
 
-		// UDP timeout or truncation: fall back to TCP on the same resolver once.
-		// If TCP also fails, immediately rotate to the next healthy resolver.
-		if errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		// TCP fallback is reserved for a genuinely truncated UDP response.
+		// A UDP timeout means this resolver/route did not answer in time; opening
+		// a synchronous TCP connection here would only double the latency budget.
+		if errors.Is(err, ErrDNSTruncated) {
 			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, resolverTimeout)
 			if tcpErr == nil {
 				ips, err = tcpIPs, nil
@@ -1271,6 +1285,9 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 }
 
 func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
+	resolutionCtx, resolutionCancel := context.WithTimeout(ctx, DNSResolutionBudgetPTR)
+	defer resolutionCancel()
+	ctx = resolutionCtx
 	rev, err := reverseIPv4(ip)
 	if err != nil {
 		return nil, err
@@ -1320,7 +1337,7 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, resolverTimeout)
-		if errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		if errors.Is(err, ErrDNSTruncated) {
 			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, resolverTimeout); tcpErr == nil {
 				names, err = tcpNames, nil
 			} else {
@@ -1412,7 +1429,7 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		}
 		req.Header.Set("Accept", "application/dns-json")
 		req.Header.Set("User-Agent", "reality-scanner/1.0")
-		resp, err := (&http.Client{Timeout: timeout}).Do(req)
+		resp, err := dnsDoHHTTPClient.Do(req)
 		if err != nil {
 			cancel()
 			lastErr = err
@@ -2023,7 +2040,7 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 			cleanRes = cleanRes[:acceptedCount]
 		}
 
-		if err == nil && len(cleanRes) > 0 {
+		if len(cleanRes) > 0 {
 			before := len(cleanRes)
 			cleanRes, _ = r.applyGlobalNameBudget(cleanRes)
 			if len(cleanRes) < before {
@@ -2311,6 +2328,10 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 		if err != nil {
 			return result, err
 		}
+		var issuances []struct {
+			ID       string   `json:"id"`
+			DNSNames []string `json:"dns_names"`
+		}
 		if resp.StatusCode != http.StatusOK {
 			errProv := makeProviderHTTPError(resp)
 			resp.Body.Close()
@@ -2318,10 +2339,6 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 				return result, errProv
 			}
 			return nil, errProv
-		}
-		var issuances []struct {
-			ID       string   `json:"id"`
-			DNSNames []string `json:"dns_names"`
 		}
 		err = json.NewDecoder(resp.Body).Decode(&issuances)
 		resp.Body.Close()
@@ -2346,7 +2363,7 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 	return result, nil
 }
 
-type alienVaultProvider struct{}
+type alienVaultProvider struct{ Key string }
 
 func (p *alienVaultProvider) Name() string                 { return "AlienVault" }
 func (p *alienVaultProvider) Category() DiscoveryCategory  { return CatPassiveDNS }
@@ -2365,6 +2382,9 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			return result, err
 		}
 		setBrowserHeaders(req)
+		if p.Key != "" {
+			req.Header.Set("X-OTX-API-KEY", p.Key)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return result, err
@@ -4559,7 +4579,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
-		extProviders = append(extProviders, NewRunner(&alienVaultProvider{}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&alienVaultProvider{Key: "929d56ef744c3b8c178d4726db2ab51838417c06c7f475fa98d571bb50f21a85"}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
 		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 7 * time.Second, MaxConcurrent: 3, MinInterval: 500 * time.Millisecond, MaxNames: 6000, MaxRoots: 100, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 1500, MaxRoots: 150, MaxPages: 1}))
 		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 80, MaxPages: 1}))
@@ -5244,8 +5264,8 @@ func getASNAndPrefix(ip string) (string, string) {
 
 	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
 	if err == nil {
+		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
 		} else {
 			var result struct {
 				Data struct {
@@ -5262,7 +5282,6 @@ func getASNAndPrefix(ip string) (string, string) {
 				}
 				prefix = result.Data.Prefix
 			}
-			resp.Body.Close()
 		}
 	}
 
