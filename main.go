@@ -487,6 +487,10 @@ type PipelineStats struct {
 	H2TLSAlerts            int
 	H2OtherErrs            int
 	H2InvalidFrame         int
+	H2InvalidFrameLength   int
+	H2InvalidFrameStreamID int
+	H2InvalidFramePadding  int
+	H2InvalidFramePreface  int
 	H2BadContinuation      int
 	H2HPACKDecode          int
 	H2MissingSettings      int
