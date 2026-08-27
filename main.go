@@ -572,13 +572,14 @@ func (s *PipelineStats) recordProviderStat(name string, cat DiscoveryCategory, r
 }
 
 type DNSResolverStat struct {
-	Attempts int
-	Answers  int
-	NXDomain int
-	Failures int
-	Timeouts int
-	IPv4s    int
-	RTTMs    float64
+	Attempts    int
+	Answers     int
+	NXDomain    int
+	RCODEErrors int
+	Failures    int
+	Timeouts    int
+	IPv4s       int
+	RTTMs       float64
 }
 
 type DNSHealthWindow struct {
@@ -744,6 +745,16 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 	if errors.Is(err, ErrDNSNXDomain) {
 		stat.NXDomain++
 		// NXDOMAIN is a valid DNS response and MUST NOT count as transport failure.
+		r.recordDNSHealthLocked(resolver, false)
+		r.DNSConsecutiveFailures[resolver] = 0
+		delete(r.DNSCooldownUntil, resolver)
+		return
+	}
+	var rcodeErr *DNSRCODEError
+	if errors.As(err, &rcodeErr) {
+		// FORMERR/SERVFAIL/REFUSED/etc. proves that the resolver answered.
+		// Count it separately, but never quarantine the transport for a DNS-layer RCODE.
+		stat.RCODEErrors++
 		r.recordDNSHealthLocked(resolver, false)
 		r.DNSConsecutiveFailures[resolver] = 0
 		delete(r.DNSCooldownUntil, resolver)
@@ -948,6 +959,21 @@ func buildMiekgDNSMessage(domain string, qtype uint16, ecsIP string, ecsPrefix i
 	return m, nil
 }
 
+type DNSRCODEError struct {
+	Code int
+	Name string
+}
+
+func (e *DNSRCODEError) Error() string {
+	if e == nil {
+		return "DNS server returned RCODE"
+	}
+	if e.Name != "" {
+		return fmt.Sprintf("DNS server returned RCODE=%s", e.Name)
+	}
+	return fmt.Sprintf("DNS server returned RCODE=%d", e.Code)
+}
+
 func parseDNSAResponse(msg *mdns.Msg) ([]string, error) {
 	if msg == nil {
 		return nil, fmt.Errorf("nil DNS response")
@@ -956,7 +982,7 @@ func parseDNSAResponse(msg *mdns.Msg) ([]string, error) {
 		return nil, ErrDNSNXDomain
 	}
 	if msg.Rcode != mdns.RcodeSuccess {
-		return nil, fmt.Errorf("DNS server returned RCODE=%s", mdns.RcodeToString[msg.Rcode])
+		return nil, &DNSRCODEError{Code: msg.Rcode, Name: mdns.RcodeToString[msg.Rcode]}
 	}
 	ips := make([]string, 0, len(msg.Answer))
 	for _, rr := range msg.Answer {
@@ -980,7 +1006,7 @@ func parseDNSPTRResponse(msg *mdns.Msg) ([]string, error) {
 		return nil, ErrDNSNXDomain
 	}
 	if msg.Rcode != mdns.RcodeSuccess {
-		return nil, fmt.Errorf("DNS server returned RCODE=%s", mdns.RcodeToString[msg.Rcode])
+		return nil, &DNSRCODEError{Code: msg.Rcode, Name: mdns.RcodeToString[msg.Rcode]}
 	}
 	names := make([]string, 0, len(msg.Answer))
 	for _, rr := range msg.Answer {
@@ -3574,8 +3600,8 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 		if rtCaches.DNSDisabledForRun[resolver] {
 			status = "disabled-run"
 		}
-		fmt.Printf("    %-15s attempts=%d answers=%d ipv4=%d nxdomain=%d failures=%d timeouts=%d status=%s\n",
-			resolver, stat.Attempts, stat.Answers, stat.IPv4s, stat.NXDomain, stat.Failures, stat.Timeouts, status)
+		fmt.Printf("    %-15s attempts=%d answers=%d ipv4=%d nxdomain=%d rcode=%d failures=%d timeouts=%d status=%s\n",
+			resolver, stat.Attempts, stat.Answers, stat.IPv4s, stat.NXDomain, stat.RCODEErrors, stat.Failures, stat.Timeouts, status)
 	}
 	rtCaches.DNSStatsMu.Unlock()
 }
