@@ -3665,6 +3665,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	pH2Other := s.H2OtherErrs
 	pH2InvalidFrame := s.H2InvalidFrame
 	pH2InvalidFrameLength := s.H2InvalidFrameLength
+	pH2InvalidFrameRSTLength := s.H2InvalidFrameRSTLength
 	pH2InvalidFrameStreamID := s.H2InvalidFrameStreamID
 	pH2InvalidFramePadding := s.H2InvalidFramePadding
 	pH2InvalidFramePreface := s.H2InvalidFramePreface
