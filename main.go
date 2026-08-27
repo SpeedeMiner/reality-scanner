@@ -448,6 +448,7 @@ type PipelineStats struct {
 	DNSOtherShortResponse int
 	DNSOtherTxIDMismatch  int
 	DNSOtherUnsupported   int
+	DNSOtherNotFound      int
 	DNSOtherUnknown       int
 	DNSResolvedIPs        int
 	DNSUniqueResolvedIPs  int
@@ -1222,24 +1223,37 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		ordered = ordered[:DNSMaxAttemptsA]
 	}
 	var lastErr error
+	bestErr := error(nil)
+	bestPriority := -1
 	nxCount := 0
 	emptyCount := 0
+	rcodeCount := 0
+
+	rememberErr := func(err error) {
+		if err == nil {
+			return
+		}
+		pri := dnsErrorPriority(err)
+		if pri > bestPriority {
+			bestPriority = pri
+			bestErr = err
+		}
+		lastErr = err
+	}
 
 	for _, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
-		ips, err := dnsExchangeUDP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, resolverTimeout)
+		ips, err := dnsExchangeUDP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 
-		// TCP fallback is reserved for a genuinely truncated UDP response.
-		// A UDP timeout means this resolver/route did not answer in time; opening
-		// a synchronous TCP connection here would only double the latency budget.
+		// TCP is only a truncation fallback. A UDP timeout must not spend another
+		// synchronous timeout budget against the same resolver.
 		if errors.Is(err, ErrDNSTruncated) {
-			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, 1, ecsIP, ecsPrefix, resolverTimeout)
+			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 			if tcpErr == nil {
 				ips, err = tcpIPs, nil
 			} else {
 				err = tcpErr
-				lastErr = tcpErr
 			}
 		}
 		rtCaches.recordDNSResult(resolver, err, time.Since(started), len(ips))
@@ -1253,50 +1267,62 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		}
 		if errors.Is(err, ErrDNSNXDomain) {
 			nxCount++
-			// Require two independent negative answers before declaring NXDOMAIN.
-			// This prevents one resolver's transient/geo-specific negative answer
-			// from suppressing a valid answer from another resolver.
 			if nxCount >= 2 {
 				return nil, ErrDNSNXDomain
 			}
 			continue
 		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("%s: %w", resolver, err)
+		var rcodeErr *DNSRCODEError
+		if errors.As(err, &rcodeErr) {
+			rcodeCount++
+			rememberErr(err)
+			continue
 		}
+		rememberErr(err)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 	}
 
-	// Last-resort DoH with the same ECS prefix. This is intentionally only
-	// used after bounded UDP/TCP attempts so healthy public resolvers remain the
-	// fast path. It is the primary safety net for VPS networks that throttle UDP/53.
+	// DoH is a fallback transport, not a reason to replace the primary DNS
+	// error in telemetry. Only a successful fallback changes the result.
 	if dohIPs, dohErr := resolveADoH(ctx, domain, ecsIP, ecsPrefix, PTRDoHTimeout); dohErr == nil && len(dohIPs) > 0 {
 		rtCaches.DNSStatsMu.Lock()
 		rtCaches.DNSDoHFallbacks++
 		rtCaches.DNSStatsMu.Unlock()
 		return dohIPs, nil
-	} else if dohErr != nil && lastErr == nil {
-		lastErr = dohErr
+	} else if dohErr != nil {
+		// Keep DoH as a last-resort cause only when UDP had no concrete cause.
+		rememberErr(dohErr)
 	}
 
-	// Final compatibility fallback through the host resolver. This path does
-	// not guarantee ECS, but is preferable to losing a live name completely.
 	if sysIPs, sysErr := resolveASystem(ctx, domain); sysErr == nil && len(sysIPs) > 0 {
 		rtCaches.DNSStatsMu.Lock()
 		rtCaches.DNSSystemFallbacks++
 		rtCaches.DNSStatsMu.Unlock()
 		return sysIPs, nil
+	} else if sysErr != nil {
+		rememberErr(sysErr)
 	}
 
 	if nxCount > 0 && emptyCount+nxCount == len(ordered) {
 		return nil, ErrDNSNXDomain
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("all DNS resolvers failed")
+	if bestErr != nil {
+		kind := classifyDNSOtherError(bestErr)
+		if kind == "unknown" {
+			if errors.Is(bestErr, context.DeadlineExceeded) || os.IsTimeout(bestErr) {
+				kind = "timeout"
+			} else if rcodeCount > 0 {
+				kind = "rcode"
+			}
+		}
+		return nil, &DNSAggregateError{Kind: kind, Err: bestErr}
 	}
-	return nil, lastErr
+	if lastErr != nil {
+		return nil, &DNSAggregateError{Kind: classifyDNSOtherError(lastErr), Err: lastErr}
+	}
+	return nil, fmt.Errorf("all DNS resolvers returned no data")
 }
 
 func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
@@ -1680,6 +1706,47 @@ func uniqueStrings(values []string) []string {
 	return result
 }
 
+type DNSAggregateError struct {
+	Kind string
+	Err  error
+}
+
+func (e *DNSAggregateError) Error() string {
+	if e == nil {
+		return "dns aggregate error"
+	}
+	if e.Err == nil {
+		return e.Kind
+	}
+	return e.Err.Error()
+}
+
+func (e *DNSAggregateError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func dnsErrorPriority(err error) int {
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return 3
+	}
+	var rcodeErr *DNSRCODEError
+	if errors.As(err, &rcodeErr) {
+		return 4
+	}
+	if kind := classifyDNSOtherError(err); kind != "unknown" {
+		return 5
+	}
+	// Unknown final fallback errors are intentionally lowest priority so they
+	// cannot overwrite a concrete UDP RCODE/timeout/transport cause.
+	return 1
+}
+
 func classifyDNSOtherError(err error) string {
 	if err == nil {
 		return "unknown"
@@ -1698,6 +1765,8 @@ func classifyDNSOtherError(err error) string {
 		return "short-response"
 	case strings.Contains(s, "unsupported"):
 		return "unsupported"
+	case strings.Contains(s, "no such host"), strings.Contains(s, "name or service not known"):
+		return "name-not-found"
 	default:
 		return "unknown"
 	}
@@ -2360,7 +2429,7 @@ func (p *crtShProvider) Fetch(ctx context.Context, query string, client *http.Cl
 	return subs, nil
 }
 
-type certSpotterProvider struct{}
+type certSpotterProvider struct{ Key string }
 
 func (p *certSpotterProvider) Name() string                 { return "CertSpotter" }
 func (p *certSpotterProvider) Category() DiscoveryCategory  { return CatCertificate }
@@ -2383,6 +2452,9 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 			return result, err
 		}
 		setBrowserHeaders(req)
+		if p.Key != "" {
+			req.Header.Set("Authorization", "Bearer "+p.Key)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return result, err
@@ -3487,6 +3559,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	qOtherShort := s.DNSOtherShortResponse
 	qOtherTxID := s.DNSOtherTxIDMismatch
 	qOtherUnsupported := s.DNSOtherUnsupported
+	qOtherNotFound := s.DNSOtherNotFound
 	qOtherUnknown := s.DNSOtherUnknown
 	qRCODE := s.DNSRCODEErrors
 	qResolved := s.DNSResolvedIPs
@@ -3643,7 +3716,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", qDNS, qDNSSuc, qDNSFail)
 	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", qResolved, qNX, qNoV4)
 	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, RCODE: %d, Other: %d\n", qTimeout, qTemp, qRCODE, qOther)
-	fmt.Printf("    DNS Other breakdown:       Network=%d, Malformed=%d, Short=%d, TXID=%d, Unsupported=%d, Unknown=%d\n", qOtherNetwork, qOtherMalformed, qOtherShort, qOtherTxID, qOtherUnsupported, qOtherUnknown)
+	fmt.Printf("    DNS Other breakdown:       Network=%d, Malformed=%d, Short=%d, TXID=%d, Unsupported=%d, NotFound=%d, Unknown=%d\n", qOtherNetwork, qOtherMalformed, qOtherShort, qOtherTxID, qOtherUnsupported, qOtherNotFound, qOtherUnknown)
 	fmt.Printf("[*] Target Range IP Matches:   %d\n", qTargetMatches)
 	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", qTargetDomains)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", qValidPairs)
@@ -4659,7 +4732,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	var extProviders []*ProviderRunner
 	if !cfg.NoCT {
 		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&certSpotterProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
+		extProviders = append(extProviders, NewRunner(&certSpotterProvider{Key: "k68583_76cap3skvhbzpnt735xyoauopb"}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
 	}
 	if !cfg.NoPassive {
 		extProviders = append(extProviders, NewRunner(&alienVaultProvider{Key: "929d56ef744c3b8c178d4726db2ab51838417c06c7f475fa98d571bb50f21a85"}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
@@ -4861,13 +4934,20 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 									pipeStats.DNSOtherTxIDMismatch++
 								case "unsupported":
 									pipeStats.DNSOtherUnsupported++
+								case "name-not-found":
+									pipeStats.DNSOtherNotFound++
 								default:
 									pipeStats.DNSOtherUnknown++
 								}
 							}
 						} else {
 							pipeStats.DNSOtherErr++
-							switch classifyDNSOtherError(err) {
+							kind := classifyDNSOtherError(err)
+							var aggErr *DNSAggregateError
+							if errors.As(err, &aggErr) && aggErr != nil && aggErr.Kind != "" {
+								kind = aggErr.Kind
+							}
+							switch kind {
 							case "network":
 								pipeStats.DNSOtherNetworkErr++
 							case "malformed":
