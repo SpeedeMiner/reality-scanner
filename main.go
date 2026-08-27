@@ -60,13 +60,10 @@ const (
 	MaxDiscoveredDomains = 50000
 	LimitValidPairs      = 10000
 
-	providerMaxAttempts    = 3
-	providerCBThreshold    = 3
-	providerCBCooldown     = 2 * time.Minute
-	provider429CBCooldown  = 5 * time.Minute
-	providerBackoffInitial = 1 * time.Second
-	providerBackoffSecond  = 3 * time.Second
-	providerMaxRetryAfter  = 60 * time.Second
+	providerCBThreshold   = 3
+	providerCBCooldown    = 2 * time.Minute
+	provider429CBCooldown = 5 * time.Minute
+	providerMaxRetryAfter = 60 * time.Second
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
 	PTRQueryTimeoutDefault = 1000 * time.Millisecond
@@ -80,8 +77,8 @@ const (
 	DNSAdaptiveTimeoutMin  = 700 * time.Millisecond
 	DNSAdaptiveTimeoutMax  = 1500 * time.Millisecond
 	DNSHealthWindowSize    = 32
-	DNSHealthWindowMin     = 32
-	DNSHealthWindowBadRate = 0.95
+	DNSHealthWindowMin     = 8
+	DNSHealthWindowBadRate = 0.90
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	MaxPairEvidenceEntries = LimitValidPairs * 8
@@ -99,7 +96,6 @@ var (
 
 	domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
 	numRe    = regexp.MustCompile(`(?i)(^|\.)\d+\.[a-z]{2,}$`)
-	stampRe  = regexp.MustCompile(`^sdns://[A-Za-z0-9_-]+=*$`)
 
 	ErrProviderNoData = errors.New("provider returned no data")
 
@@ -134,7 +130,6 @@ type Config struct {
 	TargetCountry     string
 	TargetIP          string
 	ScanEntireASN     bool
-	CIDRs             []string
 	Domains           []string
 	NoPTR             bool
 	NoCT              bool
@@ -296,13 +291,11 @@ func (t Timings) TotalProbeLatency() time.Duration { return t.TCP + t.TLS + t.H2
 
 type PeerSettingsProfile struct {
 	HeaderTableSize         uint32
-	EnablePush              uint32
 	MaxConcurrentStreams    uint32
 	InitialWindowSize       uint32
 	MaxFrameSize            uint32
 	MaxHeaderListSize       uint32
 	HasHeaderTableSize      bool
-	HasEnablePush           bool
 	HasMaxConcurrentStreams bool
 	HasInitialWindowSize    bool
 	HasMaxFrameSize         bool
@@ -347,8 +340,6 @@ type Candidate struct {
 	Server                string
 	ContentType           string
 	Timings               Timings
-	ASN                   uint
-	Country               string
 	CDNProvider           string
 	CDNStatus             CDNStatus
 	Score                 float64
@@ -361,8 +352,6 @@ type Candidate struct {
 	Evidence              Evidence
 	DomainQuality         string
 	CertIssuer            string
-	CertSubject           string
-	CertSANCount          int
 	CertValidTime         bool
 	CertSNIMatch          bool
 	SettingsFramesCount   int
@@ -507,7 +496,6 @@ type PipelineStats struct {
 
 	ASNFiltered     int
 	CountryFiltered int
-	CDNDropped      int
 
 	Alloc         TotalAllocationStats
 	StageC        StageCStats
@@ -629,6 +617,9 @@ type RuntimeCaches struct {
 	PTRNegativeIPs         map[string]struct{}
 	DNSDoHFallbacks        int
 	DNSSystemFallbacks     int
+
+	CountryCacheMu sync.Mutex
+	CountryCache   map[string]string
 }
 
 func NewRuntimeCaches() *RuntimeCaches {
@@ -643,18 +634,8 @@ func NewRuntimeCaches() *RuntimeCaches {
 		DNSConsecutiveFailures: make(map[string]int),
 		DNSDisabledForRun:      make(map[string]bool),
 		DNSHealthWindows:       make(map[string]*DNSHealthWindow),
+		CountryCache:           make(map[string]string),
 	}
-}
-
-func (r *RuntimeCaches) dnsResolverStat(resolver string) *DNSResolverStat {
-	r.DNSStatsMu.Lock()
-	defer r.DNSStatsMu.Unlock()
-	stat, ok := r.DNSResolverStats[resolver]
-	if !ok {
-		stat = &DNSResolverStat{}
-		r.DNSResolverStats[resolver] = stat
-	}
-	return stat
 }
 
 func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
@@ -732,9 +713,8 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	for _, item := range eligible {
 		order = append(order, item.resolver)
 	}
-	if len(order) == 0 && earliest != "" && !r.DNSDisabledForRun[earliest] {
-		return []string{earliest}
-	}
+	// Never bypass an active cooldown. An all-cooldown pool falls through to
+	// DoH/system fallback instead of immediately retrying the same resolver.
 	return order
 }
 
@@ -935,18 +915,10 @@ func (c *SafeCache) Put(key string, vals []string, status StatResult, ttl time.D
 	}
 }
 
-// ================= V17 REMEDIATION PLAN =================
-// 1) Keep PTR compatibility: system resolver -> raw UDP/TCP -> DoH; count each path.
-// 2) Keep health-aware round-robin for raw DNS, but rank resolvers by observed failure/RTT.
-// 3) For A/ECS: UDP -> TCP on timeout/truncation -> DoH with ECS -> system resolver.
-// 4) Require two independent NXDOMAIN responses before hard-negative caching.
-// 5) Keep DNS concurrency bounded to 32 workers to avoid VPS UDP burst loss.
-//    Resolver selection remains round-robin; health only gates eligibility.
-// 6) Fix URLScan pagination precision by preserving JSON numeric sort values verbatim.
-// 7) Use the current Anubis DB API path; isolate quota-limited VT/URLScan from hot provider scheduling.
-// 8) Keep score as ranking only; valid H2 + HTTP candidates remain eligible.
-// 9) Distinguish pre-cluster accepted candidates from post-cluster output in telemetry.
-// ================= END V17 REMEDIATION PLAN =================
+// ================= DNS TRANSPORT =================
+// Raw UDP/53 with EDNS Client Subnet is the fast path; TCP is used only for
+// genuinely truncated responses. DoH and the system resolver are bounded fallbacks.
+// Resolver health is based only on the recent sliding window and never on lifetime ratios.
 
 // ================= RAW UDP DNS + EDNS CLIENT SUBNET =================
 
@@ -1487,16 +1459,18 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 				Data string `json:"data"`
 			} `json:"Answer"`
 		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			lastErr = fmt.Errorf("DoH HTTP status=%d", resp.StatusCode)
+			continue
+		}
 		decodeErr := func() error {
 			defer resp.Body.Close()
 			return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
 		}()
 		if decodeErr != nil {
 			lastErr = decodeErr
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			lastErr = fmt.Errorf("DoH HTTP status=%d", resp.StatusCode)
 			continue
 		}
 		if payload.Status == 3 {
@@ -1544,7 +1518,7 @@ func resolvePTRDoH(ctx context.Context, rev string, timeout time.Duration) ([]st
 		"https://dns.google/resolve?name=" + url.QueryEscape(rev) + "&type=PTR",
 		"https://cloudflare-dns.com/dns-query?name=" + url.QueryEscape(rev) + "&type=PTR",
 	}
-	client := &http.Client{Timeout: timeout}
+	client := dnsDoHHTTPClient
 	var lastErr error
 	for _, endpoint := range endpoints {
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -1562,6 +1536,13 @@ func resolvePTRDoH(ctx context.Context, rev string, timeout time.Duration) ([]st
 			lastErr = err
 			continue
 		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			cancel()
+			lastErr = fmt.Errorf("PTR DoH HTTP status=%d", resp.StatusCode)
+			continue
+		}
 		var payload struct {
 			Status int `json:"Status"`
 			Answer []struct {
@@ -1569,8 +1550,10 @@ func resolvePTRDoH(ctx context.Context, rev string, timeout time.Duration) ([]st
 				Data string `json:"data"`
 			} `json:"Answer"`
 		}
-		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
-		resp.Body.Close()
+		decodeErr := func() error {
+			defer resp.Body.Close()
+			return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
+		}()
 		cancel()
 		if decodeErr != nil {
 			lastErr = decodeErr
@@ -1649,6 +1632,39 @@ func limitStr(s string, n int) string {
 	return string(r[:n-3]) + "..."
 }
 
+func cleanUniqueBounded(values []string, limit int) (clean []string, uniqueCount, invalidCount, limitedCount int) {
+	if limit <= 0 {
+		limit = len(values)
+	}
+	seen := make(map[string]struct{}, minInt(limit, 4096))
+	clean = make([]string, 0, minInt(limit, len(values)))
+	for i, raw := range values {
+		d := CleanDomain(raw)
+		if d == "" {
+			invalidCount++
+			continue
+		}
+		if _, exists := seen[d]; exists {
+			continue
+		}
+		if len(clean) >= limit {
+			limitedCount = len(values) - i
+			break
+		}
+		seen[d] = struct{}{}
+		clean = append(clean, d)
+	}
+	uniqueCount = len(clean)
+	return clean, uniqueCount, invalidCount, limitedCount
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]bool)
 	var result []string
@@ -1699,6 +1715,14 @@ func setBrowserHeaders(req *http.Request) {
 	req.Header.Set("Sec-Fetch-Site", "none")
 }
 
+func decodeJSONBody(resp *http.Response, dst interface{}) error {
+	if resp == nil || resp.Body == nil {
+		return fmt.Errorf("nil HTTP response body")
+	}
+	defer resp.Body.Close()
+	return json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(dst)
+}
+
 // ================= SNI PROVIDERS =================
 
 type ProviderHTTPError struct {
@@ -1720,9 +1744,12 @@ func (e *ProviderHTTPError) Error() string {
 }
 
 func makeProviderHTTPError(resp *http.Response) error {
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	body := strings.TrimSpace(string(bodyBytes))
 	body = strings.Join(strings.Fields(body), " ")
+	if readErr != nil {
+		body = strings.TrimSpace(body + " [body read error: " + readErr.Error() + "]")
+	}
 
 	var retryAfter time.Duration
 	if v := resp.Header.Get("Retry-After"); v != "" {
@@ -1743,38 +1770,6 @@ func makeProviderHTTPError(resp *http.Response) error {
 		Body:       body,
 		RetryAfter: retryAfter,
 	}
-}
-
-func providerCooldown(err error) (time.Duration, bool) {
-	var httpErr *ProviderHTTPError
-	if !errors.As(err, &httpErr) {
-		return 0, false
-	}
-
-	switch httpErr.StatusCode {
-	case http.StatusTooManyRequests:
-		if httpErr.RetryAfter > 0 {
-			return httpErr.RetryAfter, true
-		}
-		return provider429CBCooldown, true
-
-	case http.StatusForbidden,
-		http.StatusUnauthorized,
-		http.StatusBadRequest,
-		http.StatusNotFound,
-		http.StatusMethodNotAllowed,
-		http.StatusGone,
-		http.StatusUnprocessableEntity:
-		return providerCBCooldown, true
-
-	case http.StatusInternalServerError,
-		http.StatusBadGateway,
-		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout:
-		return providerCBCooldown, true
-	}
-
-	return 0, false
 }
 
 type ProviderQueryType int
@@ -2068,27 +2063,15 @@ func (r *ProviderRunner) Execute(ctx context.Context, query string, client *http
 		isTimeout := errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)
 
 		rawCount := len(rawRes)
-		var validRes []string
-		invalidCount := 0
-
-		for _, s := range rawRes {
-			if d := CleanDomain(s); d != "" {
-				validRes = append(validRes, d)
-			} else {
-				invalidCount++
-			}
+		maxNames := r.Config.MaxNames
+		if maxNames <= 0 {
+			maxNames = 4096
 		}
+		cleanRes, uniqueCount, invalidCount, limitedCount := cleanUniqueBounded(rawRes, maxNames)
+		acceptedCount := len(cleanRes)
 
-		cleanRes := uniqueStrings(validRes)
-		uniqueCount := len(cleanRes)
-		acceptedCount := uniqueCount
-		limitedCount := 0
-
-		if r.Config.MaxNames > 0 && acceptedCount > r.Config.MaxNames {
-			acceptedCount = r.Config.MaxNames
-			limitedCount = uniqueCount - acceptedCount
-			cleanRes = cleanRes[:acceptedCount]
-		}
+		// The bounded normalizer stops once MaxNames is reached, so no unbounded
+		// validRes slice or uniqueStrings map can be constructed for huge provider responses.
 
 		if len(cleanRes) > 0 {
 			before := len(cleanRes)
@@ -2390,8 +2373,7 @@ func (p *certSpotterProvider) Fetch(ctx context.Context, query string, client *h
 			}
 			return nil, errProv
 		}
-		err = json.NewDecoder(resp.Body).Decode(&issuances)
-		resp.Body.Close()
+		err = decodeJSONBody(resp, &issuances)
 		if err != nil {
 			if len(result) > 0 {
 				return result, err
@@ -2453,8 +2435,7 @@ func (p *alienVaultProvider) Fetch(ctx context.Context, query string, client *ht
 			} `json:"passive_dns"`
 			Next string `json:"next"`
 		}
-		err = json.NewDecoder(resp.Body).Decode(&otxRes)
-		resp.Body.Close()
+		err = decodeJSONBody(resp, &otxRes)
 		if err != nil {
 			if len(result) > 0 {
 				return result, err
@@ -2603,8 +2584,7 @@ func (p *vtDomainProvider) Fetch(ctx context.Context, query string, client *http
 				Cursor string `json:"cursor"`
 			} `json:"meta"`
 		}
-		err = json.NewDecoder(resp.Body).Decode(&res)
-		resp.Body.Close()
+		err = decodeJSONBody(resp, &res)
 		if err != nil {
 			if len(subs) > 0 {
 				return subs, err
@@ -2668,8 +2648,7 @@ func (p *vtIPProvider) Fetch(ctx context.Context, query string, client *http.Cli
 				Cursor string `json:"cursor"`
 			} `json:"meta"`
 		}
-		err = json.NewDecoder(resp.Body).Decode(&res)
-		resp.Body.Close()
+		err = decodeJSONBody(resp, &res)
 		if err != nil {
 			if len(subs) > 0 {
 				return subs, err
@@ -2731,8 +2710,7 @@ func fetchURLScanSearch(ctx context.Context, query string, key string, client *h
 			return nil, errProv
 		}
 		var res URLScanSearchResponse
-		err = json.NewDecoder(resp.Body).Decode(&res)
-		resp.Body.Close()
+		err = decodeJSONBody(resp, &res)
 		if err != nil {
 			if len(domains) > 0 {
 				return domains, err
@@ -2812,7 +2790,6 @@ func (p *chaosProvider) Fetch(ctx context.Context, query string, client *http.Cl
 	}
 	setBrowserHeaders(req)
 	req.Header.Add("Authorization", p.Key)
-	req.Header.Set("Connection", "close")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -3483,6 +3460,8 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	qTargetMatches := s.DNSTargetRangeMatches
 	qTargetDomains := s.DNSTargetDomains
 	qValidPairs := s.DNSValidPairs
+	qASNFiltered := s.ASNFiltered
+	qCountryFiltered := s.CountryFiltered
 
 	pTCP := s.TCPConnected
 	pTCPTimeouts := s.TCPTimeouts
@@ -3580,6 +3559,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("    Failed:                %d\n", stageC.Failed)
 	fmt.Printf("    Skipped (CB/Rate):     %d\n", stageC.Skipped)
 	fmt.Printf("    Reassigned to next:    %d\n", stageC.Reassigned)
+	fmt.Printf("[*] DNS target filters:     ASN=%d | Country=%d | Final pairs=%d\n", qASNFiltered, qCountryFiltered, qValidPairs)
 
 	fmt.Println("\nSNI/Hostname Discovery Providers:")
 	categories := map[DiscoveryCategory][]string{}
@@ -3998,9 +3978,73 @@ const (
 	ProbeStageComplete
 )
 
+type H2ErrorCode uint8
+
+const (
+	H2ErrUnknown H2ErrorCode = iota
+	H2ErrInvalidFrame
+	H2ErrBadContinuation
+	H2ErrHPACK
+	H2ErrSettings
+	H2ErrFlowControl
+	H2ErrHeaders
+	H2ErrTimeout
+	H2ErrConnectionReset
+	H2ErrBrokenPipe
+	H2ErrBadRequest
+	H2ErrGoAway
+	H2ErrEOF
+	H2ErrTLSAlert
+)
+
 type ProbeError struct {
 	Stage ProbeStage
+	Code  H2ErrorCode
 	Err   error
+}
+
+func classifyH2Error(err error) H2ErrorCode {
+	if err == nil {
+		return H2ErrUnknown
+	}
+	s := strings.ToLower(err.Error())
+	switch {
+	case errors.Is(err, io.EOF) || strings.Contains(s, "unexpected eof") || strings.HasSuffix(s, " eof"):
+		return H2ErrEOF
+	case os.IsTimeout(err) || strings.Contains(s, "deadline") || strings.Contains(s, "i/o timeout"):
+		return H2ErrTimeout
+	case strings.Contains(s, "connection reset"):
+		return H2ErrConnectionReset
+	case strings.Contains(s, "broken pipe"):
+		return H2ErrBrokenPipe
+	case strings.Contains(s, "400 bad request") || strings.Contains(s, "http/1.1"):
+		return H2ErrBadRequest
+	case strings.Contains(s, "goaway"):
+		return H2ErrGoAway
+	case strings.Contains(s, "tls:"):
+		return H2ErrTLSAlert
+	case strings.Contains(s, "continuation"):
+		return H2ErrBadContinuation
+	case strings.Contains(s, "hpack"):
+		return H2ErrHPACK
+	case strings.Contains(s, "settings"):
+		return H2ErrSettings
+	case strings.Contains(s, "window_update"), strings.Contains(s, "flow"):
+		return H2ErrFlowControl
+	case strings.Contains(s, "headers"):
+		return H2ErrHeaders
+	case strings.Contains(s, "invalid h2"), strings.Contains(s, "invalid frame"):
+		return H2ErrInvalidFrame
+	default:
+		return H2ErrUnknown
+	}
+}
+
+func normalizeProbeError(pe *ProbeError) *ProbeError {
+	if pe != nil && pe.Stage == ProbeStageH2 && pe.Code == H2ErrUnknown {
+		pe.Code = classifyH2Error(pe.Err)
+	}
+	return pe
 }
 
 func (e *ProbeError) Error() string {
@@ -4080,9 +4124,6 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	if cand.CertIssuer == "" {
 		cand.CertIssuer = cert.Issuer.CommonName
 	}
-	cand.CertSubject = cert.Subject.CommonName
-	cand.CertSANCount = len(cert.DNSNames) + len(cert.IPAddresses)
-
 	now := time.Now()
 	cand.CertValidTime = now.After(cert.NotBefore) && now.Before(cert.NotAfter)
 	cand.CertExpiry = cert.NotAfter
@@ -4203,14 +4244,9 @@ ReadLoop:
 				if cand.H2SettingsReceived {
 					prof = cand.LatestPeerSettings
 				}
-				seenSettings := make(map[uint16]bool)
 				for i := 0; i+6 <= int(length); i += 6 {
 					id := binary.BigEndian.Uint16(payload[i : i+2])
 					val := binary.BigEndian.Uint32(payload[i+2 : i+6])
-					if seenSettings[id] {
-						return cand, &ProbeError{Stage: ProbeStageH2, Err: fmt.Errorf("duplicate SETTINGS identifier: %d", id)}
-					}
-					seenSettings[id] = true
 					switch id {
 					case 1:
 						prof.HeaderTableSize = val
@@ -4315,8 +4351,11 @@ ReadLoop:
 					}
 				}
 			case FrameContinuation:
-				if !expectingContinuation || streamID != activeStreamID {
-					continue
+				if !expectingContinuation {
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, Err: fmt.Errorf("unexpected CONTINUATION frame")}
+				}
+				if streamID != activeStreamID {
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrBadContinuation, Err: fmt.Errorf("CONTINUATION stream mismatch: got %d want %d", streamID, activeStreamID)}
 				}
 				headerBlocks.Write(payload)
 				if (flags & FlagEndHeaders) != 0 {
@@ -4577,7 +4616,7 @@ func validateAndEnrich(cand *Candidate, cfg Config, pipeStats *PipelineStats) bo
 		rs.Latency = 1
 	}
 
-	rs.Total = rs.TLSQuality + rs.Certificate + rs.H2Profile + rs.ServerProfile + rs.HTTPBehavior + rs.DiscoveryScore + rs.Latency
+	rs.Total = rs.H2Profile + rs.ServerProfile + rs.HTTPBehavior + rs.DiscoveryScore + rs.Latency
 
 	scorePenalty := 0.0
 	switch cand.DomainQuality {
@@ -4846,6 +4885,13 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 			for _, resolvedIP := range ips {
 				uniqueResolvedIPs.Store(resolvedIP, struct{}{})
 
+				if !ipInRanges(resolvedIP, scanRanges) {
+					pipeStats.mu.Lock()
+					pipeStats.ASNFiltered++
+					pipeStats.mu.Unlock()
+					continue
+				}
+
 				if ipInRanges(resolvedIP, scanRanges) {
 					uniqueTargetIPs.Store(resolvedIP, struct{}{})
 					matched = true
@@ -4904,8 +4950,81 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	pipeStats.DNSUniqueResolvedIPs = uniqueResolvedCount
 	pipeStats.DNSUniqueTargetIPs = uniqueTargetCount
 	pipeStats.DNSValidPairs = len(validPairs)
-	fmt.Printf("[+] Stage D Завершён. Подтверждено DNS-пар (IP+SNI): %d\n", pipeStats.DNSValidPairs)
 	pipeStats.mu.Unlock()
+
+	if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" && len(validPairs) > 0 {
+		countryWorkers := cfg.Workers
+		if countryWorkers < 1 {
+			countryWorkers = 1
+		}
+		if countryWorkers > 16 {
+			countryWorkers = 16
+		}
+		type countryResult struct {
+			IP      string
+			Country string
+		}
+		ipSet := make(map[string]struct{})
+		for _, pair := range validPairs {
+			ipSet[pair.IP] = struct{}{}
+		}
+		jobs := make(chan string)
+		results := make(chan countryResult, len(ipSet))
+		var cwg sync.WaitGroup
+		for i := 0; i < countryWorkers; i++ {
+			cwg.Add(1)
+			go func() {
+				defer cwg.Done()
+				for ip := range jobs {
+					results <- countryResult{IP: ip, Country: getCountryCached(rtCaches, ip)}
+				}
+			}()
+		}
+		go func() {
+			defer close(results)
+			for ip := range ipSet {
+				select {
+				case jobs <- ip:
+				case <-ctx.Done():
+					close(jobs)
+					cwg.Wait()
+					return
+				}
+			}
+			close(jobs)
+			cwg.Wait()
+		}()
+		allowed := make(map[string]bool, len(ipSet))
+		for res := range results {
+			if res.Country == "" || res.Country == "UNKNOWN" {
+				// Preserve historical behavior when the geolocation source cannot classify an IP.
+				allowed[res.IP] = true
+				continue
+			}
+			if strings.EqualFold(res.Country, cfg.TargetCountry) {
+				allowed[res.IP] = true
+			} else {
+				pipeStats.mu.Lock()
+				pipeStats.CountryFiltered++
+				pipeStats.mu.Unlock()
+			}
+		}
+		filtered := validPairs[:0]
+		for _, pair := range validPairs {
+			if allowed[pair.IP] {
+				filtered = append(filtered, pair)
+			}
+		}
+		validPairs = filtered
+	}
+
+	pipeStats.mu.Lock()
+	pipeStats.DNSValidPairs = len(validPairs)
+	finalPairCount := pipeStats.DNSValidPairs
+	finalASNFiltered := pipeStats.ASNFiltered
+	finalCountryFiltered := pipeStats.CountryFiltered
+	pipeStats.mu.Unlock()
+	fmt.Printf("[+] Stage D Завершён. Подтверждено DNS-пар (IP+SNI): %d | ASN filtered: %d | Country filtered: %d\n", finalPairCount, finalASNFiltered, finalCountryFiltered)
 
 	if len(validPairs) == 0 {
 		return nil
@@ -4936,6 +5055,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				}
 
 				cand, pErr := ProbeH2(ctx, p.IP, p.SNI, p.Evidence, cfg)
+				pErr = normalizeProbeError(pErr)
 
 				pipeStats.mu.Lock()
 
@@ -4985,33 +5105,33 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 				}
 
 				if pErr != nil {
-					errStr := pErr.Err.Error()
-					lowerErr := strings.ToLower(errStr)
-					switch {
-					case os.IsTimeout(pErr.Err) || strings.Contains(lowerErr, "deadline") || strings.Contains(lowerErr, "i/o timeout") || (cand != nil && cand.ReadTimeout):
+					switch pErr.Code {
+					case H2ErrTimeout:
 						pipeStats.H2TimeoutNoFrames++
-					case strings.Contains(lowerErr, "connection reset"):
+					case H2ErrConnectionReset:
 						pipeStats.H2ConnectionReset++
-					case strings.Contains(lowerErr, "broken pipe"):
+					case H2ErrBrokenPipe:
 						pipeStats.H2BrokenPipe++
-					case strings.Contains(errStr, "400 Bad Request") || strings.Contains(errStr, "HTTP/1.1"):
+					case H2ErrBadRequest:
 						pipeStats.H2BadRequest++
-					case cand != nil && cand.GoAwaySeen:
+					case H2ErrGoAway:
 						pipeStats.H2GoAway++
-					case errors.Is(pErr.Err, io.EOF) || strings.Contains(errStr, "EOF"):
+					case H2ErrEOF:
 						pipeStats.H2EOF++
-					case strings.Contains(lowerErr, "tls:"):
+					case H2ErrTLSAlert:
 						pipeStats.H2TLSAlerts++
-					case strings.Contains(lowerErr, "expected continuation"):
+					case H2ErrBadContinuation:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2BadContinuation++
-					case strings.Contains(lowerErr, "invalid h2"):
+					case H2ErrInvalidFrame:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2InvalidFrame++
-					case strings.Contains(lowerErr, "hpack decode") || strings.Contains(lowerErr, "hpack"):
+					case H2ErrHPACK:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2HPACKDecode++
-					default:
+					case H2ErrSettings:
+						pipeStats.H2OtherErrs++
+					case H2ErrFlowControl, H2ErrHeaders, H2ErrUnknown:
 						pipeStats.H2OtherErrs++
 					}
 					pipeStats.mu.Unlock()
@@ -5300,6 +5420,24 @@ func getPrefixes(asn string) []string {
 	return uniqueStrings(prefixes)
 }
 
+func getCountryCached(rt *RuntimeCaches, ip string) string {
+	if rt != nil {
+		rt.CountryCacheMu.Lock()
+		if country, ok := rt.CountryCache[ip]; ok {
+			rt.CountryCacheMu.Unlock()
+			return country
+		}
+		rt.CountryCacheMu.Unlock()
+	}
+	country := getCountry(ip)
+	if rt != nil {
+		rt.CountryCacheMu.Lock()
+		rt.CountryCache[ip] = country
+		rt.CountryCacheMu.Unlock()
+	}
+	return country
+}
+
 func getCountry(ip string) string {
 	client := &http.Client{Timeout: 4 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode", ip))
@@ -5326,8 +5464,7 @@ func getASNAndPrefix(ip string) (string, string) {
 	resp, err := client.Get(fmt.Sprintf("https://stat.ripe.net/data/network-info/data.json?resource=%s", ip))
 	if err == nil {
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-		} else {
+		if resp.StatusCode == http.StatusOK {
 			var result struct {
 				Data struct {
 					ASNs   []interface{} `json:"asns"`
