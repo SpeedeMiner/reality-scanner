@@ -4982,9 +4982,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	var extProviders []*ProviderRunner
 	extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
 	extProviders = append(extProviders, NewRunner(&certSpotterProvider{Key: "k68583_76cap3skvhbzpnt735xyoauopb"}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
-	if key := os.Getenv("ALIENVAULT_API_KEY"); key != "" {
-		extProviders = append(extProviders, NewRunner(&alienVaultProvider{Key: key}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
-	}
+	extProviders = append(extProviders, NewRunner(&alienVaultProvider{Key: "929d56ef744c3b8c178d4726db2ab51838417c06c7f475fa98d571bb50f21a85"}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
 	extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 7 * time.Second, MaxConcurrent: 3, MinInterval: 500 * time.Millisecond, MaxNames: 6000, MaxRoots: 100, MaxPages: 1}))
 	extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 1500, MaxRoots: 150, MaxPages: 1}))
 	extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 80, MaxPages: 1}))
