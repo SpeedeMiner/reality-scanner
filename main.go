@@ -76,8 +76,8 @@ const (
 	DNSAdaptiveTimeoutMin  = 700 * time.Millisecond
 	DNSAdaptiveTimeoutMax  = 1500 * time.Millisecond
 	DNSHealthWindowSize    = 32
-	DNSHealthWindowMin     = 24
-	DNSHealthWindowBadRate = 0.90
+	DNSHealthWindowMin     = 32
+	DNSHealthWindowBadRate = 0.95
 	PTRDoHTimeout          = 1200 * time.Millisecond
 	DefaultECSIPv4Prefix   = 24
 	MaxPairEvidenceEntries = LimitValidPairs * 8
@@ -447,6 +447,7 @@ type PipelineStats struct {
 	DNSTemporary          int
 	DNSNoIPv4             int
 	DNSOtherErr           int
+	DNSRCODEErrors        int
 	DNSResolvedIPs        int
 	DNSUniqueResolvedIPs  int
 	DNSUniqueTargetIPs    int
@@ -3428,6 +3429,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	qTimeout := s.DNSTimeout
 	qTemp := s.DNSTemporary
 	qOther := s.DNSOtherErr
+	qRCODE := s.DNSRCODEErrors
 	qResolved := s.DNSResolvedIPs
 	qTargetMatches := s.DNSTargetRangeMatches
 	qTargetDomains := s.DNSTargetDomains
@@ -3578,7 +3580,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("[*] DNS healthy for run: %d/%d\n", healthyRun, len(cfg.DNSResolvers))
 	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", qDNS, qDNSSuc, qDNSFail)
 	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", qResolved, qNX, qNoV4)
-	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, Other: %d\n", qTimeout, qTemp, qOther)
+	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, RCODE: %d, Other: %d\n", qTimeout, qTemp, qRCODE, qOther)
 	fmt.Printf("[*] Target Range IP Matches:   %d\n", qTargetMatches)
 	fmt.Printf("[*] DNS доменов с Target IP:   %d\n", qTargetDomains)
 	fmt.Printf("[*] Подтверждено DNS-пар:      %d\n", qValidPairs)
@@ -4022,9 +4024,12 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	}
 
 	cert := state.PeerCertificates[0]
-	cand.CertIssuer = cert.Issuer.CommonName
-	if cand.CertIssuer == "" && len(cert.Issuer.Organization) > 0 {
+	cand.CertIssuer = ""
+	if len(cert.Issuer.Organization) > 0 {
 		cand.CertIssuer = cert.Issuer.Organization[0]
+	}
+	if cand.CertIssuer == "" {
+		cand.CertIssuer = cert.Issuer.CommonName
 	}
 	cand.CertSubject = cert.Subject.CommonName
 	cand.CertSANCount = len(cert.DNSNames) + len(cert.IPAddresses)
@@ -4751,19 +4756,26 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					pipeStats.DNSNXDomain++
 				} else {
 					pipeStats.DNSFailed++
-					var dnsErr *net.DNSError
-					if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-						pipeStats.DNSTimeout++
-					} else if errors.As(err, &dnsErr) {
-						if dnsErr.Timeout() {
+					var rcodeErr *DNSRCODEError
+					if errors.As(err, &rcodeErr) {
+						// The recursive resolver answered at DNS protocol level; this is
+						// not a transport failure and must not inflate generic "Other".
+						pipeStats.DNSRCODEErrors++
+					} else {
+						var dnsErr *net.DNSError
+						if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
 							pipeStats.DNSTimeout++
-						} else if dnsErr.Temporary() {
-							pipeStats.DNSTemporary++
+						} else if errors.As(err, &dnsErr) {
+							if dnsErr.Timeout() {
+								pipeStats.DNSTimeout++
+							} else if dnsErr.Temporary() {
+								pipeStats.DNSTemporary++
+							} else {
+								pipeStats.DNSOtherErr++
+							}
 						} else {
 							pipeStats.DNSOtherErr++
 						}
-					} else {
-						pipeStats.DNSOtherErr++
 					}
 				}
 				pipeStats.mu.Unlock()
@@ -5424,22 +5436,19 @@ func main() {
 
 	fmt.Printf("\n[+] Найдено валидных HTTP/2 целей (после кластеризации): %d\n\n", len(results))
 	fmt.Printf("%-32.32s | %-15.15s | %-6s | %-30s | %4s\n",
-		"Цель (SNI)", "IP адрес", "STATUS", "certificate", "RTT")
+		"Цель (SNI)", "IP адрес", "STATUS", "certificate issuer", "RTT")
 	fmt.Println(strings.Repeat("-", 101))
 
 	for _, r := range results {
-		cert := r.CertSubject
-		if cert == "" {
-			cert = r.CertIssuer
+		issuer := r.CertIssuer
+		if issuer == "" {
+			issuer = "unknown issuer"
 		}
-		if cert == "" {
-			cert = "-"
-		}
-		certState := "INVALID"
+		certState := "untrusted"
 		if r.CertSNIMatch && r.CertChainValid && r.CertValidTime {
 			certState = "trusted"
 		}
-		certCol := fmt.Sprintf("%s [%s]", limitStr(cert, 21), certState)
+		certCol := fmt.Sprintf("%s [%s]", limitStr(issuer, 21), certState)
 		rtt := r.Timings.TCP + r.Timings.TLS + r.Timings.H2Headers
 		fmt.Printf("%-32.32s | %-15.15s | %-6d | %-30.30s | %4dms\n",
 			r.SNI, r.IP, r.HTTPStatus, certCol, rtt.Milliseconds())
@@ -5452,8 +5461,8 @@ func main() {
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
 	fmt.Printf("Подробности лучшего кандидата:\n")
-	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate: %s | trusted: %t | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
-		best.HTTPStatus, best.RealityScore.TLSQuality, best.CertSubject, best.CertChainValid, best.CertSNIMatch, best.RealityFeasible,
+	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate issuer: %s | trusted: %t | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
+		best.HTTPStatus, best.RealityScore.TLSQuality, best.CertIssuer, best.CertChainValid, best.CertSNIMatch, best.RealityFeasible,
 		(best.Timings.TCP + best.Timings.TLS + best.Timings.H2Headers).Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
 	fmt.Printf("RANK: RealityFeasible=%t | BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n", best.RealityFeasible,
