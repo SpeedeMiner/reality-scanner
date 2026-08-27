@@ -145,6 +145,7 @@ type Config struct {
 }
 
 var ErrDNSNXDomain = errors.New("NXDOMAIN")
+var ErrDNSNoData = errors.New("DNS no data")
 var ErrDNSTruncated = errors.New("DNS truncated response")
 
 // ================= EVIDENCE & PROVENANCE =================
@@ -476,31 +477,32 @@ type PipelineStats struct {
 	TLSOtherErrs          int
 
 	// H2
-	H2NoALPN               int
-	H2ProtocolOK           int
-	H2TimeoutNoFrames      int
-	H2ConnectionReset      int
-	H2BrokenPipe           int
-	H2BadRequest           int
-	H2GoAway               int
-	H2EOF                  int
-	H2TLSAlerts            int
-	H2OtherErrs            int
-	H2InvalidFrame         int
-	H2InvalidFrameLength   int
-	H2InvalidFrameStreamID int
-	H2InvalidFramePadding  int
-	H2InvalidFramePreface  int
-	H2BadContinuation      int
-	H2HPACKDecode          int
-	H2MissingSettings      int
-	H2HeadersWithoutStatus int
-	H2HeadersOK            int
-	H2Timeouts             int
-	H2HPACKErrors          int
-	H2StatusOK             int
-	H2InvalidStatus        int
-	EndStreamOK            int
+	H2NoALPN                int
+	H2ProtocolOK            int
+	H2TimeoutNoFrames       int
+	H2ConnectionReset       int
+	H2BrokenPipe            int
+	H2BadRequest            int
+	H2GoAway                int
+	H2EOF                   int
+	H2TLSAlerts             int
+	H2OtherErrs             int
+	H2InvalidFrame          int
+	H2InvalidFrameLength    int
+	H2InvalidFrameRSTLength int
+	H2InvalidFrameStreamID  int
+	H2InvalidFramePadding   int
+	H2InvalidFramePreface   int
+	H2BadContinuation       int
+	H2HPACKDecode           int
+	H2MissingSettings       int
+	H2HeadersWithoutStatus  int
+	H2HeadersOK             int
+	H2Timeouts              int
+	H2HPACKErrors           int
+	H2StatusOK              int
+	H2InvalidStatus         int
+	EndStreamOK             int
 
 	// Final
 	ScoreRejected             int
@@ -1335,7 +1337,7 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	if lastErr != nil {
 		return nil, &DNSAggregateError{Kind: classifyDNSOtherError(lastErr), Err: lastErr}
 	}
-	return nil, fmt.Errorf("all DNS resolvers returned no data")
+	return nil, ErrDNSNoData
 }
 
 func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout time.Duration, rtCaches *RuntimeCaches) ([]string, error) {
@@ -1782,6 +1784,63 @@ func classifyDNSOtherError(err error) string {
 		return "name-not-found"
 	default:
 		return "unknown"
+	}
+}
+
+func recordDNSPipelineErrorLocked(s *PipelineStats, err error) {
+	if s == nil || err == nil {
+		return
+	}
+	if errors.Is(err, ErrDNSNoData) {
+		s.DNSSuccess++
+		s.DNSNoIPv4++
+		return
+	}
+	var rcodeErr *DNSRCODEError
+	if errors.As(err, &rcodeErr) {
+		s.DNSFailed++
+		s.DNSRCODEErrors++
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		s.DNSFailed++
+		s.DNSTimeout++
+		return
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		s.DNSFailed++
+		if dnsErr.Timeout() {
+			s.DNSTimeout++
+			return
+		}
+		if dnsErr.Temporary() {
+			s.DNSTemporary++
+			return
+		}
+	}
+	s.DNSFailed++
+	s.DNSOtherErr++
+	kind := classifyDNSOtherError(err)
+	var aggErr *DNSAggregateError
+	if errors.As(err, &aggErr) && aggErr != nil && aggErr.Kind != "" {
+		kind = aggErr.Kind
+	}
+	switch kind {
+	case "network":
+		s.DNSOtherNetworkErr++
+	case "malformed":
+		s.DNSOtherMalformed++
+	case "short-response":
+		s.DNSOtherShortResponse++
+	case "txid-mismatch":
+		s.DNSOtherTxIDMismatch++
+	case "unsupported":
+		s.DNSOtherUnsupported++
+	case "name-not-found":
+		s.DNSOtherNotFound++
+	default:
+		s.DNSOtherUnknown++
 	}
 }
 
@@ -3723,13 +3782,29 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("[*] Raw UDP DNS pool: %s\n", strings.Join(cfg.DNSResolvers, ", "))
 	rtCaches.DNSStatsMu.Lock()
 	healthyRun := 0
+	degradedRun := 0
+	cooldownRun := 0
+	disabledRun := 0
 	for _, resolver := range cfg.DNSResolvers {
-		if !rtCaches.DNSDisabledForRun[resolver] {
+		if rtCaches.DNSDisabledForRun[resolver] {
+			disabledRun++
+			continue
+		}
+		if until := rtCaches.DNSCooldownUntil[resolver]; !until.IsZero() && time.Now().Before(until) {
+			cooldownRun++
+			continue
+		}
+		state := dnsHealthState(rtCaches.DNSHealthWindows[resolver])
+		switch state {
+		case "degraded":
+			degradedRun++
+		default:
 			healthyRun++
 		}
 	}
 	rtCaches.DNSStatsMu.Unlock()
-	fmt.Printf("[*] DNS healthy for run: %d/%d\n", healthyRun, len(cfg.DNSResolvers))
+	fmt.Printf("[*] DNS resolver health:     healthy=%d degraded=%d cooldown=%d disabled=%d / total=%d\n", healthyRun, degradedRun, cooldownRun, disabledRun, len(cfg.DNSResolvers))
+	fmt.Printf("[*] DNS usable now:          %d/%d\n", healthyRun+degradedRun, len(cfg.DNSResolvers)-disabledRun)
 	fmt.Printf("[*] Logical DNS Lookups:       %d (Успех: %d, Ошибок: %d)\n", qDNS, qDNSSuc, qDNSFail)
 	fmt.Printf("    Детали DNS успехов:        Resolved IPs: %d, NXDOMAIN: %d, NoIPv4: %d\n", qResolved, qNX, qNoV4)
 	fmt.Printf("    Детали DNS ошибок:         Timeout: %d, Temporary: %d, RCODE: %d, Other: %d\n", qTimeout, qTemp, qRCODE, qOther)
@@ -3760,7 +3835,8 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("    8. После кластеризации по IP:  %d (оставлен лучший SNI на IP)\n", clustered)
 	fmt.Printf("    Reality-feasible из принятых:      %d\n", pReality)
 	fmt.Printf("    H2 причины Other: InvalidFrame=%d, BadContinuation=%d, HPACK=%d, MissingSettings=%d, HeadersWithoutStatus=%d\n", pH2InvalidFrame, pH2BadContinuation, pH2HPACKDecode, pH2MissingSettings, pH2HeadersWithoutStatus)
-	fmt.Printf("    H2 InvalidFrame detail: Length=%d, StreamID=%d, Padding=%d, Preface=%d, Generic=%d\n", pH2InvalidFrameLength, pH2InvalidFrameStreamID, pH2InvalidFramePadding, pH2InvalidFramePreface, pH2InvalidFrame-pH2InvalidFrameLength-pH2InvalidFrameStreamID-pH2InvalidFramePadding-pH2InvalidFramePreface)
+	fmt.Printf("    H2 InvalidFrame detail: FrameSize=%d, RSTStreamLength=%d, StreamID=%d, Padding=%d, Preface=%d, Generic=%d\n", pH2InvalidFrameLength, pH2InvalidFrameRSTLength, pH2InvalidFrameStreamID, pH2InvalidFramePadding, pH2InvalidFramePreface, pH2InvalidFrame-pH2InvalidFrameLength-pH2InvalidFrameRSTLength-pH2InvalidFrameStreamID-pH2InvalidFramePadding-pH2InvalidFramePreface)
+	fmt.Printf("    H2 note: FrameSize means peer MAX_FRAME_SIZE violation; RSTStreamLength is the fixed 4-byte RST_STREAM payload check.\n")
 	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
 	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", pH2NoALPN)
 	fmt.Printf("    * Уникальных IP-кластеров:    %d (дедупликация финального списка по IP)\n", clustered)
@@ -4131,6 +4207,7 @@ const (
 	H2ErrGoAway
 	H2ErrEOF
 	H2ErrTLSAlert
+	H2ErrRSTStreamLength
 )
 
 type ProbeError struct {
@@ -4534,7 +4611,7 @@ ReadLoop:
 				}
 			case FrameRSTStream:
 				if length != 4 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameLength, Err: fmt.Errorf("invalid RST_STREAM length: %d", length)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrRSTStreamLength, Err: fmt.Errorf("invalid RST_STREAM length: %d", length)}
 				}
 				if streamID == 1 {
 					cand.StreamReset = true
@@ -4941,63 +5018,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					pipeStats.DNSSuccess++
 					pipeStats.DNSNXDomain++
 				} else {
-					pipeStats.DNSFailed++
-					var rcodeErr *DNSRCODEError
-					if errors.As(err, &rcodeErr) {
-						// The recursive resolver answered at DNS protocol level; this is
-						// not a transport failure and must not inflate generic "Other".
-						pipeStats.DNSRCODEErrors++
-					} else {
-						var dnsErr *net.DNSError
-						if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-							pipeStats.DNSTimeout++
-						} else if errors.As(err, &dnsErr) {
-							if dnsErr.Timeout() {
-								pipeStats.DNSTimeout++
-							} else if dnsErr.Temporary() {
-								pipeStats.DNSTemporary++
-							} else {
-								pipeStats.DNSOtherErr++
-								switch classifyDNSOtherError(err) {
-								case "network":
-									pipeStats.DNSOtherNetworkErr++
-								case "malformed":
-									pipeStats.DNSOtherMalformed++
-								case "short-response":
-									pipeStats.DNSOtherShortResponse++
-								case "txid-mismatch":
-									pipeStats.DNSOtherTxIDMismatch++
-								case "unsupported":
-									pipeStats.DNSOtherUnsupported++
-								case "name-not-found":
-									pipeStats.DNSOtherNotFound++
-								default:
-									pipeStats.DNSOtherUnknown++
-								}
-							}
-						} else {
-							pipeStats.DNSOtherErr++
-							kind := classifyDNSOtherError(err)
-							var aggErr *DNSAggregateError
-							if errors.As(err, &aggErr) && aggErr != nil && aggErr.Kind != "" {
-								kind = aggErr.Kind
-							}
-							switch kind {
-							case "network":
-								pipeStats.DNSOtherNetworkErr++
-							case "malformed":
-								pipeStats.DNSOtherMalformed++
-							case "short-response":
-								pipeStats.DNSOtherShortResponse++
-							case "txid-mismatch":
-								pipeStats.DNSOtherTxIDMismatch++
-							case "unsupported":
-								pipeStats.DNSOtherUnsupported++
-							default:
-								pipeStats.DNSOtherUnknown++
-							}
-						}
-					}
+					recordDNSPipelineErrorLocked(pipeStats, err)
 				}
 				pipeStats.mu.Unlock()
 				return nil
@@ -5194,6 +5215,10 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					case H2ErrBadContinuation:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2BadContinuation++
+					case H2ErrRSTStreamLength:
+						pipeStats.H2OtherErrs++
+						pipeStats.H2InvalidFrame++
+						pipeStats.H2InvalidFrameRSTLength++
 					case H2ErrInvalidFrame, H2ErrInvalidFrameLength, H2ErrInvalidFrameStreamID, H2ErrInvalidFramePadding, H2ErrInvalidFramePreface:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2InvalidFrame++
