@@ -62,7 +62,6 @@ const (
 
 	providerCBThreshold   = 3
 	providerCBCooldown    = 2 * time.Minute
-	provider429CBCooldown = 5 * time.Minute
 	providerMaxRetryAfter = 60 * time.Second
 
 	DNSQueryTimeoutDefault = 1500 * time.Millisecond
@@ -132,14 +131,6 @@ type Config struct {
 	TargetASN         string
 	TargetCountry     string
 	TargetIP          string
-	ScanEntireASN     bool
-	Domains           []string
-	NoPTR             bool
-	NoCT              bool
-	NoPassive         bool
-	NoReverseIP       bool
-	Debug             bool
-	DebugFile         string
 
 	VTKey      string
 	URLScanKey string
@@ -573,7 +564,6 @@ func (s *PipelineStats) recordProviderStat(name string, cat DiscoveryCategory, r
 	}
 
 	if result != StatSuccess {
-		debugf("[PROVIDER] name=%s category=%s result=%d timeout=%t raw=%d unique=%d invalid=%d limited=%d accepted=%d status=%d err=%s retries=%d", name, string(cat), result, isTimeout, raw, unique, invalid, limited, accepted, httpStatus, errText, retries)
 	}
 
 	switch result {
@@ -620,92 +610,6 @@ type DNSHealthWindow struct {
 	Failures int
 }
 
-type DebugLogger struct {
-	mu       sync.Mutex
-	f        *os.File
-	maxBytes int64
-	written  int64
-	dropped  bool
-}
-
-const DebugMaxBytes int64 = 32 * 1024 * 1024
-
-func NewDebugLogger(path string, maxBytes int64) (*DebugLogger, error) {
-	if path == "" {
-		return nil, nil
-	}
-	if maxBytes <= 0 {
-		maxBytes = DebugMaxBytes
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	return &DebugLogger{f: f, maxBytes: maxBytes}, nil
-}
-
-func (d *DebugLogger) Close() error {
-	if d == nil {
-		return nil
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.f == nil {
-		return nil
-	}
-	err := d.f.Close()
-	d.f = nil
-	return err
-}
-
-func (d *DebugLogger) Printf(format string, args ...interface{}) {
-	if d == nil {
-		return
-	}
-	line := fmt.Sprintf(format, args...)
-	if !strings.HasSuffix(line, "\n") {
-		line += "\n"
-	}
-	if debugRunID != "" {
-		line = fmt.Sprintf("[run_id=%s] %s", debugRunID, line)
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.f == nil || d.dropped {
-		return
-	}
-	if d.written+int64(len(line)) > d.maxBytes {
-		d.dropped = true
-		_, _ = d.f.WriteString("[DEBUG] log size limit reached; further debug events dropped\n")
-		return
-	}
-	if _, err := d.f.WriteString(line); err != nil {
-		d.dropped = true
-	}
-	d.written += int64(len(line))
-}
-
-var (
-	debugRunID  string
-	debugMu     sync.RWMutex
-	debugLogger *DebugLogger
-)
-
-func setDebugLogger(d *DebugLogger) {
-	debugMu.Lock()
-	debugLogger = d
-	debugMu.Unlock()
-}
-
-func debugf(format string, args ...interface{}) {
-	debugMu.RLock()
-	d := debugLogger
-	debugMu.RUnlock()
-	if d != nil {
-		d.Printf(format, args...)
-	}
-}
-
 type RuntimeCaches struct {
 	ProvCache              *SafeCache
 	ProvGroup              *singleflight.Group
@@ -722,9 +626,6 @@ type RuntimeCaches struct {
 	// RunCtx is the pipeline-wide context used as the shared singleflight leader context.
 	// It prevents one root cancellation from aborting a request shared by other roots.
 	RunCtx context.Context
-
-	// Debug is a bounded, mutex-protected diagnostic sink shared by pipeline stages.
-	Debug *DebugLogger
 
 	// PTR fallback telemetry. Access under DNSStatsMu.
 	PTRSystemFallbacks     int
@@ -909,7 +810,6 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 
 	stat.Failures++
 	isTimeout := errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)
-	debugf("[DNS][RESULT] resolver=%s err=%v timeout=%t elapsed_ms=%.1f ipv4=%d", resolver, err, isTimeout, elapsedMs, ipv4Count)
 	if isTimeout {
 		stat.Timeouts++
 	}
@@ -926,13 +826,11 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 		if healthFailureRate >= DNSHealthHardBadRate {
 			r.DNSDisabledForRun[resolver] = true
 			delete(r.DNSCooldownUntil, resolver)
-			debugf("[DNS][HEALTH] resolver=%s transition=disabled reason=health_window rate=%.3f samples=%d", resolver, healthFailureRate, hw.Count)
 			return
 		}
 		if healthFailureRate >= DNSHealthWindowBadRate {
 			cooldownUntil := time.Now().Add(DNSHealthBadCooldown)
 			r.DNSCooldownUntil[resolver] = cooldownUntil
-			debugf("[DNS][HEALTH] resolver=%s transition=cooldown reason=health_window rate=%.3f samples=%d until=%s", resolver, healthFailureRate, hw.Count, cooldownUntil.Format(time.RFC3339Nano))
 			return
 		}
 	}
@@ -953,7 +851,6 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 	}
 	cooldownUntil := time.Now().Add(cooldown)
 	r.DNSCooldownUntil[resolver] = cooldownUntil
-	debugf("[DNS][HEALTH] resolver=%s transition=cooldown reason=consecutive_failure failures=%d timeout=%t until=%s", resolver, n, isTimeout, cooldownUntil.Format(time.RFC3339Nano))
 }
 
 type DNSCacheEntry struct {
@@ -1195,29 +1092,6 @@ func dnsExchangeTCP(ctx context.Context, resolver, domain string, qtype uint16, 
 	return dnsExchange(ctx, resolver, domain, qtype, ecsIP, ecsPrefix, timeout, "tcp")
 }
 
-func dnsDebugResult(err error, answerCount int) string {
-	if err == nil && answerCount > 0 {
-		return "success"
-	}
-	if errors.Is(err, ErrDNSNXDomain) {
-		return "nxdomain"
-	}
-	var rcodeErr *DNSRCODEError
-	if errors.As(err, &rcodeErr) {
-		return "rcode"
-	}
-	if errors.Is(err, ErrDNSTruncated) {
-		return "truncated"
-	}
-	if err == nil {
-		return "no-data"
-	}
-	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-		return "timeout"
-	}
-	return classifyDNSOtherError(err)
-}
-
 func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, ecsIP string, ecsPrefix int, timeout time.Duration) ([]string, error) {
 	// Build the DNS message exactly once and reuse it for the UDP exchange.
 	msg, err := buildMiekgDNSMessage(domain, qtype, ecsIP, ecsPrefix)
@@ -1227,16 +1101,13 @@ func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, 
 	client := &mdns.Client{Net: "udp", Timeout: timeout}
 	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(resolver, "53"))
 	if err != nil {
-		debugf("[DNS][UDP] transport=UDP resolver=%s q=%s qtype=%d result=error err=%v", resolver, domain, qtype, err)
 		return nil, err
 	}
 	if resp == nil {
 		err = fmt.Errorf("nil DNS response")
-		debugf("[DNS][UDP] transport=UDP resolver=%s q=%s qtype=%d result=error err=%v", resolver, domain, qtype, err)
 		return nil, err
 	}
 	if resp.Truncated {
-		debugf("[DNS][UDP] transport=UDP resolver=%s q=%s qtype=%d result=truncated rcode=%d", resolver, domain, qtype, resp.Rcode)
 		return nil, ErrDNSTruncated
 	}
 	var out []string
@@ -1245,7 +1116,6 @@ func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, 
 	} else {
 		out, err = parseDNSAResponse(resp)
 	}
-	debugf("[DNS][UDP] transport=UDP resolver=%s q=%s qtype=%d result=%s rcode=%d answers=%d err=%v", resolver, domain, qtype, dnsDebugResult(err, len(out)), resp.Rcode, len(out), err)
 	return out, err
 }
 
@@ -1400,13 +1270,11 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	for attempt, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
-		debugf("[DNS][ATTEMPT] transport=UDP resolver=%s q=%s qtype=A attempt=%d/%d timeout_ms=%d", resolver, domain, attempt+1, len(ordered), resolverTimeout.Milliseconds())
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 
 		// TCP is only a truncation fallback. A UDP timeout must not spend another
 		// synchronous timeout budget against the same resolver.
 		if errors.Is(err, ErrDNSTruncated) {
-			debugf("[DNS][ATTEMPT] transport=TCP resolver=%s q=%s qtype=A reason=udp-truncated", resolver, domain)
 			tcpIPs, tcpErr := dnsExchangeTCP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 			if tcpErr == nil {
 				ips, err = tcpIPs, nil
@@ -1503,7 +1371,6 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	names, lookupErr := net.DefaultResolver.LookupAddr(lookupCtx, ip)
 	cancel()
-	debugf("[DNS][System] transport=System resolver=default q=%s qtype=PTR result=%s answers=%d elapsed_ms=%.1f err=%v", ip, dnsDebugResult(lookupErr, len(names)), len(names), time.Since(lookupStarted).Seconds()*1000, lookupErr)
 	if lookupErr == nil && len(names) > 0 {
 		clean := make([]string, 0, len(names))
 		for _, n := range names {
@@ -1539,10 +1406,8 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	for attempt, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
-		debugf("[DNS][ATTEMPT] transport=UDP resolver=%s q=%s qtype=PTR attempt=%d/%d timeout_ms=%d", resolver, rev, attempt+1, len(ordered), resolverTimeout.Milliseconds())
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, resolverTimeout)
 		if errors.Is(err, ErrDNSTruncated) {
-			debugf("[DNS][ATTEMPT] transport=TCP resolver=%s q=%s qtype=PTR reason=udp-truncated", resolver, rev)
 			if tcpNames, tcpErr := dnsExchangeTCP(ctx, resolver, rev, 12, "", 0, resolverTimeout); tcpErr == nil {
 				names, err = tcpNames, nil
 			} else {
@@ -1640,11 +1505,9 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		}
 		req.Header.Set("Accept", "application/dns-json")
 		req.Header.Set("User-Agent", "reality-scanner/1.0")
-		debugf("[DNS][ATTEMPT] transport=DoH endpoint=%s q=%s qtype=A attempt=%d/%d", endpoint, domain, attempt+1, len(endpoints))
 		resp, err := dnsDoHHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
-			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=error elapsed_ms=%.1f err=%v", endpoint, domain, time.Since(started).Seconds()*1000, err)
 			continue
 		}
 
@@ -1659,7 +1522,6 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			lastErr = fmt.Errorf("DoH HTTP status=%d", resp.StatusCode)
-			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=http-error status=%d elapsed_ms=%.1f", endpoint, domain, resp.StatusCode, time.Since(started).Seconds()*1000)
 			continue
 		}
 		decodeErr := func() error {
@@ -1668,16 +1530,13 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		}()
 		if decodeErr != nil {
 			lastErr = decodeErr
-			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=decode-error elapsed_ms=%.1f err=%v", endpoint, domain, time.Since(started).Seconds()*1000, decodeErr)
 			continue
 		}
 		if payload.Status == 3 {
-			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=nxdomain elapsed_ms=%.1f", endpoint, domain, time.Since(started).Seconds()*1000)
 			return nil, ErrDNSNXDomain
 		}
 		if payload.Status != 0 {
 			lastErr = fmt.Errorf("DoH DNS status=%d", payload.Status)
-			debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=rcode status=%d elapsed_ms=%.1f", endpoint, domain, payload.Status, time.Since(started).Seconds()*1000)
 			continue
 		}
 		ips := make([]string, 0, len(payload.Answer))
@@ -1690,7 +1549,6 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 			}
 		}
 		cleanIPs := uniqueStrings(ips)
-		debugf("[DNS][DoH] transport=DoH endpoint=%s q=%s result=%s answers=%d elapsed_ms=%.1f", endpoint, domain, dnsDebugResult(nil, len(cleanIPs)), len(cleanIPs), time.Since(started).Seconds()*1000)
 		return cleanIPs, nil
 	}
 	if lastErr == nil {
@@ -1705,7 +1563,6 @@ func resolveASystem(ctx context.Context, domain string) ([]string, error) {
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, domain)
 	if err != nil {
-		debugf("[DNS][System] transport=System resolver=default q=%s qtype=A result=error elapsed_ms=%.1f err=%v", domain, time.Since(started).Seconds()*1000, err)
 		return nil, err
 	}
 	ips := make([]string, 0, len(addrs))
@@ -1715,7 +1572,6 @@ func resolveASystem(ctx context.Context, domain string) ([]string, error) {
 		}
 	}
 	cleanIPs := uniqueStrings(ips)
-	debugf("[DNS][System] transport=System resolver=default q=%s qtype=A result=%s answers=%d elapsed_ms=%.1f", domain, dnsDebugResult(nil, len(cleanIPs)), len(cleanIPs), time.Since(started).Seconds()*1000)
 	return cleanIPs, nil
 }
 
@@ -4531,12 +4387,9 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (cand
 		HTTPStatus:    0,
 	}
 
-	debugf("[H2][START] ip=%s sni=%s", ip, sni)
 	defer func() {
 		if pErr != nil {
-			debugf("[H2][REJECT] ip=%s sni=%s code=%s code_id=%d frame_type=%s frame_type_id=%d length=%d flags=0x%02x stream_id=%d raw_header_hex=%s err=%s tcp_ms=%d tls_ms=%d", ip, sni, pErr.Code.String(), pErr.Code, h2FrameTypeName(pErr.FrameType), pErr.FrameType, pErr.Length, pErr.Flags, pErr.StreamID, pErr.RawHeaderHex, pErr.Error(), cand.Timings.TCP.Milliseconds(), cand.Timings.TLS.Milliseconds())
 		} else {
-			debugf("[H2][PROBE] ip=%s sni=%s status=%d alpn=%s cert_sni=%t cert_chain=%t cert_time=%t h2_settings=%t h2_headers=%t body=%d", ip, sni, cand.HTTPStatus, cand.ALPN, cand.CertSNIMatch, cand.CertChainValid, cand.CertValidTime, cand.H2SettingsReceived, cand.H2HeadersReceived, cand.BodyBytes)
 		}
 	}()
 
@@ -5127,33 +4980,20 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	ds := NewDiscoveryState()
 	rtCaches := NewRuntimeCaches()
 	rtCaches.RunCtx = ctx
-	debugMu.RLock()
-	rtCaches.Debug = debugLogger
-	debugMu.RUnlock()
 	warmDNSResolvers(ctx, cfg.DNSResolvers, cfg.ECSIP, cfg.ECSPrefix, rtCaches)
 
-	for _, d := range cfg.Domains {
-		if cleaned := CleanDomain(d); cleaned != "" {
-			ds.AddDomainSource(cleaned, SourceSeed, 0)
-		}
-	}
-
 	var extProviders []*ProviderRunner
-	if !cfg.NoCT {
-		extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&certSpotterProvider{Key: "k68583_76cap3skvhbzpnt735xyoauopb"}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
+	extProviders = append(extProviders, NewRunner(&crtShProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+	extProviders = append(extProviders, NewRunner(&certSpotterProvider{Key: "k68583_76cap3skvhbzpnt735xyoauopb"}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 100, MaxPages: 3}))
+	if key := os.Getenv("ALIENVAULT_API_KEY"); key != "" {
+		extProviders = append(extProviders, NewRunner(&alienVaultProvider{Key: key}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
 	}
-	if !cfg.NoPassive {
-		extProviders = append(extProviders, NewRunner(&alienVaultProvider{Key: "929d56ef744c3b8c178d4726db2ab51838417c06c7f475fa98d571bb50f21a85"}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 500 * time.Millisecond, MaxNames: 1000, MaxRoots: 150, MaxPages: 3}))
-		extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 7 * time.Second, MaxConcurrent: 3, MinInterval: 500 * time.Millisecond, MaxNames: 6000, MaxRoots: 100, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 1500, MaxRoots: 150, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 80, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
-	}
-	if !cfg.NoReverseIP {
-		extProviders = append(extProviders, NewRunner(&hackerTargetProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxPages: 1}))
-		extProviders = append(extProviders, NewRunner(&shodanInternetDBProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 10, MinInterval: 50 * time.Millisecond, MaxNames: 1000, MaxPages: 1}))
-	}
+	extProviders = append(extProviders, NewRunner(&waybackProvider{}, ProviderConfig{Timeout: 7 * time.Second, MaxConcurrent: 3, MinInterval: 500 * time.Millisecond, MaxNames: 6000, MaxRoots: 100, MaxPages: 1}))
+	extProviders = append(extProviders, NewRunner(&anubisProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 2, MinInterval: 400 * time.Millisecond, MaxNames: 1500, MaxRoots: 150, MaxPages: 1}))
+	extProviders = append(extProviders, NewRunner(&threatMinerProvider{}, ProviderConfig{Timeout: 5 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 80, MaxPages: 1}))
+	extProviders = append(extProviders, NewRunner(&hackerTargetHostSearchProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxRoots: 50, MaxPages: 1}))
+	extProviders = append(extProviders, NewRunner(&hackerTargetProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 1, MinInterval: 1 * time.Second, MaxNames: 1000, MaxPages: 1}))
+	extProviders = append(extProviders, NewRunner(&shodanInternetDBProvider{}, ProviderConfig{Timeout: 6 * time.Second, MaxConcurrent: 10, MinInterval: 50 * time.Millisecond, MaxNames: 1000, MaxPages: 1}))
 	if cfg.VTKey != "" {
 		extProviders = append(extProviders, NewRunner(&vtDomainProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 8 * time.Second, MaxConcurrent: 1, MinInterval: 15 * time.Second, MaxNames: 1500, MaxRoots: 75, MaxPages: 2}))
 		extProviders = append(extProviders, NewRunner(&vtIPProvider{Key: cfg.VTKey}, ProviderConfig{Timeout: 10 * time.Second, MaxConcurrent: 2, MinInterval: 1 * time.Second, MaxNames: 2000, MaxPages: 3}))
@@ -5183,48 +5023,46 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	fmt.Printf("[*] STAGE A: Reverse-IP OSINT & PTR Gathering...\n")
 	gA, gCtxA := errgroup.WithContext(ctx)
 
-	if !cfg.NoPTR {
-		gA.Go(func() error {
-			ptrJobs := make(chan string)
-			var ptrG errgroup.Group
-			for i := 0; i < cfg.Workers; i++ {
-				ptrG.Go(func() error {
-					for {
-						select {
-						case <-gCtxA.Done():
-							return gCtxA.Err()
-						case ip, ok := <-ptrJobs:
-							if !ok {
-								return nil
-							}
-							names, err := resolvePTRRaw(gCtxA, ip, cfg.DNSResolvers, PTRQueryTimeoutDefault, rtCaches)
-							if err == nil && len(names) > 0 {
-								for _, n := range names {
-									ds.AddPairSource(ip, n, SourcePTR)
-								}
-								pipeStats.mu.Lock()
-								pipeStats.IPWithPTR++
-								pipeStats.PTRFound++
-								pipeStats.mu.Unlock()
-							}
-						}
-					}
-				})
-			}
+	gA.Go(func() error {
+		ptrJobs := make(chan string)
+		var ptrG errgroup.Group
+		for i := 0; i < cfg.Workers; i++ {
 			ptrG.Go(func() error {
-				defer close(ptrJobs)
-				for _, ip := range sampledIPs {
+				for {
 					select {
 					case <-gCtxA.Done():
 						return gCtxA.Err()
-					case ptrJobs <- ip:
+					case ip, ok := <-ptrJobs:
+						if !ok {
+							return nil
+						}
+						names, err := resolvePTRRaw(gCtxA, ip, cfg.DNSResolvers, PTRQueryTimeoutDefault, rtCaches)
+						if err == nil && len(names) > 0 {
+							for _, n := range names {
+								ds.AddPairSource(ip, n, SourcePTR)
+							}
+							pipeStats.mu.Lock()
+							pipeStats.IPWithPTR++
+							pipeStats.PTRFound++
+							pipeStats.mu.Unlock()
+						}
 					}
 				}
-				return nil
 			})
-			return ptrG.Wait()
+		}
+		ptrG.Go(func() error {
+			defer close(ptrJobs)
+			for _, ip := range sampledIPs {
+				select {
+				case <-gCtxA.Done():
+					return gCtxA.Err()
+				case ptrJobs <- ip:
+				}
+			}
+			return nil
 		})
-	}
+		return ptrG.Wait()
+	})
 
 	for idx, p := range ipProviders {
 		p := p
@@ -5619,8 +5457,6 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					continue
 				}
 
-				debugf("[H2][ACCEPT] ip=%s sni=%s status=%d alpn=%s score=%.2f reality_feasible=%t cert_sni=%t cert_chain=%t cert_time=%t", cand.IP, cand.SNI, cand.HTTPStatus, cand.ALPN, cand.Score, cand.RealityFeasible, cand.CertSNIMatch, cand.CertChainValid, cand.CertValidTime)
-
 				pipeStats.mu.Lock()
 				pipeStats.CandidatesAccepted++
 				if cand.RealityFeasible {
@@ -5903,24 +5739,6 @@ func filterPrefixesByCountry(prefixes []string, targetCountry string) []string {
 	return uniqueStrings(matched)
 }
 
-func getCountryCached(rt *RuntimeCaches, ip string) string {
-	if rt != nil {
-		rt.CountryCacheMu.Lock()
-		if country, ok := rt.CountryCache[ip]; ok {
-			rt.CountryCacheMu.Unlock()
-			return country
-		}
-		rt.CountryCacheMu.Unlock()
-	}
-	country := getCountry(ip)
-	if rt != nil {
-		rt.CountryCacheMu.Lock()
-		rt.CountryCache[ip] = country
-		rt.CountryCacheMu.Unlock()
-	}
-	return country
-}
-
 func getCountry(ip string) string {
 	client := &http.Client{Timeout: 4 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode", ip))
@@ -6022,41 +5840,12 @@ func main() {
 		VTKey:             "dea2ba0b84a3d88ea20a5fb14165e94d170cbe369529dbc57119757e04f1efb5",
 		URLScanKey:        "01a032ae-681d-7718-821b-c6fd33aa11a7",
 		ChaosKey:          "e3c91ed9-2f79-4147-807f-43dd150003e4",
-		NoPTR:             false,
-		NoCT:              false,
-		NoPassive:         false,
-		NoReverseIP:       false,
-		Debug:             true,
-		DebugFile:         "/tmp/reality-scanner-debug.log",
-		ScanEntireASN:     true,
 	}
 
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
 	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера; используется для ASN/Country и ECS")
-	flag.BoolVar(&cfg.Debug, "debug", true, "Писать bounded debug trace в файл")
-	flag.StringVar(&cfg.DebugFile, "debug-file", "/tmp/reality-scanner-debug.log", "Путь debug trace файла")
 	flag.Parse()
 
-	debugRunID = fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
-
-	if cfg.Debug {
-		dbg, dbgErr := NewDebugLogger(cfg.DebugFile, DebugMaxBytes)
-		if dbgErr != nil {
-			log.Printf("[!] Не удалось открыть debug log %s: %v", cfg.DebugFile, dbgErr)
-		} else {
-			setDebugLogger(dbg)
-			defer func() {
-				if err := dbg.Close(); err != nil {
-					log.Printf("[!] Ошибка закрытия debug log: %v", err)
-				}
-			}()
-			debugf("[DEBUG] start version=v70 max_bytes=%d pid=%d run_id=%s", DebugMaxBytes, os.Getpid(), debugRunID)
-		}
-	}
-
-	if cfg.Workers < 1 {
-		cfg.Workers = 1
-	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -6097,31 +5886,26 @@ func main() {
 		log.Fatalf("[-] Target IP is not present in ASN announced prefixes")
 	}
 
-	var samplingCIDRs []string
-	if cfg.ScanEntireASN {
-		samplingCIDRs = cidrs
-		if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
-			countryCIDRs := filterPrefixesByCountry(cidrs, cfg.TargetCountry)
-			if len(countryCIDRs) > 0 {
-				samplingCIDRs = countryCIDRs
-				// Match the Windows scanner: always retain the local/target prefix
-				// even when the prefix geolocation service omits or misclassifies it.
-				foundLocal := false
-				for _, prefix := range samplingCIDRs {
-					if prefix == localPrefix {
-						foundLocal = true
-						break
-					}
+	samplingCIDRs := cidrs
+	if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
+		countryCIDRs := filterPrefixesByCountry(cidrs, cfg.TargetCountry)
+		if len(countryCIDRs) > 0 {
+			samplingCIDRs = countryCIDRs
+			// Always retain the local/target prefix even when the geolocation service
+			// omits or misclassifies it.
+			foundLocal := false
+			for _, prefix := range samplingCIDRs {
+				if prefix == localPrefix {
+					foundLocal = true
+					break
 				}
-				if !foundLocal && localPrefix != "" {
-					samplingCIDRs = append([]string{localPrefix}, samplingCIDRs...)
-				}
-			} else {
-				log.Printf("[!] Не удалось отфильтровать ASN prefixes по стране %s; sampling оставлен по всем prefix", cfg.TargetCountry)
 			}
+			if !foundLocal && localPrefix != "" {
+				samplingCIDRs = append([]string{localPrefix}, samplingCIDRs...)
+			}
+		} else {
+			log.Printf("[!] Не удалось отфильтровать ASN prefixes по стране %s; sampling оставлен по всем prefix", cfg.TargetCountry)
 		}
-	} else {
-		samplingCIDRs = []string{localPrefix}
 	}
 	samplingRanges := MergeCIDRs(samplingCIDRs)
 	sampledIPs := SampleIPs(samplingRanges, cfg.MaxIPs, cfg.Seed)
@@ -6133,15 +5917,11 @@ func main() {
 	fmt.Printf("[*] Raw UDP DNS pool:       %s\n", strings.Join(cfg.DNSResolvers, ", "))
 	fmt.Printf("[*] Целевой IP:             %s\n", cfg.TargetIP)
 	fmt.Printf("[*] Announcing ASN:         %s\n", cfg.TargetASN)
-	if cfg.ScanEntireASN {
-		if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
-			fmt.Printf("[*] Фокус на префиксы:       %d subnet ASN (с учетом страны)\n", len(samplingCIDRs))
-			fmt.Printf("[*] ВНИМАНИЕ: DNS валидация проверяет все %d префиксов ASN для расширения покрытия.\n", len(cidrs))
-		} else {
-			fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN\n", len(samplingCIDRs))
-		}
+	if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" {
+		fmt.Printf("[*] Фокус на префиксы:       %d subnet ASN (с учетом страны)\n", len(samplingCIDRs))
+		fmt.Printf("[*] ВНИМАНИЕ: DNS валидация проверяет все %d префиксов ASN для расширения покрытия.\n", len(cidrs))
 	} else {
-		fmt.Printf("[*] Фокус на IPv4 prefix:   %s (DNS-валидация по всем %d префиксам ASN)\n", localPrefix, len(cidrs))
+		fmt.Printf("[*] Фокус на все префиксы:   %d подсетей ASN\n", len(samplingCIDRs))
 	}
 	fmt.Printf("[*] Страна сервера:          %s (ip-api)\n", cfg.TargetCountry)
 	fmt.Printf("[*] Подготовлено %d IP адресов для passive discovery. Запуск...\n\n", len(sampledIPs))
