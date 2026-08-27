@@ -79,6 +79,7 @@ const (
 	DNSHealthWindowSize    = 32
 	DNSHealthWindowMin     = 8
 	DNSHealthWindowBadRate = 0.90
+	DNSHealthDegradedRate  = 0.20
 	DNSHealthHardBadRate   = 1.0
 	DNSHealthBadCooldown   = 10 * time.Second
 	PTRDoHTimeout          = 1200 * time.Millisecond
@@ -647,6 +648,23 @@ func NewRuntimeCaches() *RuntimeCaches {
 	}
 }
 
+func dnsHealthState(hw *DNSHealthWindow) string {
+	if hw == nil || hw.Count < DNSHealthWindowMin {
+		return "unknown"
+	}
+	rate := float64(hw.Failures) / float64(hw.Count)
+	switch {
+	case rate >= DNSHealthHardBadRate:
+		return "disabled"
+	case rate >= DNSHealthWindowBadRate:
+		return "cooldown"
+	case rate >= DNSHealthDegradedRate:
+		return "degraded"
+	default:
+		return "healthy"
+	}
+}
+
 func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	if len(resolvers) == 0 {
 		return nil
@@ -689,25 +707,14 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 		return nil
 	}
 
-	// Round-robin is the primary policy. Health is only a bounded local
-	// preference, so one healthy resolver cannot monopolize the whole run.
-	for i := 1; i < len(eligible); i++ {
-		best := i
-		for j := i - 1; j >= 0; j-- {
-			if eligible[j].health+0.20 < eligible[best].health {
-				break
-			}
-			if eligible[j].health < eligible[best].health+0.20 {
-				continue
-			}
-			best = j
+	// Round-robin remains the tie-breaker; recent health pushes degraded
+	// resolvers later without allowing one resolver to monopolize the run.
+	sort.SliceStable(eligible, func(i, j int) bool {
+		if math.Abs(eligible[i].health-eligible[j].health) < 0.20 {
+			return eligible[i].ord < eligible[j].ord
 		}
-		if best != i {
-			tmp := eligible[i]
-			copy(eligible[best+1:i+1], eligible[best:i])
-			eligible[best] = tmp
-		}
-	}
+		return eligible[i].health > eligible[j].health
+	})
 
 	order := make([]string, 0, len(eligible))
 	for _, item := range eligible {
@@ -3594,6 +3601,10 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	pH2TLSAlerts := s.H2TLSAlerts
 	pH2Other := s.H2OtherErrs
 	pH2InvalidFrame := s.H2InvalidFrame
+	pH2InvalidFrameLength := s.H2InvalidFrameLength
+	pH2InvalidFrameStreamID := s.H2InvalidFrameStreamID
+	pH2InvalidFramePadding := s.H2InvalidFramePadding
+	pH2InvalidFramePreface := s.H2InvalidFramePreface
 	pH2BadContinuation := s.H2BadContinuation
 	pH2HPACKDecode := s.H2HPACKDecode
 	pH2MissingSettings := s.H2MissingSettings
@@ -3745,6 +3756,7 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("    8. После кластеризации по IP:  %d (оставлен лучший SNI на IP)\n", clustered)
 	fmt.Printf("    Reality-feasible из принятых:      %d\n", pReality)
 	fmt.Printf("    H2 причины Other: InvalidFrame=%d, BadContinuation=%d, HPACK=%d, MissingSettings=%d, HeadersWithoutStatus=%d\n", pH2InvalidFrame, pH2BadContinuation, pH2HPACKDecode, pH2MissingSettings, pH2HeadersWithoutStatus)
+	fmt.Printf("    H2 InvalidFrame detail: Length=%d, StreamID=%d, Padding=%d, Preface=%d, Generic=%d\n", pH2InvalidFrameLength, pH2InvalidFrameStreamID, pH2InvalidFramePadding, pH2InvalidFramePreface, pH2InvalidFrame-pH2InvalidFrameLength-pH2InvalidFrameStreamID-pH2InvalidFramePadding-pH2InvalidFramePreface)
 	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
 	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", pH2NoALPN)
 	fmt.Printf("    * Уникальных IP-кластеров:    %d (дедупликация финального списка по IP)\n", clustered)
@@ -3759,6 +3771,13 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 		status := "active"
 		if rtCaches.DNSDisabledForRun[resolver] {
 			status = "disabled-run"
+		} else {
+			switch dnsHealthState(rtCaches.DNSHealthWindows[resolver]) {
+			case "degraded":
+				status = "degraded"
+			case "cooldown":
+				status = "cooldown"
+			}
 		}
 		fmt.Printf("    %-15s attempts=%d answers=%d ipv4=%d nxdomain=%d rcode=%d failures=%d timeouts=%d status=%s\n",
 			resolver, stat.Attempts, stat.Answers, stat.IPv4s, stat.NXDomain, stat.RCODEErrors, stat.Failures, stat.Timeouts, status)
@@ -4092,6 +4111,10 @@ type H2ErrorCode uint8
 const (
 	H2ErrUnknown H2ErrorCode = iota
 	H2ErrInvalidFrame
+	H2ErrInvalidFrameLength
+	H2ErrInvalidFrameStreamID
+	H2ErrInvalidFramePadding
+	H2ErrInvalidFramePreface
 	H2ErrBadContinuation
 	H2ErrHPACK
 	H2ErrSettings
@@ -4267,7 +4290,7 @@ ReadLoop:
 			data := recvBuf.Bytes()
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
 			if length > maxInboundFrameSize {
-				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("inbound frame exceeds limit: %d", length)}
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameLength, Err: fmt.Errorf("inbound frame exceeds limit: %d", length)}
 			}
 			if uint32(recvBuf.Len()) < 9+length {
 				break
@@ -4276,7 +4299,7 @@ ReadLoop:
 			if !firstFrameSeen {
 				cand.Timings.H2FirstFrame = time.Since(requestSent)
 				if frameType != FrameSettings {
-					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("invalid H2 preface sequence: first server frame is type %d, want SETTINGS", frameType)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFramePreface, Err: fmt.Errorf("invalid H2 preface sequence: first server frame is type %d, want SETTINGS", frameType)}
 				}
 				firstFrameSeen = true
 			}
@@ -4295,11 +4318,11 @@ ReadLoop:
 			switch frameType {
 			case FrameSettings, FrameGoAway:
 				if streamID != 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameStreamID, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
 				}
 			case FrameHeaders, FrameData, FrameRSTStream, FrameContinuation:
 				if streamID == 0 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("frame type %d must use non-zero stream", frameType)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameStreamID, Err: fmt.Errorf("frame type %d must use non-zero stream", frameType)}
 				}
 			}
 
@@ -4475,13 +4498,13 @@ ReadLoop:
 					padLen := 0
 					if flags&FlagPadded != 0 {
 						if len(actualPayload) < 1 {
-							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("PADDED DATA payload too short")}
+							return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFramePadding, Err: fmt.Errorf("PADDED DATA payload too short")}
 						}
 						padLen = int(actualPayload[0])
 						actualPayload = actualPayload[1:]
 					}
 					if padLen > len(actualPayload) {
-						return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("DATA padding exceeds payload")}
+						return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFramePadding, Err: fmt.Errorf("DATA padding exceeds payload")}
 					}
 					actualPayload = actualPayload[:len(actualPayload)-padLen]
 
@@ -4507,7 +4530,7 @@ ReadLoop:
 				}
 			case FrameRSTStream:
 				if length != 4 {
-					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("invalid RST_STREAM length: %d", length)}
+					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameLength, Err: fmt.Errorf("invalid RST_STREAM length: %d", length)}
 				}
 				if streamID == 1 {
 					cand.StreamReset = true
@@ -5167,9 +5190,19 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 					case H2ErrBadContinuation:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2BadContinuation++
-					case H2ErrInvalidFrame:
+					case H2ErrInvalidFrame, H2ErrInvalidFrameLength, H2ErrInvalidFrameStreamID, H2ErrInvalidFramePadding, H2ErrInvalidFramePreface:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2InvalidFrame++
+						switch pErr.Code {
+						case H2ErrInvalidFrameLength:
+							pipeStats.H2InvalidFrameLength++
+						case H2ErrInvalidFrameStreamID:
+							pipeStats.H2InvalidFrameStreamID++
+						case H2ErrInvalidFramePadding:
+							pipeStats.H2InvalidFramePadding++
+						case H2ErrInvalidFramePreface:
+							pipeStats.H2InvalidFramePreface++
+						}
 					case H2ErrHPACK:
 						pipeStats.H2OtherErrs++
 						pipeStats.H2HPACKDecode++
