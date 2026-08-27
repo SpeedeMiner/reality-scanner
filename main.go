@@ -1267,7 +1267,7 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		lastErr = err
 	}
 
-	for attempt, resolver := range ordered {
+	for _, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
@@ -1367,7 +1367,6 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	// the local/system resolver still has working access to the reverse zone.
 	// Try the system resolver first: it is the fastest compatibility path and
 	// preserves the old scanner's PTR behavior without giving up raw DNS.
-	lookupStarted := time.Now()
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	names, lookupErr := net.DefaultResolver.LookupAddr(lookupCtx, ip)
 	cancel()
@@ -1403,7 +1402,7 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	var lastErr error
 	nxCount := 0
 	emptyCount := 0
-	for attempt, resolver := range ordered {
+	for _, resolver := range ordered {
 		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, resolverTimeout)
@@ -1487,7 +1486,7 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		"https://freedns.controld.com/p0",
 	}
 	var lastErr error
-	for attempt, endpoint := range endpoints {
+	for _, endpoint := range endpoints {
 		if err := budgetCtx.Err(); err != nil {
 			break
 		}
