@@ -138,6 +138,8 @@ type Config struct {
 	NoCT              bool
 	NoPassive         bool
 	NoReverseIP       bool
+	Debug             bool
+	DebugFile         string
 
 	VTKey      string
 	URLScanKey string
@@ -493,6 +495,11 @@ type PipelineStats struct {
 	H2InvalidFrameStreamID  int
 	H2InvalidFramePadding   int
 	H2InvalidFramePreface   int
+	H2FrameSizeHeaders      int
+	H2FrameSizeData         int
+	H2FrameSizeContinuation int
+	H2FrameSizeSettings     int
+	H2FrameSizeOther        int
 	H2BadContinuation       int
 	H2HPACKDecode           int
 	H2MissingSettings       int
@@ -564,6 +571,10 @@ func (s *PipelineStats) recordProviderStat(name string, cat DiscoveryCategory, r
 		ps.LastError = errText
 	}
 
+	if result != StatSuccess {
+		debugf("[PROVIDER] name=%s category=%d result=%d timeout=%t raw=%d unique=%d invalid=%d limited=%d accepted=%d status=%d err=%s retries=%d", name, cat, result, isTimeout, raw, unique, invalid, limited, accepted, httpStatus, errText, retries)
+	}
+
 	switch result {
 	case StatSuccess, StatPartial:
 		if result == StatSuccess {
@@ -608,6 +619,88 @@ type DNSHealthWindow struct {
 	Failures int
 }
 
+type DebugLogger struct {
+	mu       sync.Mutex
+	f        *os.File
+	maxBytes int64
+	written  int64
+	dropped  bool
+}
+
+const DebugMaxBytes int64 = 32 * 1024 * 1024
+
+func NewDebugLogger(path string, maxBytes int64) (*DebugLogger, error) {
+	if path == "" {
+		return nil, nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = DebugMaxBytes
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return &DebugLogger{f: f, maxBytes: maxBytes}, nil
+}
+
+func (d *DebugLogger) Close() error {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.f == nil {
+		return nil
+	}
+	err := d.f.Close()
+	d.f = nil
+	return err
+}
+
+func (d *DebugLogger) Printf(format string, args ...interface{}) {
+	if d == nil {
+		return
+	}
+	line := fmt.Sprintf(format, args...)
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.f == nil || d.dropped {
+		return
+	}
+	if d.written+int64(len(line)) > d.maxBytes {
+		d.dropped = true
+		_, _ = d.f.WriteString("[DEBUG] log size limit reached; further debug events dropped\n")
+		return
+	}
+	if _, err := d.f.WriteString(line); err != nil {
+		d.dropped = true
+	}
+	d.written += int64(len(line))
+}
+
+var (
+	debugMu     sync.RWMutex
+	debugLogger *DebugLogger
+)
+
+func setDebugLogger(d *DebugLogger) {
+	debugMu.Lock()
+	debugLogger = d
+	debugMu.Unlock()
+}
+
+func debugf(format string, args ...interface{}) {
+	debugMu.RLock()
+	d := debugLogger
+	debugMu.RUnlock()
+	if d != nil {
+		d.Printf(format, args...)
+	}
+}
+
 type RuntimeCaches struct {
 	ProvCache              *SafeCache
 	ProvGroup              *singleflight.Group
@@ -624,6 +717,9 @@ type RuntimeCaches struct {
 	// RunCtx is the pipeline-wide context used as the shared singleflight leader context.
 	// It prevents one root cancellation from aborting a request shared by other roots.
 	RunCtx context.Context
+
+	// Debug is a bounded, mutex-protected diagnostic sink shared by pipeline stages.
+	Debug *DebugLogger
 
 	// PTR fallback telemetry. Access under DNSStatsMu.
 	PTRSystemFallbacks     int
@@ -685,46 +781,51 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	type candidate struct {
-		resolver string
-		ord      int
-		health   float64
-	}
-	eligible := make([]candidate, 0, len(resolvers))
+	var healthy, degraded []string
+	var earliest string
+	var earliestUntil time.Time
 	for i := 0; i < len(resolvers); i++ {
 		resolver := resolvers[(start+i)%len(resolvers)]
 		if r.DNSDisabledForRun[resolver] {
 			continue
 		}
-		if until := r.DNSCooldownUntil[resolver]; !until.IsZero() && now.Before(until) {
+		until := r.DNSCooldownUntil[resolver]
+		if !until.IsZero() && now.Before(until) {
+			if earliest == "" || until.Before(earliestUntil) {
+				earliest = resolver
+				earliestUntil = until
+			}
 			continue
 		}
-		health := 1.0
-		if hw := r.DNSHealthWindows[resolver]; hw != nil && hw.Count > 0 {
-			failureRate := float64(hw.Failures) / float64(hw.Count)
-			health = 1.0 - 0.75*failureRate
-			if health < 0.25 {
-				health = 0.25
-			}
+		switch dnsHealthState(r.DNSHealthWindows[resolver]) {
+		case "degraded", "cooldown":
+			degraded = append(degraded, resolver)
+		default:
+			healthy = append(healthy, resolver)
 		}
-		eligible = append(eligible, candidate{resolver: resolver, ord: i, health: health})
 	}
-	if len(eligible) == 0 {
+
+	if len(healthy)+len(degraded) == 0 {
+		// Do not immediately reuse a resolver that is still in cooldown. Returning
+		// nil lets the caller use its bounded fallback transports instead of
+		// defeating the cooldown and recreating the failure spiral.
+		_ = earliest
 		return nil
 	}
 
-	// Round-robin remains the tie-breaker; recent health pushes degraded
-	// resolvers later without allowing one resolver to monopolize the run.
-	sort.SliceStable(eligible, func(i, j int) bool {
-		if math.Abs(eligible[i].health-eligible[j].health) < 0.20 {
-			return eligible[i].ord < eligible[j].ord
+	// Keep the scheduler fair. Healthy nodes get the first position of each
+	// pair, but degraded nodes remain in rotation instead of being starved or
+	// monopolizing the entire run.
+	order := make([]string, 0, len(healthy)+len(degraded))
+	for hi, di := 0, 0; hi < len(healthy) || di < len(degraded); {
+		if hi < len(healthy) {
+			order = append(order, healthy[hi])
+			hi++
 		}
-		return eligible[i].health > eligible[j].health
-	})
-
-	order := make([]string, 0, len(eligible))
-	for _, item := range eligible {
-		order = append(order, item.resolver)
+		if di < len(degraded) {
+			order = append(order, degraded[di])
+			di++
+		}
 	}
 	return order
 }
@@ -803,6 +904,7 @@ func (r *RuntimeCaches) recordDNSResult(resolver string, err error, elapsed time
 
 	stat.Failures++
 	isTimeout := errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)
+	debugf("[DNS][RESULT] resolver=%s err=%v timeout=%t elapsed_ms=%.1f ipv4=%d", resolver, err, isTimeout, elapsedMs, ipv4Count)
 	if isTimeout {
 		stat.Timeouts++
 	}
@@ -1092,12 +1194,16 @@ func dnsExchangeUDP(ctx context.Context, resolver, domain string, qtype uint16, 
 	client := &mdns.Client{Net: "udp", Timeout: timeout}
 	resp, _, err := client.ExchangeContext(ctx, msg, net.JoinHostPort(resolver, "53"))
 	if err != nil {
+		debugf("[DNS][UDP] resolver=%s q=%s qtype=%d err=%v", resolver, domain, qtype, err)
 		return nil, err
 	}
 	if resp == nil {
-		return nil, fmt.Errorf("nil DNS response")
+		err = fmt.Errorf("nil DNS response")
+		debugf("[DNS][UDP] resolver=%s q=%s qtype=%d err=%v", resolver, domain, qtype, err)
+		return nil, err
 	}
 	if resp.Truncated {
+		debugf("[DNS][UDP] resolver=%s q=%s qtype=%d result=truncated", resolver, domain, qtype)
 		return nil, ErrDNSTruncated
 	}
 	if qtype == mdns.TypePTR {
@@ -1796,6 +1902,44 @@ func recordDNSPipelineErrorLocked(s *PipelineStats, err error) {
 		s.DNSNoIPv4++
 		return
 	}
+
+	// Preserve the aggregate provenance before inspecting the wrapped error.
+	// A fallback may wrap a useful primary classification (timeout, RCODE,
+	// not-found, malformed, network, ...); unwrapping first used to erase that
+	// information and inflate DNS Other/Unknown.
+	var aggErr *DNSAggregateError
+	if errors.As(err, &aggErr) && aggErr != nil && aggErr.Kind != "" {
+		s.DNSFailed++
+		switch aggErr.Kind {
+		case "timeout":
+			s.DNSTimeout++
+		case "rcode":
+			s.DNSRCODEErrors++
+		case "network":
+			s.DNSOtherErr++
+			s.DNSOtherNetworkErr++
+		case "malformed":
+			s.DNSOtherErr++
+			s.DNSOtherMalformed++
+		case "short-response":
+			s.DNSOtherErr++
+			s.DNSOtherShortResponse++
+		case "txid-mismatch":
+			s.DNSOtherErr++
+			s.DNSOtherTxIDMismatch++
+		case "unsupported":
+			s.DNSOtherErr++
+			s.DNSOtherUnsupported++
+		case "name-not-found":
+			s.DNSOtherErr++
+			s.DNSOtherNotFound++
+		default:
+			s.DNSOtherErr++
+			s.DNSOtherUnknown++
+		}
+		return
+	}
+
 	var rcodeErr *DNSRCODEError
 	if errors.As(err, &rcodeErr) {
 		s.DNSFailed++
@@ -1819,14 +1963,10 @@ func recordDNSPipelineErrorLocked(s *PipelineStats, err error) {
 			return
 		}
 	}
+
 	s.DNSFailed++
 	s.DNSOtherErr++
-	kind := classifyDNSOtherError(err)
-	var aggErr *DNSAggregateError
-	if errors.As(err, &aggErr) && aggErr != nil && aggErr.Kind != "" {
-		kind = aggErr.Kind
-	}
-	switch kind {
+	switch classifyDNSOtherError(err) {
 	case "network":
 		s.DNSOtherNetworkErr++
 	case "malformed":
@@ -3669,6 +3809,11 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	pH2InvalidFrameStreamID := s.H2InvalidFrameStreamID
 	pH2InvalidFramePadding := s.H2InvalidFramePadding
 	pH2InvalidFramePreface := s.H2InvalidFramePreface
+	pH2FrameSizeHeaders := s.H2FrameSizeHeaders
+	pH2FrameSizeData := s.H2FrameSizeData
+	pH2FrameSizeContinuation := s.H2FrameSizeContinuation
+	pH2FrameSizeSettings := s.H2FrameSizeSettings
+	pH2FrameSizeOther := s.H2FrameSizeOther
 	pH2BadContinuation := s.H2BadContinuation
 	pH2HPACKDecode := s.H2HPACKDecode
 	pH2MissingSettings := s.H2MissingSettings
@@ -3837,7 +3982,8 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 	fmt.Printf("    Reality-feasible из принятых:      %d\n", pReality)
 	fmt.Printf("    H2 причины Other: InvalidFrame=%d, BadContinuation=%d, HPACK=%d, MissingSettings=%d, HeadersWithoutStatus=%d\n", pH2InvalidFrame, pH2BadContinuation, pH2HPACKDecode, pH2MissingSettings, pH2HeadersWithoutStatus)
 	fmt.Printf("    H2 InvalidFrame detail: FrameSize=%d, RSTStreamLength=%d, StreamID=%d, Padding=%d, Preface=%d, Generic=%d\n", pH2InvalidFrameLength, pH2InvalidFrameRSTLength, pH2InvalidFrameStreamID, pH2InvalidFramePadding, pH2InvalidFramePreface, pH2InvalidFrame-pH2InvalidFrameLength-pH2InvalidFrameRSTLength-pH2InvalidFrameStreamID-pH2InvalidFramePadding-pH2InvalidFramePreface)
-	fmt.Printf("    H2 note: FrameSize means peer MAX_FRAME_SIZE violation; RSTStreamLength is the fixed 4-byte RST_STREAM payload check.\n")
+	fmt.Printf("    H2 FrameSize by type: HEADERS=%d, DATA=%d, CONTINUATION=%d, SETTINGS=%d, Other=%d\n", pH2FrameSizeHeaders, pH2FrameSizeData, pH2FrameSizeContinuation, pH2FrameSizeSettings, pH2FrameSizeOther)
+	fmt.Printf("    H2 note: FrameSize is an inbound payload larger than the local/default 16384-byte receive limit; peer SETTINGS_MAX_FRAME_SIZE controls frames sent by this client.\n")
 	fmt.Printf("       Важно: кластеризация по IP выполняется ПОСЛЕ этого этапа и не считается отклонением.\n")
 	fmt.Printf("\n    * Инфо: H2 целей без ALPN 'h2': %d\n", pH2NoALPN)
 	fmt.Printf("    * Уникальных IP-кластеров:    %d (дедупликация финального списка по IP)\n", clustered)
@@ -3849,16 +3995,13 @@ func (s *PipelineStats) SnapshotAndPrint(rtCaches *RuntimeCaches, cfg Config, cl
 		if stat == nil {
 			continue
 		}
-		status := "active"
+		status := dnsHealthState(rtCaches.DNSHealthWindows[resolver])
 		if rtCaches.DNSDisabledForRun[resolver] {
 			status = "disabled-run"
-		} else {
-			switch dnsHealthState(rtCaches.DNSHealthWindows[resolver]) {
-			case "degraded":
-				status = "degraded"
-			case "cooldown":
-				status = "cooldown"
-			}
+		} else if until := rtCaches.DNSCooldownUntil[resolver]; !until.IsZero() && time.Now().Before(until) {
+			status = "cooldown"
+		} else if status == "unknown" {
+			status = "healthy"
 		}
 		fmt.Printf("    %-15s attempts=%d answers=%d ipv4=%d nxdomain=%d rcode=%d failures=%d timeouts=%d status=%s\n",
 			resolver, stat.Attempts, stat.Answers, stat.IPv4s, stat.NXDomain, stat.RCODEErrors, stat.Failures, stat.Timeouts, status)
@@ -4212,9 +4355,10 @@ const (
 )
 
 type ProbeError struct {
-	Stage ProbeStage
-	Code  H2ErrorCode
-	Err   error
+	Stage     ProbeStage
+	Code      H2ErrorCode
+	Err       error
+	FrameType byte
 }
 
 func normalizeProbeError(pe *ProbeError) *ProbeError {
@@ -4242,8 +4386,8 @@ func (e *ProbeError) Error() string {
 	return e.Err.Error()
 }
 
-func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Candidate, *ProbeError) {
-	cand := &Candidate{
+func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (cand *Candidate, pErr *ProbeError) {
+	cand = &Candidate{
 		IP:            ip,
 		SNI:           sni,
 		Evidence:      ev,
@@ -4251,6 +4395,14 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 		CDNStatus:     CDNStatusUnknown,
 		HTTPStatus:    0,
 	}
+
+	defer func() {
+		if pErr != nil {
+			debugf("[H2][ERROR] ip=%s sni=%s code=%d frame_type=%d err=%s tcp_ms=%d tls_ms=%d", ip, sni, pErr.Code, pErr.FrameType, pErr.Error(), cand.Timings.TCP.Milliseconds(), cand.Timings.TLS.Milliseconds())
+		} else {
+			debugf("[H2][OK] ip=%s sni=%s status=%d alpn=%s cert_sni=%t cert_chain=%t cert_time=%t h2_settings=%t h2_headers=%t body=%d", ip, sni, cand.HTTPStatus, cand.ALPN, cand.CertSNIMatch, cand.CertChainValid, cand.CertValidTime, cand.H2SettingsReceived, cand.H2HeadersReceived, cand.BodyBytes)
+		}
+	}()
 
 	t0 := time.Now()
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.TCPTimeoutMs) * time.Millisecond}
@@ -4348,7 +4500,7 @@ func ProbeH2(ctx context.Context, ip, sni string, ev Evidence, cfg Config) (*Can
 	requestSent := time.Now()
 	uConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.H2ReadTimeoutMs) * time.Millisecond))
 
-	maxInboundFrameSize := uint32(16384)
+	const localMaxInboundFrameSize uint32 = 16384
 	buf := make([]byte, 32768)
 	recvBuf := bytes.Buffer{}
 	headerBlocks := bytes.Buffer{}
@@ -4371,8 +4523,10 @@ ReadLoop:
 		for recvBuf.Len() >= 9 {
 			data := recvBuf.Bytes()
 			length := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
-			if length > maxInboundFrameSize {
-				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameLength, Err: fmt.Errorf("inbound frame exceeds limit: %d", length)}
+			if length > localMaxInboundFrameSize {
+				frameType := data[3]
+				streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7fffffff
+				return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrameLength, FrameType: frameType, Err: fmt.Errorf("inbound frame exceeds local limit: type=%d length=%d max=%d stream=%d", frameType, length, localMaxInboundFrameSize, streamID)}
 			}
 			if uint32(recvBuf.Len()) < 9+length {
 				break
@@ -4454,7 +4608,6 @@ ReadLoop:
 						}
 						prof.MaxFrameSize = val
 						prof.HasMaxFrameSize = true
-						maxInboundFrameSize = val
 					case 6:
 						prof.MaxHeaderListSize = val
 						prof.HasMaxHeaderListSize = true
@@ -4834,6 +4987,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	ds := NewDiscoveryState()
 	rtCaches := NewRuntimeCaches()
 	rtCaches.RunCtx = ctx
+	debugMu.RLock()
+	rtCaches.Debug = debugLogger
+	debugMu.RUnlock()
 	warmDNSResolvers(ctx, cfg.DNSResolvers, cfg.ECSIP, cfg.ECSPrefix, rtCaches)
 
 	for _, d := range cfg.Domains {
@@ -5226,6 +5382,18 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 						switch pErr.Code {
 						case H2ErrInvalidFrameLength:
 							pipeStats.H2InvalidFrameLength++
+							switch pErr.FrameType {
+							case FrameHeaders:
+								pipeStats.H2FrameSizeHeaders++
+							case FrameData:
+								pipeStats.H2FrameSizeData++
+							case FrameContinuation:
+								pipeStats.H2FrameSizeContinuation++
+							case FrameSettings:
+								pipeStats.H2FrameSizeSettings++
+							default:
+								pipeStats.H2FrameSizeOther++
+							}
 						case H2ErrInvalidFrameStreamID:
 							pipeStats.H2InvalidFrameStreamID++
 						case H2ErrInvalidFramePadding:
@@ -5714,12 +5882,31 @@ func main() {
 		NoCT:              false,
 		NoPassive:         false,
 		NoReverseIP:       false,
+		Debug:             true,
+		DebugFile:         "/tmp/reality-scanner-debug.log",
 		ScanEntireASN:     true,
 	}
 
 	flag.IntVar(&cfg.Workers, "w", 30, "Worker pool size")
 	flag.StringVar(&cfg.TargetIP, "vps-ip", "", "IP сервера; используется для ASN/Country и ECS")
+	flag.BoolVar(&cfg.Debug, "debug", true, "Писать bounded debug trace в файл")
+	flag.StringVar(&cfg.DebugFile, "debug-file", "/tmp/reality-scanner-debug.log", "Путь debug trace файла")
 	flag.Parse()
+
+	if cfg.Debug {
+		dbg, dbgErr := NewDebugLogger(cfg.DebugFile, DebugMaxBytes)
+		if dbgErr != nil {
+			log.Printf("[!] Не удалось открыть debug log %s: %v", cfg.DebugFile, dbgErr)
+		} else {
+			setDebugLogger(dbg)
+			defer func() {
+				if err := dbg.Close(); err != nil {
+					log.Printf("[!] Ошибка закрытия debug log: %v", err)
+				}
+			}()
+			debugf("[DEBUG] start version=v69 max_bytes=%d pid=%d", DebugMaxBytes, os.Getpid())
+		}
+	}
 
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
