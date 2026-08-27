@@ -1277,7 +1277,7 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		rtCaches.DNSDoHFallbacks++
 		rtCaches.DNSStatsMu.Unlock()
 		return dohIPs, nil
-	} else if dohErr != nil {
+	} else if dohErr != nil && lastErr == nil {
 		lastErr = dohErr
 	}
 
@@ -1388,7 +1388,7 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 		rtCaches.PTRDoHFallbacks++
 		rtCaches.DNSStatsMu.Unlock()
 		return dohNames, nil
-	} else if dohErr != nil {
+	} else if dohErr != nil && lastErr == nil {
 		lastErr = dohErr
 	}
 
@@ -1690,10 +1690,12 @@ func classifyDNSOtherError(err error) string {
 		return "txid-mismatch"
 	case strings.Contains(s, "short response"), strings.Contains(s, "too short"), strings.Contains(s, "short packet"):
 		return "short-response"
-	case strings.Contains(s, "invalid packet"), strings.Contains(s, "unpack"), strings.Contains(s, "malformed"), strings.Contains(s, "overflow"):
+	case strings.Contains(s, "invalid packet"), strings.Contains(s, "unpack"), strings.Contains(s, "malformed"), strings.Contains(s, "overflow"), strings.Contains(s, "pack: dns"), strings.Contains(s, "dns: buffer size"):
 		return "malformed"
-	case strings.Contains(s, "network"), strings.Contains(s, "connection refused"), strings.Contains(s, "no route"), strings.Contains(s, "broken pipe"), strings.Contains(s, "reset by peer"), strings.Contains(s, "connection reset"):
+	case strings.Contains(s, "network"), strings.Contains(s, "connection refused"), strings.Contains(s, "no route"), strings.Contains(s, "broken pipe"), strings.Contains(s, "reset by peer"), strings.Contains(s, "connection reset"), strings.Contains(s, "use of closed network connection"):
 		return "network"
+	case strings.Contains(s, "unexpected eof"), strings.Contains(s, "unexpected end"):
+		return "short-response"
 	case strings.Contains(s, "unsupported"):
 		return "unsupported"
 	default:
@@ -4968,68 +4970,9 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	pipeStats.DNSValidPairs = len(validPairs)
 	pipeStats.mu.Unlock()
 
-	if cfg.TargetCountry != "" && cfg.TargetCountry != "UNKNOWN" && len(validPairs) > 0 {
-		countryWorkers := cfg.Workers
-		if countryWorkers < 1 {
-			countryWorkers = 1
-		}
-		if countryWorkers > 16 {
-			countryWorkers = 16
-		}
-		type countryResult struct {
-			IP      string
-			Country string
-		}
-		ipSet := make(map[string]struct{})
-		for _, pair := range validPairs {
-			ipSet[pair.IP] = struct{}{}
-		}
-		jobs := make(chan string)
-		results := make(chan countryResult, len(ipSet))
-		var cwg sync.WaitGroup
-		for i := 0; i < countryWorkers; i++ {
-			cwg.Add(1)
-			go func() {
-				defer cwg.Done()
-				for ip := range jobs {
-					results <- countryResult{IP: ip, Country: getCountryCached(rtCaches, ip)}
-				}
-			}()
-		}
-		go func() {
-			defer close(results)
-			for ip := range ipSet {
-				select {
-				case jobs <- ip:
-				case <-ctx.Done():
-					close(jobs)
-					cwg.Wait()
-					return
-				}
-			}
-			close(jobs)
-			cwg.Wait()
-		}()
-		allowed := make(map[string]bool, len(ipSet))
-		for res := range results {
-			if res.Country != "" && res.Country != "UNKNOWN" && strings.EqualFold(res.Country, cfg.TargetCountry) {
-				allowed[res.IP] = true
-				continue
-			}
-			// Country filtering is strict, matching the Windows/local-GeoIP behavior:
-			// an unclassified IP is not allowed to bypass the country gate.
-			pipeStats.mu.Lock()
-			pipeStats.CountryFiltered++
-			pipeStats.mu.Unlock()
-		}
-		filtered := validPairs[:0]
-		for _, pair := range validPairs {
-			if allowed[pair.IP] {
-				filtered = append(filtered, pair)
-			}
-		}
-		validPairs = filtered
-	}
+	// Country filtering is intentionally not repeated here. Country is used
+	// for ASN-prefix sampling only; DNS validation keeps full ASN coverage,
+	// matching the Windows scanner and avoiding per-IP geo-IP false negatives.
 
 	pipeStats.mu.Lock()
 	pipeStats.DNSValidPairs = len(validPairs)
@@ -5037,7 +4980,7 @@ func RunPipeline(ctx context.Context, cfg Config, sampledIPs []string, scanRange
 	finalASNFiltered := pipeStats.ASNFiltered
 	finalCountryFiltered := pipeStats.CountryFiltered
 	pipeStats.mu.Unlock()
-	fmt.Printf("[+] Stage D Завершён. Подтверждено DNS-пар (IP+SNI): %d | ASN filtered: %d | Country filtered: %d\n", finalPairCount, finalASNFiltered, finalCountryFiltered)
+	fmt.Printf("[+] Stage D Завершён. Подтверждено DNS-пар (IP+SNI): %d | ASN filtered: %d | Country sampling prefixes filtered: %d\n", finalPairCount, finalASNFiltered, finalCountryFiltered)
 
 	if len(validPairs) == 0 {
 		return nil
