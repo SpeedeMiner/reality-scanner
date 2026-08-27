@@ -1292,8 +1292,9 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		rtCaches.DNSStatsMu.Unlock()
 		return dohIPs, nil
 	} else if dohErr != nil {
-		// Keep DoH as a last-resort cause only when UDP had no concrete cause.
-		rememberErr(dohErr)
+		// DoH is a fallback transport. Its own failure must not replace the
+		// primary raw-UDP diagnostic or turn a transport failure into a bogus
+		// name-not-found/unknown telemetry bucket.
 	}
 
 	if sysIPs, sysErr := resolveASystem(ctx, domain); sysErr == nil && len(sysIPs) > 0 {
@@ -1302,7 +1303,8 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 		rtCaches.DNSStatsMu.Unlock()
 		return sysIPs, nil
 	} else if sysErr != nil {
-		rememberErr(sysErr)
+		// The system resolver is also a fallback. Do not let its error mask the
+		// raw DNS transport failure that determined the actual lookup outcome.
 	}
 
 	if nxCount > 0 && emptyCount+nxCount == len(ordered) {
@@ -4291,7 +4293,7 @@ ReadLoop:
 			}
 
 			switch frameType {
-			case FrameSettings, FrameGoAway, FrameWindowUpdate:
+			case FrameSettings, FrameGoAway:
 				if streamID != 0 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrInvalidFrame, Err: fmt.Errorf("frame type %d must use stream 0, got %d", frameType, streamID)}
 				}
@@ -4495,6 +4497,8 @@ ReadLoop:
 					}
 				}
 			case FrameWindowUpdate:
+				// WINDOW_UPDATE is valid on stream 0 (connection-level) or on a
+				// non-zero stream (stream-level). Only its payload is constrained here.
 				if length != 4 {
 					return cand, &ProbeError{Stage: ProbeStageH2, Code: H2ErrFlowControl, Err: fmt.Errorf("invalid WINDOW_UPDATE length: %d", length)}
 				}
