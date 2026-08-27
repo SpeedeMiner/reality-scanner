@@ -36,6 +36,10 @@ import (
 )
 
 // ================= CONFIG & CONSTANTS =================
+// DNS transport note: the legacy Linux implementation used DNSCrypt stamps with authenticated
+// resolver endpoints, pre-validated the pool, and weighted selection by RTT/failure state.
+// The current raw-DNS build keeps that resilience model without reintroducing DNSCrypt:
+// persistent DoH transport, warm-up, health-aware RR, bounded retries, and strict cooldowns.
 
 const (
 	FrameData         = 0x00
@@ -667,11 +671,13 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 	}
 	r.DNSRoundRobinCursor = (start + 1) % len(resolvers)
 
-	// True round-robin is the primary scheduling rule. Health affects only
-	// whether a resolver is eligible, not whether one "best" resolver receives
-	// the entire workload. This prevents a single healthy resolver from becoming
-	// a hotspot while the rest of the pool is gradually quarantined.
-	order := make([]string, 0, len(resolvers))
+	type scoredResolver struct {
+		resolver string
+		score    float64
+		ord      int
+		until    time.Time
+	}
+	eligible := make([]scoredResolver, 0, len(resolvers))
 	var earliest string
 	var earliestUntil time.Time
 
@@ -688,12 +694,45 @@ func (r *RuntimeCaches) dnsResolverOrder(resolvers []string) []string {
 			}
 			continue
 		}
-		order = append(order, resolver)
+
+		// Health-aware ordering deliberately uses ONLY the recent sliding window.
+		// Historical Attempts/Failures never participate in the scheduling score.
+		score := 1.0
+		if hw := r.DNSHealthWindows[resolver]; hw != nil && hw.Count > 0 {
+			failureRate := float64(hw.Failures) / float64(hw.Count)
+			score *= 1.0 - 0.75*failureRate
+			if score < 0.25 {
+				score = 0.25
+			}
+		}
+		if st := r.DNSResolverStats[resolver]; st != nil && st.RTTMs > 0 {
+			// RTT influences preference gently; it cannot starve slower resolvers.
+			latencyFactor := 250.0 / math.Max(50.0, st.RTTMs)
+			if latencyFactor > 1.5 {
+				latencyFactor = 1.5
+			}
+			if latencyFactor < 0.5 {
+				latencyFactor = 0.5
+			}
+			score *= latencyFactor
+		}
+		eligible = append(eligible, scoredResolver{resolver: resolver, score: score, ord: i, until: until})
 	}
 
+	// Stable health-aware round-robin: preserve rotation as the tie-breaker,
+	// while moving clearly healthier resolvers toward the front of each batch.
+	sort.SliceStable(eligible, func(i, j int) bool {
+		if math.Abs(eligible[i].score-eligible[j].score) > 0.05 {
+			return eligible[i].score > eligible[j].score
+		}
+		return eligible[i].ord < eligible[j].ord
+	})
+
+	order := make([]string, 0, len(eligible))
+	for _, item := range eligible {
+		order = append(order, item.resolver)
+	}
 	if len(order) == 0 && earliest != "" && !r.DNSDisabledForRun[earliest] {
-		// All eligible resolvers are temporarily cooling. Reuse only the one
-		// whose cooldown expires first; run-disabled resolvers remain excluded.
 		return []string{earliest}
 	}
 	return order
@@ -1104,7 +1143,7 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 			qctx, cancel := context.WithTimeout(ctx, DNSWarmupTimeout)
 			started := time.Now()
 			ips, err := dnsExchangeUDP(qctx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
-			if errors.Is(err, ErrDNSTruncated) || errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+			if errors.Is(err, ErrDNSTruncated) {
 				tcpCtx, tcpCancel := context.WithTimeout(ctx, DNSWarmupTimeout)
 				if tcpIPs, tcpErr := dnsExchangeTCP(tcpCtx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout); tcpErr == nil {
 					ips, err = tcpIPs, nil
@@ -1125,7 +1164,7 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 				qctx2, cancel2 := context.WithTimeout(ctx, DNSWarmupTimeout)
 				started = time.Now()
 				ips2, err2 := dnsExchangeUDP(qctx2, resolver, "www.cloudflare.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
-				if errors.Is(err2, ErrDNSTruncated) || errors.Is(err2, context.DeadlineExceeded) || os.IsTimeout(err2) {
+				if errors.Is(err2, ErrDNSTruncated) {
 					if tcpIPs, tcpErr := dnsExchangeTCP(qctx2, resolver, "www.cloudflare.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout); tcpErr == nil {
 						ips2, err2 = tcpIPs, nil
 					}
@@ -1395,6 +1434,9 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 	if timeout <= 0 {
 		timeout = 1200 * time.Millisecond
 	}
+	budgetCtx, budgetCancel := context.WithTimeout(ctx, timeout)
+	defer budgetCancel()
+
 	ecs := ecsIP
 	if parsed := net.ParseIP(ecsIP); parsed != nil && parsed.To4() != nil {
 		masked := append(net.IP(nil), parsed.To4()...)
@@ -1407,6 +1449,7 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		}
 		ecs = masked.String() + "/" + strconv.Itoa(ecsPrefix)
 	}
+
 	endpoints := []string{
 		"https://dns.google/resolve",
 		"https://cloudflare-dns.com/dns-query",
@@ -1415,16 +1458,17 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 	}
 	var lastErr error
 	for _, endpoint := range endpoints {
+		if err := budgetCtx.Err(); err != nil {
+			break
+		}
 		values := url.Values{}
 		values.Set("name", domain)
 		values.Set("type", "A")
 		if ecs != "" {
 			values.Set("edns_client_subnet", ecs)
 		}
-		reqCtx, cancel := context.WithTimeout(ctx, timeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint+"?"+values.Encode(), nil)
+		req, err := http.NewRequestWithContext(budgetCtx, http.MethodGet, endpoint+"?"+values.Encode(), nil)
 		if err != nil {
-			cancel()
 			lastErr = err
 			continue
 		}
@@ -1432,10 +1476,10 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 		req.Header.Set("User-Agent", "reality-scanner/1.0")
 		resp, err := dnsDoHHTTPClient.Do(req)
 		if err != nil {
-			cancel()
 			lastErr = err
 			continue
 		}
+
 		var payload struct {
 			Status int `json:"Status"`
 			Answer []struct {
@@ -1443,11 +1487,16 @@ func resolveADoH(ctx context.Context, domain, ecsIP string, ecsPrefix int, timeo
 				Data string `json:"data"`
 			} `json:"Answer"`
 		}
-		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
-		resp.Body.Close()
-		cancel()
+		decodeErr := func() error {
+			defer resp.Body.Close()
+			return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload)
+		}()
 		if decodeErr != nil {
 			lastErr = decodeErr
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("DoH HTTP status=%d", resp.StatusCode)
 			continue
 		}
 		if payload.Status == 3 {
@@ -5444,11 +5493,7 @@ func main() {
 		if issuer == "" {
 			issuer = "unknown issuer"
 		}
-		certState := "untrusted"
-		if r.CertSNIMatch && r.CertChainValid && r.CertValidTime {
-			certState = "trusted"
-		}
-		certCol := fmt.Sprintf("%s [%s]", limitStr(issuer, 21), certState)
+		certCol := limitStr(issuer, 30)
 		rtt := r.Timings.TCP + r.Timings.TLS + r.Timings.H2Headers
 		fmt.Printf("%-32.32s | %-15.15s | %-6d | %-30.30s | %4dms\n",
 			r.SNI, r.IP, r.HTTPStatus, certCol, rtt.Milliseconds())
@@ -5461,8 +5506,8 @@ func main() {
 	fmt.Printf("\"dest\": \"%s:443\",\n", best.SNI)
 	fmt.Printf("\"serverNames\": [\n  \"%s\"\n]\n\n", best.SNI)
 	fmt.Printf("Подробности лучшего кандидата:\n")
-	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate issuer: %s | trusted: %t | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
-		best.HTTPStatus, best.RealityScore.TLSQuality, best.CertIssuer, best.CertChainValid, best.CertSNIMatch, best.RealityFeasible,
+	fmt.Printf("STATUS: %d | TLS: %.0f/20 | certificate issuer: %s | SNI match: %t | Reality feasible: %t | RTT: %d ms\n",
+		best.HTTPStatus, best.RealityScore.TLSQuality, best.CertIssuer, best.CertSNIMatch, best.RealityFeasible,
 		(best.Timings.TCP + best.Timings.TLS + best.Timings.H2Headers).Milliseconds())
 	fmt.Printf("-------------------------------------------------------------------------------------------------------------------\n")
 	fmt.Printf("RANK: RealityFeasible=%t | BASE SCORE: %.1f | PENALTY: -%.1f | FINAL REALITY SCORE: %.1f/100 (HTTP: %d, Total Probe Latency: %d ms)\n", best.RealityFeasible,
