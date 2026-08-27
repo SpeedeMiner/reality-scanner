@@ -1142,6 +1142,7 @@ func warmDNSResolvers(ctx context.Context, resolvers []string, ecsIP string, ecs
 			// public resolvers legitimately differ in handling reserved/invalid
 			// names, and that must not quarantine an otherwise healthy transport.
 			healthy := false
+			started := time.Now()
 			qctx, cancel := context.WithTimeout(ctx, DNSWarmupTimeout)
 			ips, err := dnsExchangeUDP(qctx, resolver, "example.com", mdns.TypeA, ecsIP, ecsPrefix, DNSWarmupTimeout)
 			if errors.Is(err, ErrDNSTruncated) {
@@ -1267,6 +1268,7 @@ func resolveHostECS(ctx context.Context, domain, ecsIP string, ecsPrefix int, re
 	}
 
 	for _, resolver := range ordered {
+		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
 		ips, err := dnsExchangeUDP(ctx, resolver, domain, mdns.TypeA, ecsIP, ecsPrefix, resolverTimeout)
 
@@ -1401,6 +1403,7 @@ func resolvePTRRaw(ctx context.Context, ip string, resolvers []string, timeout t
 	nxCount := 0
 	emptyCount := 0
 	for _, resolver := range ordered {
+		started := time.Now()
 		resolverTimeout := rtCaches.dnsResolverTimeout(resolver, timeout)
 		names, err := dnsExchangeUDP(ctx, resolver, rev, 12, "", 0, resolverTimeout)
 		if errors.Is(err, ErrDNSTruncated) {
