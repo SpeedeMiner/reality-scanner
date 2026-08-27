@@ -4680,7 +4680,7 @@ ReadLoop:
 				firstFrameSeen = true
 			}
 
-			streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
+			streamID = binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
 			payload := data[9 : 9+length]
 			recvBuf.Next(int(9 + length))
 
